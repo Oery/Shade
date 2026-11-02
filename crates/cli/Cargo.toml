@@ -1,0 +1,20 @@
+[package]
+name = "shade-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "shade"
+path = "src/main.rs"
+
+[dependencies]
+shade-proto.workspace = true
+clap.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true

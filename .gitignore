@@ -1,0 +1,14 @@
+# Whitelist: ignore everything, then allow what belongs in the repo.
+*
+!*/
+/target/
+
+!.gitignore
+!*.rs
+!*.md
+!Cargo.toml
+!Cargo.lock
+!clippy.toml
+!rustfmt.toml
+!rust-toolchain.toml
+!check.sh

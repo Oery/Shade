@@ -1,0 +1,19 @@
+# Enforce understandable functions and bounded nesting. These limits are review
+# triggers: extract meaningful operations rather than splitting code mechanically.
+cognitive-complexity-threshold = 20
+too-many-lines-threshold = 100
+too-many-arguments-threshold = 7
+type-complexity-threshold = 250
+excessive-nesting-threshold = 5
+
+# Tests and opt-in benchmarks may fail loudly and print measurements. Other
+# correctness, readability, safety, and performance checks still apply to them.
+allow-unwrap-in-tests = true
+allow-expect-in-tests = true
+allow-panic-in-tests = true
+allow-print-in-tests = true
+allow-dbg-in-tests = false
+
+# Compile-time failures do not threaten a running shard.
+allow-unwrap-in-consts = true
+allow-expect-in-consts = true
