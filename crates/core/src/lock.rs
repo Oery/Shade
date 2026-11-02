@@ -1,7 +1,7 @@
 //! Data directory ownership: one daemon per directory.
 
 use std::fs::{DirBuilder, File, OpenOptions, TryLockError};
-use std::os::unix::fs::DirBuilderExt;
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::Path;
 
 use crate::Error;
@@ -27,7 +27,7 @@ pub fn create_data_dir(path: &Path) -> Result<(), Error> {
 pub fn acquire(data_dir: &Path) -> Result<ExecutionLock, Error> {
     let path = data_dir.join(LOCK_FILE);
 
-    let file = match OpenOptions::new().write(true).create(true).truncate(false).open(&path) {
+    let file = match OpenOptions::new().write(true).create(true).truncate(false).mode(0o600).open(&path) {
         Ok(file) => file,
         Err(source) => return Err(Error::Lock { path, source }),
     };

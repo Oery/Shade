@@ -5,6 +5,7 @@
 
 !.gitignore
 !*.rs
+!*.sql
 !*.md
 !Cargo.toml
 !Cargo.lock

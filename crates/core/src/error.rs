@@ -39,6 +39,18 @@ pub enum Error {
     #[error("{0} (model.api_key_env) is not set in the environment or the .env file next to the config")]
     MissingApiKey(String),
 
+    #[error("cannot create database {path}: {source}")]
+    DatabaseFile { path: PathBuf, source: std::io::Error },
+
+    #[error("cannot open the database: {0}")]
+    Database(#[from] rusqlite::Error),
+
+    #[error("the database has schema version {found}, but this shaded supports up to {supported}; upgrade shaded")]
+    SchemaTooNew { found: u32, supported: u32 },
+
+    #[error("cannot start the database worker: {0}")]
+    DatabaseWorker(std::io::Error),
+
     #[error("cannot set up the model: {0}")]
     Model(BoxError),
 

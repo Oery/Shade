@@ -93,6 +93,14 @@ rows are replayed with the same ID on startup.
 [core-sync]: https://github.com/hydro-project/infinity/blob/97c2f06ea4715bd62577a0f25182aab88a54e76b/crates/infinity-agent-core/src/event_processor.rs#L627
 [core-commit]: https://github.com/hydro-project/infinity/blob/97c2f06ea4715bd62577a0f25182aab88a54e76b/crates/infinity-agent-core/src/system/thread.rs#L566
 
+### Message IDs (M2)
+
+The ID passed with each message to `append_messages` is not unique: every item
+of one completion (reasoning, text, tool calls) carries the same completion ID,
+user text carries its dedup ID, and synthetic results derive theirs from the
+tool call. Shade keys history rows on `(thread, ord)` and treats only processed
+IDs as unique.
+
 ### Local delivery path
 
 Local mode uses unbounded in-process channels ([sender.rs:36][core-sender]) with
@@ -201,9 +209,7 @@ Both adjustments are pure functions over `(pattern, tz, instant)`; test them in 
 
 ## Open items
 
-- Real-key check: one streamed reply from `shade ask` (the M1 check). The
-  pipeline is verified up to authentication for Anthropic and for both OpenCode
-  Go formats (Anthropic Messages and Chat Completions): an invalid key returns
-  a clean 401 to the client.
+- ~~Real-key check~~: done through OpenCode Go (Chat Completions); `shade ask`
+  streamed a reply. Anthropic directly is verified up to authentication.
 - Reasoning round trip through rig's Chat Completions client (above).
 - Thinking-block round trip and compaction against Claude Opus 5.5 (above).

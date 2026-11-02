@@ -103,10 +103,12 @@ crates/
       error.rs              typed errors
       lock.rs               data directory creation and execution lock
       config.rs             TOML parsing and policy validation
-      db.rs                 database worker and migrations
+      secrets.rs            optional private .env next to the config
+      db.rs                 database worker and migrations (SQL in crates/core/migrations/)
       store/
         conversation.rs     Infinity ConversationStore
         state.rs            Infinity StateStore
+      thread_config.rs      per-thread tools (close_thread for compaction threads)
       grants.rs             origins, capabilities, delegation, root ownership
       model.rs              provider and completion-budget enforcement
       router.rs             routing, registration, output pumps, shutdown
@@ -144,7 +146,7 @@ Split a module from `shade-core` into its own crate when it has a distinct respo
 | Area | Choice | Reason |
 | --- | --- | --- |
 | Persistence | `rusqlite` with `bundled`, WAL, foreign keys | One local transactional database. |
-| Database access | One worker owns the connection; async request/response channels | SQLite work cannot stall the local agent core. Move owned parameters into requests; use necessary copies when appropriate. |
+| Database access | One worker thread owns the connection; callers send short closures that own their parameters over a bounded queue and await a oneshot reply | SQLite work cannot stall the local agent core. Closures never capture core state. |
 | Model | Infinity's rig bridge; Anthropic Messages or OpenAI Chat Completions, optionally through a gateway (`base_url`) | Reuse supported provider integration. |
 | MCP agent tools | Infinity MCP bridge | Avoid implementing a client inside Shade. |
 | MCP watches | Official `rmcp` if the bridge lacks required APIs | Resource notifications need a long-lived client outside a model tool invocation. |
@@ -157,7 +159,7 @@ Split a module from `shade-core` into its own crate when it has a distinct respo
 | Errors | `thiserror` enum and explicit domain errors | Preserve causes and useful context without pervasive mapping chains. |
 | Shell isolation | Bubblewrap | Local Linux sandbox without a container daemon. |
 
-Database requests contain operations, not arbitrary long-lived closures holding core state. Never hold a mutex or SQLite transaction across an `.await`. Backup work runs on a separate blocking connection. Add bounded SQLite busy handling and report persistent storage failures rather than accepting work that cannot be saved.
+Database requests are short closures over owned parameters, never long-lived closures holding core state. Never hold a mutex or SQLite transaction across an `.await`. Backup work runs on a separate blocking connection. Add bounded SQLite busy handling and report persistent storage failures rather than accepting work that cannot be saved.
 
 ### 2.5 Coding and testing policy
 
@@ -552,7 +554,8 @@ Each milestone is one reviewable PR. `Check` is a manual demonstration; `Tests` 
 - **Goal:** persist history without blocking the core.
 - **Scope:** worker thread, bounded requests, migrations, WAL/foreign keys, ConversationStore, parent links, messages, and summaries. `ensure_root_thread` never creates rows; processed IDs are written with history; `CloseThreadTool` for compaction threads.
 - **Check:** `ask` works with SQLite and database errors surface clearly.
-- **Tests:** reference-store parity for offset bounds, compaction selection, inherited-history Fresh boundaries, and structural parent lookup through a Fresh child. Atomic append on failure; no duplicate persisted message IDs; unknown thread IDs never become roots; compaction completes with built-ins off.
+- **Tests:** reference-store parity for offset bounds, compaction selection, inherited-history Fresh boundaries, and structural parent lookup through a Fresh child. Atomic append on failure; only user/subscription-event IDs become processed IDs (Infinity gives every item of one completion the same message ID, so message IDs are not unique keys); unknown thread IDs never become roots; compaction completes with built-ins off.
+- **Done:** `shade.db` (WAL, foreign keys, `0600`) behind a worker thread taking owned closures over a bounded queue. Rows key on `(thread, ord)`. Unlike the reference store, appends, spawns, and summaries need an existing thread. Database errors at startup name the cause (newer schema, unreadable file).
 
 ### M3 — State store and replay primitives
 

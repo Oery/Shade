@@ -2,14 +2,15 @@
 
 use infinity_agent_core::ThreadId;
 use infinity_agent_core::message::InputMessage;
-use infinity_agent_core::stores::{InMemoryConversationStore, InMemoryStateStore};
+use infinity_agent_core::stores::InMemoryStateStore;
 use infinity_agent_core::system::local::{LaunchingSystem, ThreadHandle};
 use infinity_agent_core::system::{AgentEvent, AgentSystemBuilder, NoRapHttp};
-use infinity_agent_core::traits::ConversationStore;
 use shade_proto::Response;
 use tokio::sync::mpsc;
 
 use crate::model::Model;
+use crate::store::conversation::Conversations;
+use crate::thread_config::ThreadTools;
 
 /// Capacity of each reply stream between the router and a socket connection.
 pub const REPLY_QUEUE: usize = 64;
@@ -21,16 +22,16 @@ pub struct Ask {
 }
 
 pub struct Router {
-    conversations: InMemoryConversationStore,
-    system: LaunchingSystem<InMemoryConversationStore, InMemoryStateStore, NoRapHttp>,
+    conversations: Conversations,
+    system: LaunchingSystem<Conversations, InMemoryStateStore, NoRapHttp>,
 }
 
 impl Router {
     /// Built-in tools stay off: spawning has no limit hook (see docs/infinity-notes.md).
-    pub fn start(model: Model) -> Self {
-        let conversations = InMemoryConversationStore::new();
+    pub fn start(model: Model, conversations: Conversations) -> Self {
+        let tools = ThreadTools::new(conversations.clone());
         let builder = AgentSystemBuilder::new_local(conversations.clone(), InMemoryStateStore::new(), model);
-        let system = builder.without_builtin_tools().start();
+        let system = builder.without_builtin_tools().thread_config(tools).start();
 
         Self { conversations, system }
     }
@@ -72,7 +73,7 @@ impl Router {
     async fn register_root(&self) -> Result<ThreadHandle, String> {
         let thread_id = ThreadId::from(uuid::Uuid::new_v4().to_string());
 
-        if let Err(error) = self.conversations.ensure_root_thread(&thread_id).await {
+        if let Err(error) = self.conversations.register_root(&thread_id).await {
             return Err(format!("cannot register conversation: {error}"));
         }
 
