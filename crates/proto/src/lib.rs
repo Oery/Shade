@@ -76,12 +76,15 @@ fn data_dir_from(xdg_data_home: Option<OsString>, home: Option<OsString>) -> Opt
     if let Some(dir) = absolute(xdg_data_home) {
         return Some(dir.join("shade"));
     }
+
     let home = absolute(home)?;
+
     Some(home.join(".local/share/shade"))
 }
 
 fn absolute(value: Option<OsString>) -> Option<PathBuf> {
     let path = PathBuf::from(value?);
+
     if path.is_absolute() { Some(path) } else { None }
 }
 
@@ -99,8 +102,10 @@ mod tests {
             (Some(""), Some(""), None),
             (None, None, None),
         ];
+
         for (xdg, home, expected) in cases {
             let actual = data_dir_from(xdg.map(OsString::from), home.map(OsString::from));
+
             assert_eq!(actual, expected, "XDG_DATA_HOME={xdg:?} HOME={home:?}");
         }
     }

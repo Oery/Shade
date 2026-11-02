@@ -48,14 +48,17 @@ impl ControlSocket {
         if let Err(source) = remove_if_present(&path) {
             return Err(Error::Socket { path, source });
         }
+
         let listener = match UnixListener::bind(&path) {
             Ok(listener) => listener,
             Err(source) => return Err(Error::Socket { path, source }),
         };
+
         let owner_uid = match restrict_to_owner(&path) {
             Ok(uid) => uid,
             Err(source) => return Err(Error::Socket { path, source }),
         };
+
         Ok(Self { listener, path, owner_uid })
     }
 
@@ -66,10 +69,12 @@ impl ControlSocket {
     /// Accepts connections until the task is dropped, at most `MAX_CONNECTIONS` at a time.
     pub async fn serve(&self) {
         let permits = Arc::new(Semaphore::new(MAX_CONNECTIONS));
+
         loop {
             let Ok(permit) = Arc::clone(&permits).acquire_owned().await else {
                 return; // The semaphore is never closed.
             };
+
             let stream = match self.listener.accept().await {
                 Ok((stream, _)) => stream,
                 Err(error) => {
@@ -77,11 +82,13 @@ impl ControlSocket {
                     continue;
                 }
             };
+
             let owner_uid = self.owner_uid;
             tokio::spawn(async move {
                 if let Err(error) = handle(stream, owner_uid).await {
                     tracing::warn!(%error, "control connection failed");
                 }
+
                 drop(permit);
             });
         }
@@ -106,17 +113,22 @@ fn remove_if_present(path: &Path) -> std::io::Result<()> {
 /// Sets mode `0600` and returns the socket owner, which is this process's user.
 fn restrict_to_owner(path: &Path) -> std::io::Result<u32> {
     fs::set_permissions(path, Permissions::from_mode(0o600))?;
-    Ok(fs::metadata(path)?.uid())
+    let metadata = fs::metadata(path)?;
+
+    Ok(metadata.uid())
 }
 
 async fn handle(stream: UnixStream, owner_uid: u32) -> Result<(), ConnectionError> {
     let peer_uid = stream.peer_cred()?.uid();
+
     if peer_uid != owner_uid {
         return Err(ConnectionError::ForeignPeer(peer_uid));
     }
+
     let (read, mut write) = stream.into_split();
     let mut reader = BufReader::new(read);
     let hello: Hello = read_message(&mut reader).await?;
+
     if hello.version != PROTOCOL_VERSION {
         let message = format!(
             "protocol mismatch: shade speaks version {}, shaded speaks {PROTOCOL_VERSION}; upgrade both together",
@@ -124,8 +136,11 @@ async fn handle(stream: UnixStream, owner_uid: u32) -> Result<(), ConnectionErro
         );
         return write_message(&mut write, &Response::Error { message }).await;
     }
+
     let request: Request = read_message(&mut reader).await?;
-    write_message(&mut write, &dispatch(request)).await
+    let response = dispatch(request);
+
+    write_message(&mut write, &response).await
 }
 
 fn dispatch(request: Request) -> Response {
@@ -138,6 +153,7 @@ fn dispatch(request: Request) -> Response {
         Request::Usage => "usage",
         Request::Backup { .. } => "backup",
     };
+
     Response::Error { message: format!("`{name}` is not implemented yet") }
 }
 
@@ -147,19 +163,24 @@ where
     R: AsyncBufRead + Unpin,
 {
     let line = read_line(reader, MAX_LINE_BYTES).await?;
-    Ok(serde_json::from_str(&line)?)
+    let message = serde_json::from_str(&line)?;
+
+    Ok(message)
 }
 
 /// Reads one newline-terminated line of at most `limit` bytes.
 async fn read_line<R: AsyncBufRead + Unpin>(reader: &mut R, limit: u64) -> Result<String, ConnectionError> {
     let mut line = String::new();
     let read = (&mut *reader).take(limit).read_line(&mut line).await?;
+
     if line.ends_with('\n') {
         return Ok(line);
     }
+
     if read as u64 == limit {
         return Err(ConnectionError::LineTooLong);
     }
+
     Err(ConnectionError::Closed)
 }
 
@@ -171,6 +192,7 @@ where
     let mut line = serde_json::to_vec(message)?;
     line.push(b'\n');
     writer.write_all(&line).await?;
+
     Ok(())
 }
 
@@ -181,6 +203,7 @@ mod tests {
     #[tokio::test]
     async fn read_line_never_returns_partial_lines() {
         let cases: [(&[u8], &str); 4] = [(b"abc\n", "abc\n"), (b"abcd\n", "too long"), (b"abc", "closed"), (b"", "closed")];
+
         for (input, expected) in cases {
             let mut reader = input;
             let actual = match read_line(&mut reader, 4).await {
@@ -189,6 +212,7 @@ mod tests {
                 Err(ConnectionError::Closed) => "closed".to_string(),
                 Err(error) => error.to_string(),
             };
+
             assert_eq!(actual, expected, "input {input:?}");
         }
     }

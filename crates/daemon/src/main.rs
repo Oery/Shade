@@ -20,6 +20,7 @@ struct Args {
 
 fn main() -> ExitCode {
     let args = Args::parse();
+
     match run(args) {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
@@ -32,14 +33,17 @@ fn main() -> ExitCode {
 fn run(args: Args) -> Result<(), Error> {
     init_tracing()?;
     shade_core::run(args.config)?;
+
     Ok(())
 }
 
 fn init_tracing() -> Result<(), Error> {
     let filter = EnvFilter::builder().with_default_directive(LevelFilter::INFO.into()).from_env_lossy();
     let subscriber = tracing_subscriber::fmt().with_env_filter(filter).with_writer(std::io::stderr);
+
     if let Err(source) = subscriber.try_init() {
         return Err(Error::Tracing(source));
     }
+
     Ok(())
 }

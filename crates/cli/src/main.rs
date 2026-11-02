@@ -76,6 +76,7 @@ impl From<Manage> for shade_proto::Manage {
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
+
     match run(cli) {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
@@ -96,6 +97,7 @@ fn run(cli: Cli) -> Result<(), Error> {
         Command::Usage => Request::Usage,
         Command::Backup { path } => Request::Backup { path: absolute(path)? },
     };
+
     client::request(&request)
 }
 
