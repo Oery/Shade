@@ -149,8 +149,18 @@ and test this in M2, where compaction becomes reachable.
 
 ### Model provider
 
-- `infinity-provider-rig` + `rig::providers::anthropic::Client::<ReqwestClient>::new(key)`.
-  `from_env` panics on a missing key; Shade reads the configured variable itself.
+- `infinity-provider-rig` with rig's Anthropic client or its OpenAI Chat
+  Completions client (`openai::CompletionsClient`), built through
+  `Client::builder()` so `base_url` and headers can be set. `from_env` panics on
+  a missing key; Shade reads the configured variable itself.
+- `ModelSource::resolve` receives the thread ID every round, so `model.rs`
+  builds the rig client there (sharing one reqwest pool) and sends the thread ID
+  in the configured `session_header`. OpenCode Go returns 400
+  `MissingSessionID` without `x-opencode-session`.
+- rig's Chat Completions client ignores `max_tokens` and neither streams nor
+  returns reasoning content (`reasoning_content`); assistant reasoning in
+  history is dropped. Models that require reasoning to be sent back across tool
+  calls may degrade or fail there. Verify with a real key.
 - **Bug:** Infinity sends `max_tokens: None` ([event_processor.rs:1530][core-max])
   and the rig bridge does not fill it from `ModelEntry`, so Anthropic rejects
   every request. `model.rs` wraps the model to set it. Worth reporting upstream.
@@ -192,6 +202,8 @@ Both adjustments are pure functions over `(pattern, tz, instant)`; test them in 
 ## Open items
 
 - Real-key check: one streamed reply from `shade ask` (the M1 check). The
-  pipeline is verified up to Anthropic's authentication: an invalid key returns
+  pipeline is verified up to authentication for Anthropic and for both OpenCode
+  Go formats (Anthropic Messages and Chat Completions): an invalid key returns
   a clean 401 to the client.
+- Reasoning round trip through rig's Chat Completions client (above).
 - Thinking-block round trip and compaction against Claude Opus 5.5 (above).

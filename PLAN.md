@@ -145,7 +145,7 @@ Split a module from `shade-core` into its own crate when it has a distinct respo
 | --- | --- | --- |
 | Persistence | `rusqlite` with `bundled`, WAL, foreign keys | One local transactional database. |
 | Database access | One worker owns the connection; async request/response channels | SQLite work cannot stall the local agent core. Move owned parameters into requests; use necessary copies when appropriate. |
-| Model | Infinity's rig bridge; Anthropic initially | Reuse supported provider integration. |
+| Model | Infinity's rig bridge; Anthropic Messages or OpenAI Chat Completions, optionally through a gateway (`base_url`) | Reuse supported provider integration. |
 | MCP agent tools | Infinity MCP bridge | Avoid implementing a client inside Shade. |
 | MCP watches | Official `rmcp` if the bridge lacks required APIs | Resource notifications need a long-lived client outside a model tool invocation. |
 | Configuration | TOML with serde | Readable, human-controlled policy. |
@@ -472,7 +472,7 @@ Rate limits apply per root budget scope, including descendants. Runtime run-fail
 
 ### F11. Model configuration
 
-Configure provider, model ID, API-key environment variable, context window, and maximum output tokens. Use an actual verified model ID in the checked-in example rather than an invented future model name. Limits come from provider documentation and are checked in M1.
+Configure provider (`anthropic` or `openai_compatible`), model ID, API-key environment variable, optional `base_url`, optional `session_header`, context window, and maximum output tokens. Shade implements `ModelSource` itself so each request carries `User-Agent: shade/<version>` and, when `session_header` is set, the thread ID in that header (OpenCode Go requires `x-opencode-session` and rejects requests without it). Use an actual verified model ID in the checked-in example rather than an invented future model name. Limits come from provider documentation and are checked in M1.
 
 The configured provider is reused. Shared round/deadline limits are enforced before starting a completion. Provider errors use bounded retries with clear terminal run status; retries are counted and do not escape the run deadline. Per-job models through `ModelSource` remain deferred.
 

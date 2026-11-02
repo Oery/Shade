@@ -10,6 +10,7 @@ shade-proto.workspace = true
 async-trait.workspace = true
 infinity-agent-core.workspace = true
 infinity-provider-protocol.workspace = true
+http.workspace = true
 infinity-provider-rig.workspace = true
 rig-core.workspace = true
 serde.workspace = true

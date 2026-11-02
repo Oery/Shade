@@ -15,6 +15,7 @@ async-trait = "0.1"
 clap = { version = "4.6.7", features = ["derive"] }
 infinity-agent-core = "=0.2.0"
 infinity-provider-protocol = "=0.2.0"
+http = "1.5.0"
 infinity-provider-rig = "=0.2.0"
 rig-core = "=0.31.0"
 serde = { version = "1.0.229", features = ["derive"] }

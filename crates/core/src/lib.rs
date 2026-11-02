@@ -16,6 +16,7 @@ use tokio::task::LocalSet;
 pub use error::Error;
 
 use crate::adapters::socket::ControlSocket;
+use crate::model::Model;
 use crate::router::Router;
 
 /// Pending asks between the control socket and the router.
@@ -43,12 +44,13 @@ async fn serve(config_path: Option<PathBuf>) -> Result<(), Error> {
 
     // Declared before the socket so the socket file is removed while the lock is still held.
     let _lock = lock::acquire(&data_dir)?;
-    let model = model::static_model(&config.model).await?;
-    let router = Router::start(model);
+    let model = Model::new(config.model)?;
 
     let (asks, ask_queue) = mpsc::channel(ASK_QUEUE);
     let socket = ControlSocket::bind(shade_proto::socket_path(&data_dir), asks)?;
-    tracing::info!(path = %socket.path().display(), model = %config.model.id, "listening");
+    tracing::info!(path = %socket.path().display(), model = %model.id(), "listening");
+
+    let router = Router::start(model);
 
     let result = tokio::select! {
         () = socket.serve() => Ok(()),

@@ -4,10 +4,12 @@ use infinity_agent_core::ThreadId;
 use infinity_agent_core::message::InputMessage;
 use infinity_agent_core::stores::{InMemoryConversationStore, InMemoryStateStore};
 use infinity_agent_core::system::local::{LaunchingSystem, ThreadHandle};
-use infinity_agent_core::system::{AgentEvent, AgentSystemBuilder, NoRapHttp, StaticModel};
+use infinity_agent_core::system::{AgentEvent, AgentSystemBuilder, NoRapHttp};
 use infinity_agent_core::traits::ConversationStore;
 use shade_proto::Response;
 use tokio::sync::mpsc;
+
+use crate::model::Model;
 
 /// Capacity of each reply stream between the router and a socket connection.
 pub const REPLY_QUEUE: usize = 64;
@@ -25,7 +27,7 @@ pub struct Router {
 
 impl Router {
     /// Built-in tools stay off: spawning has no limit hook (see docs/infinity-notes.md).
-    pub fn start(model: StaticModel) -> Self {
+    pub fn start(model: Model) -> Self {
         let conversations = InMemoryConversationStore::new();
         let builder = AgentSystemBuilder::new_local(conversations.clone(), InMemoryStateStore::new(), model);
         let system = builder.without_builtin_tools().start();

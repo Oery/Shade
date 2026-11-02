@@ -7,3 +7,18 @@ id = "claude-opus-5-5"
 api_key_env = "ANTHROPIC_API_KEY"
 context_window = 1000000
 max_output_tokens = 128000
+
+# OpenCode Go subscription instead (https://opencode.ai/docs/en/go/).
+# Use the API format the model page lists: `openai_compatible` with
+# base_url ".../go/openai/v1", or `anthropic` with base_url ".../go/anthropic".
+# Limits per model: https://models.dev/api.json under "opencode-go".
+#
+# [model]
+# provider = "openai_compatible"
+# base_url = "https://opencode.ai/inference/go/openai/v1"
+# # OpenCode routes by conversation and rejects requests without this header.
+# session_header = "x-opencode-session"
+# id = "kimi-k3"
+# api_key_env = "OPENCODE_API_KEY"
+# context_window = 1048576
+# max_output_tokens = 131072

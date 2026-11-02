@@ -1857,6 +1857,7 @@ name = "shade-core"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "http",
  "infinity-agent-core",
  "infinity-provider-protocol",
  "infinity-provider-rig",
