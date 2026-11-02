@@ -1,0 +1,9 @@
+# Copy to ~/.config/shade/config.toml (or pass `shaded --config PATH`).
+
+[model]
+provider = "anthropic"
+id = "claude-opus-5-5"
+# Environment variable holding the API key. The key itself never goes in this file.
+api_key_env = "ANTHROPIC_API_KEY"
+context_window = 1000000
+max_output_tokens = 128000

@@ -1,30 +1,40 @@
 //! Shade runtime. The `shaded` binary is a thin wrapper around [`run`].
 
 mod adapters;
+mod config;
 mod error;
 mod lock;
+mod model;
+mod router;
 
 use std::path::PathBuf;
 
 use tokio::signal::unix::{SignalKind, signal};
+use tokio::sync::mpsc;
+use tokio::task::LocalSet;
 
 pub use error::Error;
 
 use crate::adapters::socket::ControlSocket;
+use crate::router::Router;
+
+/// Pending asks between the control socket and the router.
+const ASK_QUEUE: usize = 16;
 
 /// Runs the daemon until SIGINT or SIGTERM.
 pub fn run(config: Option<PathBuf>) -> Result<(), Error> {
-    tracing::info!(?config, "starting shade daemon");
-
     let runtime = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
         Ok(runtime) => runtime,
         Err(source) => return Err(Error::Runtime(source)),
     };
 
-    runtime.block_on(serve())
+    // Infinity's local agents are `!Send`, so they live on a `LocalSet`.
+    runtime.block_on(LocalSet::new().run_until(serve(config)))
 }
 
-async fn serve() -> Result<(), Error> {
+async fn serve(config_path: Option<PathBuf>) -> Result<(), Error> {
+    let config = config::load(config_path)?;
+
     let Some(data_dir) = shade_proto::data_dir() else {
         return Err(Error::NoDataDir);
     };
@@ -33,13 +43,22 @@ async fn serve() -> Result<(), Error> {
 
     // Declared before the socket so the socket file is removed while the lock is still held.
     let _lock = lock::acquire(&data_dir)?;
-    let socket = ControlSocket::bind(shade_proto::socket_path(&data_dir))?;
-    tracing::info!(path = %socket.path().display(), "listening");
+    let model = model::static_model(&config.model).await?;
+    let router = Router::start(model);
 
-    tokio::select! {
+    let (asks, ask_queue) = mpsc::channel(ASK_QUEUE);
+    let socket = ControlSocket::bind(shade_proto::socket_path(&data_dir), asks)?;
+    tracing::info!(path = %socket.path().display(), model = %config.model.id, "listening");
+
+    let result = tokio::select! {
         () = socket.serve() => Ok(()),
+        () = router.serve(ask_queue) => Ok(()),
         result = shutdown_signal() => result,
-    }
+    };
+
+    router.shutdown().await;
+
+    result
 }
 
 async fn shutdown_signal() -> Result<(), Error> {

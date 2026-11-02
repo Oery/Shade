@@ -7,11 +7,21 @@ publish.workspace = true
 
 [dependencies]
 shade-proto.workspace = true
+async-trait.workspace = true
+infinity-agent-core.workspace = true
+infinity-provider-protocol.workspace = true
+infinity-provider-rig.workspace = true
+rig-core.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
+toml.workspace = true
 tokio.workspace = true
 tracing.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+infinity-provider-protocol = { workspace = true, features = ["mock"] }
 
 [lints]
 workspace = true

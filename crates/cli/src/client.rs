@@ -9,7 +9,7 @@ use shade_proto::{Hello, MAX_LINE_BYTES, PROTOCOL_VERSION, Request, Response};
 
 use crate::error::Error;
 
-/// Sends one request and waits for its final response.
+/// Sends one request and prints streamed text until the final response.
 pub fn request(request: &Request) -> Result<(), Error> {
     let stream = connect()?;
 
@@ -18,12 +18,24 @@ pub fn request(request: &Request) -> Result<(), Error> {
     write_message(&mut writer, request)?;
 
     let mut reader = BufReader::new(&stream);
-    let response = read_message(&mut reader)?;
+    let mut stdout = std::io::stdout();
 
-    match response {
-        Response::Done => Ok(()),
-        Response::Error { message } => Err(Error::Daemon(message)),
+    loop {
+        let response = read_message(&mut reader)?;
+
+        match response {
+            Response::Text { text } => {
+                stdout.write_all(text.as_bytes())?;
+                stdout.flush()?;
+            }
+            Response::Done => break,
+            Response::Error { message } => return Err(Error::Daemon(message)),
+        }
     }
+
+    writeln!(stdout)?;
+
+    Ok(())
 }
 
 fn connect() -> Result<UnixStream, Error> {

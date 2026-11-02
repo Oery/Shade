@@ -12,9 +12,10 @@ use shade_proto::{Hello, MAX_LINE_BYTES, PROTOCOL_VERSION, Request, Response};
 use thiserror::Error;
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
-use tokio::sync::Semaphore;
+use tokio::sync::{Semaphore, mpsc};
 
 use crate::Error;
+use crate::router::{Ask, REPLY_QUEUE};
 
 const MAX_CONNECTIONS: usize = 16;
 
@@ -36,15 +37,18 @@ enum ConnectionError {
     ForeignPeer(u32),
 }
 
+type Writer = tokio::net::unix::OwnedWriteHalf;
+
 pub struct ControlSocket {
     listener: UnixListener,
     path: PathBuf,
     owner_uid: u32,
+    asks: mpsc::Sender<Ask>,
 }
 
 impl ControlSocket {
     /// The caller must hold the execution lock: it proves a leftover socket file is stale.
-    pub fn bind(path: PathBuf) -> Result<Self, Error> {
+    pub fn bind(path: PathBuf, asks: mpsc::Sender<Ask>) -> Result<Self, Error> {
         if let Err(source) = remove_if_present(&path) {
             return Err(Error::Socket { path, source });
         }
@@ -59,7 +63,7 @@ impl ControlSocket {
             Err(source) => return Err(Error::Socket { path, source }),
         };
 
-        Ok(Self { listener, path, owner_uid })
+        Ok(Self { listener, path, owner_uid, asks })
     }
 
     pub fn path(&self) -> &Path {
@@ -84,8 +88,10 @@ impl ControlSocket {
             };
 
             let owner_uid = self.owner_uid;
+            let asks = self.asks.clone();
+
             tokio::spawn(async move {
-                if let Err(error) = handle(stream, owner_uid).await {
+                if let Err(error) = handle(stream, owner_uid, asks).await {
                     tracing::warn!(%error, "control connection failed");
                 }
 
@@ -118,7 +124,7 @@ fn restrict_to_owner(path: &Path) -> std::io::Result<u32> {
     Ok(metadata.uid())
 }
 
-async fn handle(stream: UnixStream, owner_uid: u32) -> Result<(), ConnectionError> {
+async fn handle(stream: UnixStream, owner_uid: u32, asks: mpsc::Sender<Ask>) -> Result<(), ConnectionError> {
     let peer_uid = stream.peer_cred()?.uid();
 
     if peer_uid != owner_uid {
@@ -138,12 +144,37 @@ async fn handle(stream: UnixStream, owner_uid: u32) -> Result<(), ConnectionErro
     }
 
     let request: Request = read_message(&mut reader).await?;
-    let response = dispatch(request);
 
-    write_message(&mut write, &response).await
+    match request {
+        Request::Ask { prompt } => forward_ask(prompt, &asks, &mut write).await,
+        other => write_message(&mut write, &not_implemented(other)).await,
+    }
 }
 
-fn dispatch(request: Request) -> Response {
+/// Streams the router's replies until the final one.
+async fn forward_ask(prompt: String, asks: &mpsc::Sender<Ask>, write: &mut Writer) -> Result<(), ConnectionError> {
+    let (reply, mut replies) = mpsc::channel(REPLY_QUEUE);
+
+    if asks.send(Ask { prompt, reply }).await.is_err() {
+        let message = "the daemon is shutting down".to_owned();
+        return write_message(write, &Response::Error { message }).await;
+    }
+
+    while let Some(response) = replies.recv().await {
+        let terminal = !matches!(response, Response::Text { .. });
+        write_message(write, &response).await?;
+
+        if terminal {
+            return Ok(());
+        }
+    }
+
+    let message = "the turn ended without a reply".to_owned();
+
+    write_message(write, &Response::Error { message }).await
+}
+
+fn not_implemented(request: Request) -> Response {
     let name = match request {
         Request::Ask { .. } => "ask",
         Request::Schedule { .. } => "schedule",

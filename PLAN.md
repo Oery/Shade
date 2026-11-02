@@ -40,6 +40,8 @@ The v0.2 documentation supports the following starting points. Exact behavior is
 
 M1 records exact crate versions and source revision. Version examples such as `0.2.x` are explanatory placeholders, not valid final exact pins. Commit `Cargo.lock` and use concrete compatible versions.
 
+M1 answers, with source links and probes, are in `docs/infinity-notes.md`. Where they differ from the assumptions above, the notes win and the sections below have been updated.
+
 ## 2. Architecture
 
 ### 2.1 Process and ownership
@@ -107,7 +109,7 @@ crates/
         state.rs            Infinity StateStore
       grants.rs             origins, capabilities, delegation, root ownership
       model.rs              provider and completion-budget enforcement
-      core.rs               routing, registration, output pumps, shutdown
+      router.rs             routing, registration, output pumps, shutdown
       delivery.rs           persisted ingress/results and replay
       runs.rs               run lifecycle, shared limits, cancellation
       scheduler.rs          schedule claims and overlap handling
@@ -226,7 +228,7 @@ Rules:
 6. **Tool execution checks authority.** Hiding a tool from the model is useful, but dispatch also validates the caller's root grant, origin, and remaining limits. Every bridge tool is bound to its MCP server capability.
 7. **Policy changes require restart initially.** Parse and validate config once. Stop acceptance and shut down current runs before restarting with a new config. No hot-reload or immediate revocation promise. Fresh resolution and dispatch use that process's immutable validated policy.
 
-Root registration must commit the thread identity, grant, run metadata where applicable, and first pending input before attaching or sending anything that can load the thread. Prefer caller-assigned root IDs with supported store/sender APIs if M1 confirms them. Do not call `launch()`, insert a grant afterward, and assume configuration has not already resolved.
+Root registration must commit the thread identity, grant, run metadata where applicable, and first pending input before attaching or sending anything that can load the thread. M1 confirmed the path: Shade picks the root ID, commits the rows, then calls `LaunchingSystem::thread_handle(id)`; configuration resolves on the first input, not on attach. Do not call `launch()`. Infinity calls `ensure_root_thread` for any thread it loads, so Shade's store must never create a root there; registration is the only way a root comes to exist.
 
 Job updates apply to future runs. Active roots retain their recorded grant snapshot, bounded by the current process policy. Pause/delete stops future trigger creation; it does not silently roll back or terminate external work already in progress. Shutdown is the initial owner mechanism for stopping active work.
 
@@ -254,7 +256,7 @@ For background work, the root run is one trigger occurrence. For chat, the budge
 
 When a limit is reached, stop further model/tool dispatch, cancel owned tasks where supported, record `limit_exceeded`, and send one runtime failure notice. Reserve that notice outside the model's notification allowance. Cancellation cannot undo external side effects already committed.
 
-Built-in spawning may remain enabled only if M1 identifies an enforceable hook for child count, shared budgets, and root registration. Otherwise use `without_builtin_tools()` initially and defer model-controlled subagents; do not build a custom orchestration framework merely to preserve them in the first release.
+M1 found no enforceable spawn hook, so Shade uses `without_builtin_tools()` and defers model-controlled subagents; do not build a custom orchestration framework merely to preserve them in the first release. Auto-compaction still needs `close_thread`, so the config source adds Infinity's public `CloseThreadTool` for compaction threads only.
 
 ## 3. Features and failure semantics
 
@@ -286,7 +288,7 @@ For a schedule occurrence, one transaction claims the occurrence, creates its pe
 
 After commit, dispatch the same persisted root and stable input ID. Replay unfinished delivery on startup. Never create a new root on each retry. Deduplicate schedule occurrences with a unique `(schedule_id, scheduled_for)` key and provider webhook deliveries with `(hook_id, provider_delivery_id)` when available.
 
-M1 and M8 must establish the actual Infinity acknowledgment/replay contract, including crashes between history persistence, processed-ID persistence, and continuation. Mark an inbox record accepted only after an authoritative durable processing boundary. A channel send, event subscription, or observer callback alone is insufficient evidence.
+Infinity's local mode has no acknowledgment hook, and it writes history and processed IDs in two separate store calls. Shade's `append_messages` therefore records processed IDs for user and subscription-event messages in the same transaction as the history rows. An inbox record is accepted once its input ID is in processed IDs; checking that after `CompletionFinished` or the thread's idle event is the durable boundary. A channel send, event subscription, or observer callback alone is insufficient evidence.
 
 If local mode cannot expose a reliable boundary, use Infinity's supported step/input interface for durable handoff and recovery, or make a small upstream integration change. Resolve this before shipping unattended triggers. Do not silently claim durable delivery on top of a volatile local queue.
 
@@ -363,7 +365,7 @@ Timezone policy is explicit:
 - One-shot requests require an offset or an explicitly resolved timezone. Reject ambiguous/nonexistent wall times until the model supplies an unambiguous instant.
 - Store instants in UTC. Retain timezone/spec for display and next-occurrence computation.
 
-Use the parser's timezone/DST options where supported; verify their behavior. Test Shade's chosen policy, not the dependency's parser internals. The previous blanket claim that a 02:30 job fires once on every DST day is intentionally removed.
+`croner` runs fixed-time jobs right after a spring-forward gap and wildcard/interval jobs in both passes of a fall-back hour (M1). Shade filters both cases: drop an occurrence whose wall time no longer matches the pattern, and drop second-pass occurrences. Test Shade's chosen policy, not the dependency's parser internals. The previous blanket claim that a 02:30 job fires once on every DST day is intentionally removed.
 
 Tools accept a structured trigger rather than guessing cron versus datetime from arbitrary text. For example, `{ "kind": "cron", "expression": "0 8 * * 1-5", "timezone": "Europe/Paris" }` or `{ "kind": "once", "at": "2026-11-06T09:00:00+01:00" }`. Validate future instants and cap active definitions at 100 initially.
 
@@ -548,9 +550,9 @@ Each milestone is one reviewable PR. `Check` is a manual demonstration; `Tests` 
 ### M2 — SQLite worker and conversation store
 
 - **Goal:** persist history without blocking the core.
-- **Scope:** worker thread, bounded requests, migrations, WAL/foreign keys, ConversationStore, parent links, messages, and summaries.
+- **Scope:** worker thread, bounded requests, migrations, WAL/foreign keys, ConversationStore, parent links, messages, and summaries. `ensure_root_thread` never creates rows; processed IDs are written with history; `CloseThreadTool` for compaction threads.
 - **Check:** `ask` works with SQLite and database errors surface clearly.
-- **Tests:** reference-store parity for offset bounds, compaction selection, inherited-history Fresh boundaries, and structural parent lookup. Atomic append on failure; no duplicate persisted message IDs.
+- **Tests:** reference-store parity for offset bounds, compaction selection, inherited-history Fresh boundaries, and structural parent lookup through a Fresh child. Atomic append on failure; no duplicate persisted message IDs; unknown thread IDs never become roots; compaction completes with built-ins off.
 
 ### M3 — State store and replay primitives
 
