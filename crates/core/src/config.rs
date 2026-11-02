@@ -1,7 +1,7 @@
 //! Daemon configuration: a human-controlled TOML file.
 
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 
@@ -37,19 +37,22 @@ pub enum Provider {
     OpenaiCompatible,
 }
 
-/// Reads the file at `path`, or at the XDG default when `path` is `None`.
-pub fn load(path: Option<PathBuf>) -> Result<Config, Error> {
-    let Some(path) = path.or_else(shade_proto::config_file) else {
-        return Err(Error::NoConfigDir);
-    };
+/// The given path, or the XDG default when there is none.
+pub fn path(path: Option<PathBuf>) -> Result<PathBuf, Error> {
+    match path.or_else(shade_proto::config_file) {
+        Some(path) => Ok(path),
+        None => Err(Error::NoConfigDir),
+    }
+}
 
-    let text = match fs::read_to_string(&path) {
+pub fn load(path: &Path) -> Result<Config, Error> {
+    let text = match fs::read_to_string(path) {
         Ok(text) => text,
-        Err(source) => return Err(Error::ConfigRead { path, source }),
+        Err(source) => return Err(Error::ConfigRead { path: path.to_owned(), source }),
     };
 
     match toml::from_str(&text) {
         Ok(config) => Ok(config),
-        Err(source) => Err(Error::ConfigParse { path, source }),
+        Err(source) => Err(Error::ConfigParse { path: path.to_owned(), source }),
     }
 }

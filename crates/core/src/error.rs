@@ -30,7 +30,13 @@ pub enum Error {
     #[error("invalid config {path}: {source}")]
     ConfigParse { path: PathBuf, source: toml::de::Error },
 
-    #[error("environment variable {0} (model.api_key_env) is not set")]
+    #[error("cannot read secrets {path}: {source}")]
+    SecretsRead { path: PathBuf, source: BoxError },
+
+    #[error("secrets file {path} is accessible to other users; run `chmod 600` on it")]
+    SecretsExposed { path: PathBuf },
+
+    #[error("{0} (model.api_key_env) is not set in the environment or the .env file next to the config")]
     MissingApiKey(String),
 
     #[error("cannot set up the model: {0}")]

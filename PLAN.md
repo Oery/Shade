@@ -149,7 +149,7 @@ Split a module from `shade-core` into its own crate when it has a distinct respo
 | MCP agent tools | Infinity MCP bridge | Avoid implementing a client inside Shade. |
 | MCP watches | Official `rmcp` if the bridge lacks required APIs | Resource notifications need a long-lived client outside a model tool invocation. |
 | Configuration | TOML with serde | Readable, human-controlled policy. |
-| Secrets | Environment variables referenced by name | Keep secrets out of configuration and git. |
+| Secrets | Variables referenced by name, from the environment or a `0600` `.env` next to the config (environment wins; the file is parsed into a map, never into the process environment) | Keep secrets out of configuration, git, and child processes. |
 | Discord / HTTP | `serenity` / `axum` | Use existing gateway and HTTP machinery. |
 | Cron / timezone | `croner` and compatible timezone support verified in M1 | Delegate parsing; define Shade's DST and catch-up policy explicitly. |
 | CLI / diagnostics | `clap`, `tracing`, `tracing-subscriber` | Small adapters and consistent stderr logging. |

@@ -13,6 +13,7 @@ shade-core = { path = "crates/core" }
 shade-proto = { path = "crates/proto" }
 async-trait = "0.1"
 clap = { version = "4.6.7", features = ["derive"] }
+dotenvy = "0.15.7"
 infinity-agent-core = "=0.2.0"
 infinity-provider-protocol = "=0.2.0"
 http = "1.5.0"

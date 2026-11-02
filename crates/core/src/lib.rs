@@ -6,6 +6,7 @@ mod error;
 mod lock;
 mod model;
 mod router;
+mod secrets;
 
 use std::path::PathBuf;
 
@@ -18,6 +19,7 @@ pub use error::Error;
 use crate::adapters::socket::ControlSocket;
 use crate::model::Model;
 use crate::router::Router;
+use crate::secrets::Secrets;
 
 /// Pending asks between the control socket and the router.
 const ASK_QUEUE: usize = 16;
@@ -34,7 +36,9 @@ pub fn run(config: Option<PathBuf>) -> Result<(), Error> {
 }
 
 async fn serve(config_path: Option<PathBuf>) -> Result<(), Error> {
-    let config = config::load(config_path)?;
+    let config_path = config::path(config_path)?;
+    let config = config::load(&config_path)?;
+    let mut secrets = Secrets::load(secrets::path_for(&config_path))?;
 
     let Some(data_dir) = shade_proto::data_dir() else {
         return Err(Error::NoDataDir);
@@ -44,7 +48,7 @@ async fn serve(config_path: Option<PathBuf>) -> Result<(), Error> {
 
     // Declared before the socket so the socket file is removed while the lock is still held.
     let _lock = lock::acquire(&data_dir)?;
-    let model = Model::new(config.model)?;
+    let model = Model::new(config.model, &mut secrets)?;
 
     let (asks, ask_queue) = mpsc::channel(ASK_QUEUE);
     let socket = ControlSocket::bind(shade_proto::socket_path(&data_dir), asks)?;

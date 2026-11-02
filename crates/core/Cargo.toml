@@ -8,6 +8,7 @@ publish.workspace = true
 [dependencies]
 shade-proto.workspace = true
 async-trait.workspace = true
+dotenvy.workspace = true
 infinity-agent-core.workspace = true
 infinity-provider-protocol.workspace = true
 http.workspace = true

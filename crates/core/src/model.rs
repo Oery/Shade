@@ -21,6 +21,7 @@ use rig::providers::{anthropic, openai};
 use crate::Error;
 use crate::config::{ModelConfig, Provider};
 use crate::error::BoxError;
+use crate::secrets::Secrets;
 
 /// Gateways ask clients to identify themselves rather than as a generic HTTP library.
 const AGENT: &str = concat!("shade/", env!("CARGO_PKG_VERSION"));
@@ -34,8 +35,8 @@ pub struct Model {
 
 impl Model {
     /// Reads the API key and checks the configuration, so mistakes surface at startup.
-    pub fn new(config: ModelConfig) -> Result<Self, Error> {
-        let Ok(api_key) = std::env::var(&config.api_key_env) else {
+    pub fn new(config: ModelConfig, secrets: &mut Secrets) -> Result<Self, Error> {
+        let Some(api_key) = secrets.take(&config.api_key_env) else {
             return Err(Error::MissingApiKey(config.api_key_env));
         };
 
