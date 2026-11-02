@@ -25,7 +25,7 @@ const DB_QUEUE: usize = 64;
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Applied in order; `PRAGMA user_version` counts how many have run.
-const MIGRATIONS: &[&str] = &[include_str!("../migrations/0001_conversations.sql")];
+const MIGRATIONS: &[&str] = &[include_str!("../migrations/0001_conversations.sql"), include_str!("../migrations/0002_thread_state.sql")];
 
 type Job = Box<dyn FnOnce(&mut Connection) + Send>;
 

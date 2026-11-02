@@ -101,6 +101,15 @@ user text carries its dedup ID, and synthetic results derive theirs from the
 tool call. Shade keys history rows on `(thread, ord)` and treats only processed
 IDs as unique.
 
+### Reloaded threads with an unanswered tool call (M3)
+
+A thread whose stored history ends with a tool call and no result does not go
+idle when attached: its driver stays live expecting the result. A result sent
+later with the call ID is still accepted and reaches the model (processed IDs
+do not hide it). If the result never comes, for example because the tool
+process died with the daemon, the thread waits forever. Startup recovery (M7)
+must send the captured result or an explicit unknown-outcome result.
+
 ### Local delivery path
 
 Local mode uses unbounded in-process channels ([sender.rs:36][core-sender]) with

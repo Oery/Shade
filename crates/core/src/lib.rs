@@ -9,6 +9,8 @@ mod model;
 mod router;
 mod secrets;
 mod store;
+#[cfg(test)]
+mod testing;
 mod thread_config;
 
 use std::path::PathBuf;
@@ -24,7 +26,6 @@ use crate::db::Db;
 use crate::model::Model;
 use crate::router::Router;
 use crate::secrets::Secrets;
-use crate::store::conversation::Conversations;
 
 /// Pending asks between the control socket and the router.
 const ASK_QUEUE: usize = 16;
@@ -60,7 +61,7 @@ async fn serve(config_path: Option<PathBuf>) -> Result<(), Error> {
     let socket = ControlSocket::bind(shade_proto::socket_path(&data_dir), asks)?;
     tracing::info!(path = %socket.path().display(), model = %model.id(), "listening");
 
-    let router = Router::start(model, Conversations::new(db));
+    let router = Router::start(model, db);
 
     let result = tokio::select! {
         () = socket.serve() => Ok(()),

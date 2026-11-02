@@ -563,6 +563,8 @@ Each milestone is one reviewable PR. `Check` is a manual demonstration; `Tests` 
 - **Scope:** StateStore, processed IDs, subscriptions, pending choices; stable-input wrapper selected in M1; recoverable persisted acceptance/continuation boundaries.
 - **Check:** restart/resume using both SQLite stores; repeat the same input ID through the actual runtime path.
 - **Tests:** replacement of an existing pending choice; crashes around history/processed-ID persistence and replay, using the integration path selected in M1. A processed-ID row alone must not hide unfinished continuation work.
+- **Done:** `States` on SQLite (metadata, subscriptions, pending choices; processed IDs share the table history writes). Thread configuration now refuses unregistered threads, so Infinity loading an arbitrary ID cannot reach the model even before grants exist. Restart is tested by starting a second system on the same database.
+- **Finding for M7:** a thread reloaded with an unanswered tool call at the end of its history does not go idle; it stays live waiting for that result. After a crash mid-tool, recovery must deliver the captured result or an explicit unknown-outcome result under the same call ID, or the thread waits forever.
 
 ### M4 — Terminal chat
 
@@ -588,7 +590,7 @@ Each milestone is one reviewable PR. `Check` is a manual demonstration; `Tests` 
 ### M7 — Shell tool and initial operation recovery
 
 - **Goal:** useful commands with bounded execution and honest restart outcomes.
-- **Scope:** async shell tool, streaming bounded capture, deadlines, operation IDs, durable captured results, interruption classification, startup recovery, basic audit records, and shutdown cleanup.
+- **Scope:** async shell tool, streaming bounded capture, deadlines, operation IDs, durable captured results, interruption classification, startup recovery, basic audit records, and shutdown cleanup. Startup recovery must answer every trailing unanswered call (see M3 finding).
 - **Check:** list workspace; report nonzero exit; timeout; kill the daemon mid-command and recover without a hung tool or automatic blind retry.
 - **Tests:** output retention stays bounded, UTF-8-safe truncation, process-tree cleanup on timeout/exit/death, result replay, and unknown-outcome recovery with stable call IDs.
 
