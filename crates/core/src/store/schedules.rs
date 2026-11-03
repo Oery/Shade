@@ -267,6 +267,21 @@ impl Schedules {
         Ok(jobs.into_iter().find(|job| job.id == id))
     }
 
+    /// Archives one-shot jobs that have run, once their run ended more than
+    /// `after` seconds ago. Returns how many.
+    pub async fn archive_done(&self, after: i64) -> Result<usize, DbError> {
+        self.db
+            .call(move |connection| {
+                let sql = "UPDATE schedules SET archived_at = unixepoch()
+                           WHERE archived_at IS NULL AND deleted_at IS NULL AND kind = 'once' AND enabled = 0 AND next_at IS NULL
+                           AND NOT EXISTS (SELECT 1 FROM runs WHERE schedule_id = schedules.id AND status IN ('queued', 'running'))
+                           AND (SELECT MAX(finished_at) FROM runs WHERE schedule_id = schedules.id) <= unixepoch() - ?1";
+
+                Ok(connection.execute(sql, [after])?)
+            })
+            .await
+    }
+
     /// Proposed changes younger than `window` seconds, oldest first.
     pub async fn waiting(&self, window: i64) -> Result<Vec<Waiting>, DbError> {
         self.db
@@ -502,7 +517,7 @@ fn list_jobs(connection: &mut Connection) -> Result<Vec<Job>, DbError> {
     let sql = format!(
         "SELECT s.id, s.version, {}, r.status, r.scheduled_for
          FROM schedules s LEFT JOIN runs r ON r.id = (SELECT id FROM runs WHERE schedule_id = s.id ORDER BY scheduled_for DESC LIMIT 1)
-         WHERE s.deleted_at IS NULL ORDER BY s.enabled DESC, s.next_at, s.created_at",
+         WHERE s.deleted_at IS NULL AND s.archived_at IS NULL ORDER BY s.enabled DESC, s.next_at, s.created_at",
         "s.title, s.kind, s.spec, s.timezone, s.prompt, s.caps, s.channels, s.file, s.enabled, s.next_at"
     );
     let mut statement = connection.prepare(&sql)?;
@@ -658,7 +673,7 @@ fn sync_files(connection: &mut Connection, present: &[String], changed: &[(Strin
         let sql = format!(
             "INSERT INTO schedules (id, {COLUMNS}) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 1, ?9, ?10)
              ON CONFLICT (id) DO UPDATE SET title = ?2, kind = ?3, spec = ?4, timezone = ?5, prompt = ?6, caps = ?7, channels = ?8,
-             file = 1, enabled = ?9, next_at = ?10, deleted_at = NULL, version = version + 1"
+             file = 1, enabled = ?9, next_at = ?10, deleted_at = NULL, archived_at = NULL, version = version + 1"
         );
         transaction.execute(
             &sql,
@@ -793,6 +808,39 @@ mod tests {
         let jobs = schedules.list().await?;
         assert!(jobs.iter().all(|job| !job.definition.enabled && job.definition.next_at.is_none()));
         assert_eq!(schedules.statuses().await?, ["queued"]);
+
+        Ok(())
+    }
+
+    /// A one-shot job leaves the lists a while after its run ends; a job
+    /// still waiting to run, or a cron job, never does.
+    #[tokio::test]
+    async fn done_jobs_are_archived_after_a_while() -> Result<(), BoxError> {
+        let db = Db::in_memory()?;
+        let schedules = Schedules::new(db.clone());
+
+        for id in ["old", "recent", "cron"] {
+            let kind = if id == "cron" { "cron" } else { "once" };
+            schedules.add(id, kind, "0 8 * * *", 0).await?;
+            let next = if kind == "cron" { Some(HOUR) } else { None };
+            schedules.claim(id.to_owned(), 0, next).await?;
+        }
+
+        for queued in schedules.startable(4).await? {
+            schedules.start(queued.run, "go".to_owned()).await?;
+        }
+
+        db.call(|connection| {
+            connection.execute("UPDATE runs SET status = 'completed', finished_at = unixepoch() - 2 * 86400", [])?;
+            connection.execute("UPDATE runs SET finished_at = unixepoch() WHERE schedule_id = 'recent'", [])?;
+            Ok(())
+        })
+        .await?;
+
+        assert_eq!(schedules.archive_done(86_400).await?, 1);
+
+        let listed: Vec<String> = schedules.list().await?.into_iter().map(|job| job.id).collect();
+        assert_eq!(listed, ["cron", "recent"]);
 
         Ok(())
     }

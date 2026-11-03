@@ -11,12 +11,16 @@ use super::{Outbound, Router, SUPERSEDED};
 use crate::notify::Notifier;
 use crate::router::turn::Step;
 use crate::schedule::APPROVAL_WINDOW;
+
+/// How long a one-shot job stays listed after its run, in seconds.
+const ARCHIVE_AFTER: i64 = 24 * 3600;
 use crate::schedule::{self, Trigger};
 use crate::store::db::DbError;
 use crate::store::schedules::{Change, Definition, Due, Pending, Run, Schedules};
 
 impl Router {
-    /// Claims every due occurrence, then starts queued runs while capacity allows.
+    /// Claims every due occurrence, then starts queued runs while capacity
+    /// allows, then archives one-shot jobs that are long done.
     pub async fn schedule(&self, now: DateTime<Utc>) {
         if let Err(error) = self.claim_due(now).await {
             tracing::error!(%error, "cannot claim due jobs");
@@ -24,6 +28,12 @@ impl Router {
 
         if let Err(error) = self.start_queued(now).await {
             tracing::error!(%error, "cannot start queued runs");
+        }
+
+        match self.schedules.archive_done(ARCHIVE_AFTER).await {
+            Ok(0) => {}
+            Ok(count) => tracing::info!(count, "archived one-shot jobs that ran"),
+            Err(error) => tracing::warn!(%error, "cannot archive finished jobs"),
         }
     }
 
