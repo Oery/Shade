@@ -1,7 +1,8 @@
-//! Discord: owner chat from anywhere.
+//! Discord: owner chat from anywhere, and restricted guest mentions.
 //!
-//! Only allowlisted users are heard, in DMs and in server channels where they
-//! mention the bot. Each channel is one conversation. Replies in a server
+//! Owners are heard in DMs and server channels where they mention the bot.
+//! Other users may mention the bot in server channels with guest permissions.
+//! Each channel has separate owner and guest conversations. Replies in a server
 //! channel are visible to everyone who can read it, so private work belongs
 //! in DMs. The bot never pings anyone: replies allow no mentions.
 //!
@@ -49,7 +50,7 @@ const MAX_BUFFER: usize = 16 * 1024;
 
 #[derive(Debug, Error)]
 pub enum DiscordError {
-    #[error("[discord] owners is empty; list the Discord user IDs allowed to chat")]
+    #[error("[discord] owners is empty; list the Discord user IDs with owner permissions")]
     NoOwners,
 
     #[error("[discord] owners starts with 0, which is not a Discord user ID; the first owner receives notifications")]
@@ -165,7 +166,8 @@ impl EventHandler for Handler {
             false => Target::Direct(message.channel_id.to_string()),
         };
         let source_key = Some(format!("discord:{}", message.id));
-        let prompt = Inbound::Prompt { adapter: Adapter::Discord, target, text, source_key, outbound: Outbound::Discord(reply) };
+        let adapter = audience(incoming.author, &self.owners);
+        let prompt = Inbound::Prompt { adapter, target, text, source_key, outbound: Outbound::Discord(reply) };
 
         if self.inbound.send(prompt).await.is_err() {
             tracing::warn!("dropping a Discord message: the daemon is shutting down");
@@ -174,11 +176,11 @@ impl EventHandler for Handler {
 }
 
 impl Handler {
-    /// The bot's own role, when an owner's message mentions it.
+    /// The bot's own role, when a human's message mentions it.
     async fn mentioned_bot_role(&self, http: &Http, message: &Message, bot: u64) -> Option<u64> {
         let guild = message.guild_id?;
 
-        if message.mention_roles.is_empty() || !self.owners.contains(&message.author.id.get()) {
+        if message.mention_roles.is_empty() || message.author.bot {
             return None;
         }
 
@@ -223,15 +225,29 @@ struct Incoming<'a> {
     attachments: Vec<&'a str>,
 }
 
-/// The text to act on, or `None` when the message is not for Shade: from a
-/// bot (this one included), from anyone not allowlisted, or in a server
-/// channel without a mention. Attachments become their URLs.
+/// The conversation namespace also decides its durable grant. Guest input
+/// never enters a root that holds owner permissions or owner history.
+fn audience(author: u64, owners: &[u64]) -> Adapter {
+    if owners.contains(&author) {
+        return Adapter::Discord;
+    }
+
+    Adapter::DiscordGuest
+}
+
+/// Humans may mention Shade in server channels. Only owners may DM it.
+/// Attachments become their URLs.
 fn admit(incoming: &Incoming<'_>, bot: u64, owners: &[u64]) -> Option<String> {
-    if incoming.from_bot || !owners.contains(&incoming.author) {
+    if incoming.from_bot {
         return None;
     }
 
-    if incoming.in_guild && !incoming.mentions_bot {
+    let addressed = match incoming.in_guild {
+        true => incoming.mentions_bot,
+        false => owners.contains(&incoming.author),
+    };
+
+    if !addressed {
         return None;
     }
 
@@ -450,7 +466,7 @@ fn chunks(text: &str, limit: usize) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Incoming, admit, chunks};
+    use super::{Adapter, Incoming, admit, audience, chunks};
 
     #[test]
     fn chunks_respect_lines_and_characters() {
@@ -473,7 +489,7 @@ mod tests {
     }
 
     #[test]
-    fn only_owners_are_heard() {
+    fn owners_can_dm_and_guests_must_mention_in_servers() {
         const BOT: u64 = 9;
         const OWNER: u64 = 1;
 
@@ -496,6 +512,9 @@ mod tests {
             (message(OWNER, false, true, false, "hi"), None),
             (message(OWNER, false, true, true, "<@9> hi"), Some("hi")),
             (message(OWNER, false, true, true, "<@!9>   "), None),
+            (message(2, false, true, false, "hi"), None),
+            (message(2, false, true, true, "<@!9> hi"), Some("hi")),
+            (message(2, true, true, true, "<@9> hi"), None),
         ];
 
         for (incoming, expected) in cases {
@@ -503,10 +522,13 @@ mod tests {
         }
 
         // "@Shade" may resolve to the bot's role; it is stripped like the bot's own mention.
-        let by_role = Incoming { bot_role: Some(5), ..message(OWNER, false, true, true, "<@&5> hi <@&6>") };
+        let by_role = Incoming { bot_role: Some(5), ..message(2, false, true, true, "<@&5> hi <@&6>") };
         assert_eq!(admit(&by_role, BOT, &[OWNER]).as_deref(), Some("hi <@&6>"));
 
-        let with_file = Incoming { attachments: vec!["https://cdn/x.png"], ..message(OWNER, false, true, true, "<@9>") };
+        let with_file = Incoming { attachments: vec!["https://cdn/x.png"], ..message(2, false, true, true, "<@9>") };
         assert_eq!(admit(&with_file, BOT, &[OWNER]).as_deref(), Some("https://cdn/x.png"));
+
+        assert_eq!(audience(OWNER, &[OWNER]), Adapter::Discord);
+        assert_eq!(audience(2, &[OWNER]), Adapter::DiscordGuest);
     }
 }

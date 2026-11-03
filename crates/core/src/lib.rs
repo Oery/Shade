@@ -74,9 +74,10 @@ async fn serve(config_path: Option<PathBuf>) -> Result<(), Error> {
         config::load(&config_path)?;
     let hook_caps = hooks.iter().map(|(name, hook)| (name.to_owned(), hook.caps.clone())).collect();
     let channels = discord.as_mut().map(|discord| std::mem::take(&mut discord.channels)).unwrap_or_default();
+    let discord_guests = discord.as_mut().map(|discord| std::mem::take(&mut discord.guests.caps)).unwrap_or_default();
     let servers = mcp.iter().map(|(name, server)| (name.to_owned(), server.description.to_owned())).collect();
     let memory = start_memory(memory, &mcp, &config_path)?;
-    let sections = config::Sections { chat, jobs, hooks: hook_caps, limits, timezone, channels, servers };
+    let sections = config::Sections { chat, discord_guests, jobs, hooks: hook_caps, limits, timezone, channels, servers };
     let policy = config::policy(&config_path, sections)?;
     let mut secrets = Secrets::load(secrets::path_for(&config_path))?;
 

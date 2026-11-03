@@ -81,7 +81,8 @@ touch ~/.config/shade/.env && chmod 600 ~/.config/shade/.env
 | Section | Gives |
 | --- | --- |
 | `[chat]` | What owner chat may use: `now`, `notify`, `shell`, `shell_network`, `schedules`, and MCP server names. |
-| `[discord]` | Owner chat on Discord (DMs and mentions), notifications, approval buttons. |
+| `[discord]` | Owner chat (DMs and mentions), guest mentions, notifications, approval buttons. |
+| `[discord.guests]` | Tools non-owners may use when mentioning the bot in server channels; none by default. |
 | `[sandbox]` | Where `shell` runs. Required when anything holds `shell`. |
 | `[mcp.<name>]` | An MCP server over stdio; its name becomes a capability. |
 | `[memory]` | Memories in the vault of one MCP server. |
@@ -90,6 +91,15 @@ touch ~/.config/shade/.env && chmod 600 ~/.config/shade/.env
 | `[limits]` | Bounds on every turn and run, and on background work. |
 
 The config is read once: restart `shaded` to apply a change.
+
+On Discord, `owners` use `[chat]` permissions. Other users can mention the bot
+in server channels with `[discord.guests] caps` (for example, `["now"]`). Guests
+cannot DM the bot, manage schedules or watches, use `/new`, or approve changes.
+Every channel has separate owner and guest histories; guests share one
+conversation in that channel and do not receive the owner's custom chat prompt.
+Guest capabilities are configured independently of owner capabilities. Giving
+guests an MCP server also shares that server's tools and any memory tied to it;
+`notify`, if granted, may message only the owner.
 
 ## Run
 
@@ -182,7 +192,7 @@ XDG_DATA_HOME=/tmp/restore shade usage
 
 ## Operating limits
 
-- **One owner.** The control socket trusts the local user who runs `shaded`; Discord answers only the configured owners. There are no other users.
+- **Owner control.** The control socket trusts the local user who runs `shaded`. Discord owners use `[chat]`; other users' server mentions use `[discord.guests]`, with separate history and no tools by default.
 - **No exactly-once side effects.** A tool call interrupted before its result was recorded is reported as possibly done, never retried blindly. Notifications and MCP writes can therefore be missed or, if the model retries after checking, done once more.
 - **Grants limit, they do not judge.** A conversation, job or webhook can only use what it was granted, but whatever writes to it (a webhook sender, a web page the shell fetches, a note in the vault) can steer what it does within those caps. Grant narrowly.
 - **The sandbox isolates, it does not meter.** Shell commands see only the workspace and get no network without `shell_network`; time and output are bounded, CPU, memory and disk are not.

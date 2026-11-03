@@ -298,7 +298,7 @@ impl Router {
         };
 
         let key = match self.roots.conversation_of(thread).await {
-            Ok(Some(Conversation { adapter: Adapter::Discord, key, .. })) => key,
+            Ok(Some(Conversation { adapter: Adapter::Discord | Adapter::DiscordGuest, key, .. })) => key,
             Ok(_) => return detached,
             Err(error) => {
                 tracing::warn!(%error, %thread, "cannot find where resumed work reports");

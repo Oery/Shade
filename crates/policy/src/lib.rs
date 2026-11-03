@@ -95,6 +95,8 @@ pub fn is_server_name(name: &str) -> bool {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Origin {
     Chat,
+    /// A non-owner mentioning Shade in a Discord server channel.
+    Guest,
     Schedule,
     Watch,
     Webhook,
@@ -104,6 +106,7 @@ impl Origin {
     pub fn name(self) -> &'static str {
         match self {
             Self::Chat => "chat",
+            Self::Guest => "guest",
             Self::Schedule => "schedule",
             Self::Watch => "watch",
             Self::Webhook => "webhook",
@@ -111,7 +114,7 @@ impl Origin {
     }
 
     pub fn parse(name: &str) -> Option<Self> {
-        [Self::Chat, Self::Schedule, Self::Watch, Self::Webhook].into_iter().find(|origin| origin.name() == name)
+        [Self::Chat, Self::Guest, Self::Schedule, Self::Watch, Self::Webhook].into_iter().find(|origin| origin.name() == name)
     }
 }
 
@@ -119,10 +122,10 @@ impl Origin {
 #[derive(Debug, PartialEq)]
 pub struct Grant {
     pub origin: Origin,
-    /// The adapter for chat, the job ID, or the hook name.
+    /// The adapter for owner or guest chat, the job ID, or the hook name.
     pub source: String,
-    /// Capabilities delegated to a job. Chat and webhook roots store none and
-    /// follow their origin's current policy.
+    /// Capabilities delegated to a job. Owner chat, guest chat and webhook
+    /// roots store none and follow their origin's current policy.
     pub caps: Option<Vec<String>>,
 }
 
@@ -187,6 +190,8 @@ impl Limits {
 
 pub struct Policy {
     pub chat: Caps,
+    /// Non-owner Discord mentions, independent of owner chat.
+    pub discord_guests: Caps,
     pub chat_prompt: Option<String>,
     /// Replaces the default system prompt addition of background runs.
     pub jobs_prompt: Option<String>,
@@ -207,6 +212,11 @@ impl Policy {
         }
 
         self.check_caps("[chat]", &self.chat)?;
+        self.check_caps("[discord.guests]", &self.discord_guests)?;
+
+        if let Some(cap) = self.discord_guests.iter().find(|cap| cap.is_management()) {
+            return Err(format!("[discord.guests]: `{}` belongs to owner chat", cap.name()));
+        }
 
         for (name, id) in &self.channels {
             check_channel(name, *id)?;
@@ -234,7 +244,7 @@ impl Policy {
 
     /// Whether any root can hold `cap`. Jobs never exceed owner chat.
     pub fn grants_anywhere(&self, cap: Cap) -> bool {
-        self.chat.contains(&cap) || self.hooks.values().any(|caps| caps.contains(&cap))
+        self.chat.contains(&cap) || self.discord_guests.contains(&cap) || self.hooks.values().any(|caps| caps.contains(&cap))
     }
 
     /// The capabilities `grant` holds under this policy. `None` means its
@@ -264,6 +274,7 @@ impl Policy {
     fn ceiling(&self, origin: Origin, source: &str) -> Option<Caps> {
         match origin {
             Origin::Chat => Some(self.chat.clone()),
+            Origin::Guest => Some(delegable(&self.discord_guests)),
             Origin::Schedule | Origin::Watch => Some(delegable(&self.chat)),
             Origin::Webhook => self.hooks.get(source).cloned(),
         }
@@ -341,6 +352,7 @@ mod tests {
 
         Policy {
             chat: caps(chat),
+            discord_guests: Caps::new(),
             chat_prompt: None,
             jobs_prompt: None,
             channels: BTreeMap::new(),
@@ -408,6 +420,45 @@ mod tests {
 
         for (chat, hooks, valid) in cases {
             assert_eq!(policy(chat, hooks).validate().is_ok(), valid, "chat {chat:?}, hooks {hooks:?}");
+        }
+    }
+
+    #[test]
+    fn guest_caps_are_independent_and_follow_current_policy() {
+        let mut policy = policy(&[Cap::Shell, Cap::Schedules], &[]);
+        let guest = grant(Origin::Guest, "discord_guest", None);
+
+        assert_eq!(Origin::parse("guest"), Some(Origin::Guest));
+        assert_eq!(policy.effective(&guest), Some(Caps::new()));
+
+        policy.discord_guests.insert(Cap::Now);
+        assert_eq!(policy.effective(&guest), Some(caps(&[Cap::Now])));
+        assert!(policy.grants_anywhere(Cap::Now));
+        assert!(policy.validate().is_ok());
+
+        policy.discord_guests.clear();
+        assert_eq!(policy.effective(&guest), Some(Caps::new()));
+    }
+
+    #[test]
+    fn guest_caps_are_validated_and_never_allow_management() {
+        let cases = [
+            (caps(&[Cap::Now]), true),
+            (caps(&[Cap::Shell, Cap::ShellNetwork]), true),
+            (caps(&[Cap::Server("vault".to_owned())]), true),
+            (caps(&[Cap::Server("unknown".to_owned())]), false),
+            (caps(&[Cap::ShellNetwork]), false),
+            (caps(&[Cap::Schedules]), false),
+            (caps(&[Cap::Watches]), false),
+        ];
+
+        for (caps, valid) in cases {
+            let mut policy = policy(&[], &[]);
+            policy.discord_guests = caps;
+            assert_eq!(policy.validate().is_ok(), valid);
+
+            let effective = policy.effective(&grant(Origin::Guest, "discord_guest", None));
+            assert!(effective.is_some_and(|caps| !caps.contains(&Cap::Schedules) && !caps.contains(&Cap::Watches)));
         }
     }
 

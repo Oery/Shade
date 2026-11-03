@@ -31,7 +31,7 @@ pub struct Config {
     pub limits: Limits,
     /// Where `shell` runs. Required when any origin holds `shell`.
     pub sandbox: Option<shade_sandbox::Config>,
-    /// Owner chat over Discord. Off without this section.
+    /// Discord chat. Off without this section.
     pub discord: Option<DiscordConfig>,
     /// MCP servers by name. Each name is a capability that grants its tools.
     #[serde(default)]
@@ -45,11 +45,22 @@ pub struct Config {
 pub struct DiscordConfig {
     /// Name of the environment variable holding the bot token, like `model.api_key_env`.
     pub token_env: String,
-    /// Discord user IDs allowed to chat. Everyone else is ignored.
+    /// Discord user IDs with owner chat permissions, including DMs and management.
     pub owners: Vec<u64>,
+    /// Everyone else may mention the bot in server channels with these capabilities.
+    #[serde(default)]
+    pub guests: GuestConfig,
     /// Channels notifications may name, by short name. `dm` is always the first owner's DMs.
     #[serde(default)]
     pub channels: BTreeMap<String, u64>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GuestConfig {
+    /// No tools by default. Management capabilities belong to owners only.
+    #[serde(default)]
+    pub caps: Caps,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -176,6 +187,7 @@ pub fn load(path: &Path) -> Result<Config, Error> {
 /// The parts of the config that make up the policy.
 pub struct Sections {
     pub chat: ChatConfig,
+    pub discord_guests: Caps,
     pub jobs: JobsConfig,
     /// Each hook's caps.
     pub hooks: BTreeMap<String, Caps>,
@@ -188,7 +200,7 @@ pub struct Sections {
 
 /// Builds and checks the policy, so a bad config fails at startup rather than at dispatch.
 pub fn policy(path: &Path, config: Sections) -> Result<Policy, Error> {
-    let Sections { chat, jobs, hooks, limits, timezone, channels, servers } = config;
+    let Sections { chat, discord_guests, jobs, hooks, limits, timezone, channels, servers } = config;
 
     let timezone = match timezone {
         Some(name) => match name.parse::<Tz>() {
@@ -198,7 +210,17 @@ pub fn policy(path: &Path, config: Sections) -> Result<Policy, Error> {
         None => chrono_tz::UTC,
     };
 
-    let policy = Policy { chat: chat.caps, chat_prompt: chat.prompt, jobs_prompt: jobs.prompt, channels, servers, hooks, limits, timezone };
+    let policy = Policy {
+        chat: chat.caps,
+        discord_guests,
+        chat_prompt: chat.prompt,
+        jobs_prompt: jobs.prompt,
+        channels,
+        servers,
+        hooks,
+        limits,
+        timezone,
+    };
 
     if let Err(message) = policy.validate() {
         return Err(invalid(path, message));

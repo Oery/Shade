@@ -29,12 +29,14 @@ pub struct Conversation {
     pub direct: bool,
 }
 
-/// Where a named conversation lives. Names are scoped per adapter.
+/// Where a named conversation lives. Names are scoped per adapter and audience.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Adapter {
     Terminal,
     /// Keys are channel IDs.
     Discord,
+    /// Non-owner Discord chat, with separate history and authority.
+    DiscordGuest,
 }
 
 impl Adapter {
@@ -42,11 +44,12 @@ impl Adapter {
         match self {
             Self::Terminal => "terminal",
             Self::Discord => "discord",
+            Self::DiscordGuest => "discord_guest",
         }
     }
 
     fn parse(name: &str) -> Option<Self> {
-        [Self::Terminal, Self::Discord].into_iter().find(|adapter| adapter.name() == name)
+        [Self::Terminal, Self::Discord, Self::DiscordGuest].into_iter().find(|adapter| adapter.name() == name)
     }
 }
 
@@ -133,9 +136,14 @@ fn named(connection: &Connection, adapter: Adapter, key: &str) -> Result<String,
     }
 }
 
-/// Creates a chat root and its grant. Chat grants follow the current `[chat]` policy.
+/// Creates a chat root and its grant. Guests follow `[discord.guests]`;
+/// owner conversations follow `[chat]`.
 pub(crate) fn register(connection: &Connection, id: &str, adapter: Adapter) -> Result<(), DbError> {
-    let grant = Grant { origin: Origin::Chat, source: adapter.name().to_owned(), caps: None };
+    let origin = match adapter {
+        Adapter::DiscordGuest => Origin::Guest,
+        Adapter::Terminal | Adapter::Discord => Origin::Chat,
+    };
+    let grant = Grant { origin, source: adapter.name().to_owned(), caps: None };
 
     insert_root(connection, id, &grant)
 }
@@ -166,10 +174,15 @@ pub(crate) fn new_id() -> String {
 #[cfg(test)]
 mod tests {
     use infinity_agent_core::ThreadId;
+    use infinity_agent_core::traits::{ConversationStore, SpawnContext};
+    use rap_protocol::ToolCallId;
+    use shade_policy::Origin;
 
     use super::{Adapter, Roots, Target};
     use crate::BoxError;
+    use crate::conversation::Conversations;
     use crate::db::{Db, DbError};
+    use crate::grants::Grants;
 
     async fn count(db: &Db, sql: &'static str) -> Result<i64, BoxError> {
         Ok(db.call(move |connection| Ok(connection.query_row(sql, [], |row| row.get(0))?)).await?)
@@ -221,6 +234,36 @@ mod tests {
         assert_eq!(roots.turn(Adapter::Terminal, "default".to_owned()).await?, new);
         assert_eq!(roots.turn(Adapter::Terminal, "work".to_owned()).await?, other);
         assert_eq!(count(&db, "SELECT COUNT(*) FROM threads").await?, 3);
+
+        Ok(())
+    }
+
+    /// Owner and guest turns in the same channel have separate roots, and
+    /// guest children keep guest authority, including after `/new`.
+    #[tokio::test]
+    async fn guests_never_share_owner_roots() -> Result<(), BoxError> {
+        let db = Db::in_memory()?;
+        let roots = Roots::new(db.clone());
+        let grants = Grants::new(db.clone());
+        let conversations = Conversations::new(db);
+        let owner = roots.turn(Adapter::Discord, "7".to_owned()).await?;
+        let guest = roots.turn(Adapter::DiscordGuest, "7".to_owned()).await?;
+        assert_ne!(owner, guest);
+
+        let call = ToolCallId::from("guest-child".to_owned());
+        let child = conversations.spawn_thread(&guest, &call, false, SpawnContext::Fresh).await?;
+        assert_eq!(grants.of(&owner).await?.map(|grant| grant.origin), Some(Origin::Chat));
+
+        for thread in [&guest, &child] {
+            assert_eq!(grants.of(thread).await?.map(|grant| grant.origin), Some(Origin::Guest));
+            let place = roots.conversation_of(thread).await?.map(|conversation| (conversation.adapter, conversation.key));
+            assert_eq!(place, Some((Adapter::DiscordGuest, "7".to_owned())));
+        }
+
+        let fresh = roots.replace(Adapter::DiscordGuest, "7".to_owned()).await?;
+        assert_ne!(fresh, guest);
+        assert_eq!(grants.of(&fresh).await?.map(|grant| grant.origin), Some(Origin::Guest));
+        assert_eq!(roots.turn(Adapter::Discord, "7".to_owned()).await?, owner);
 
         Ok(())
     }

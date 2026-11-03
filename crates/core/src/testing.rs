@@ -48,6 +48,7 @@ pub fn policy(caps: &[Cap], limits: Limits) -> Arc<Policy> {
 
     Arc::new(Policy {
         chat,
+        discord_guests: Default::default(),
         chat_prompt: None,
         jobs_prompt: None,
         channels,

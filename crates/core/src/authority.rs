@@ -245,6 +245,8 @@ impl ModelProvider for MeteredProvider {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use infinity_agent_core::ThreadId;
     use infinity_agent_core::message::InputMessage;
     use infinity_agent_core::system::AgentEvent;
@@ -252,15 +254,101 @@ mod tests {
     use infinity_provider_protocol::Usage;
     use shade_policy::{Cap, Limits};
     use shade_store::db::Db;
-    use shade_store::roots::Roots;
+    use shade_store::inbox::{Inbox, Input};
+    use shade_store::roots::{Adapter, Roots, Target};
     use shade_store::usage::Usages;
 
     use super::Denied;
     use crate::error::BoxError;
-    use crate::testing::{self, attach, reaches_model, until, within};
+    use crate::testing::{self, attach, reaches_model, reply, until, within};
 
     fn root() -> ThreadId {
         ThreadId::from("root".to_owned())
+    }
+
+    async fn discord_input(db: &Db, adapter: Adapter) -> Result<Input, BoxError> {
+        let target = Target::Named("42".to_owned());
+
+        match Inbox::new(db.clone()).accept(adapter, target, "hi".to_owned(), None).await? {
+            Some(input) => Ok(input),
+            None => Err("a new Discord input was treated as a duplicate".into()),
+        }
+    }
+
+    /// A guest can get an answer without owner tools or owner history. Its
+    /// prompt also excludes the owner's custom instructions.
+    #[tokio::test(flavor = "current_thread")]
+    async fn guest_answers_are_isolated_from_owner_chat() -> Result<(), BoxError> {
+        within(async {
+            let db = Db::in_memory()?;
+            let mut policy = testing::policy(&[Cap::Now, Cap::Schedules], Limits::default());
+            Arc::get_mut(&mut policy).ok_or("policy is shared")?.chat_prompt = Some("owner secret".to_owned());
+            let mut harness = testing::start_with(&db, policy).await?;
+            let owner = discord_input(&db, Adapter::Discord).await?;
+            let mut handle = attach(&mut harness, &owner.root).await?;
+            handle.send(InputMessage::user_text(owner.root, owner.text), &owner.id).await?;
+
+            let request = harness.model.next_request().await;
+            assert!(request.tools.iter().any(|tool| tool.name == "now"));
+            assert!(request.tools.iter().any(|tool| tool.name == "schedule_create"));
+            reply(&mut harness, &mut handle, "private owner history").await;
+
+            let guest = discord_input(&db, Adapter::DiscordGuest).await?;
+            let mut handle = attach(&mut harness, &guest.root).await?;
+            handle.send(InputMessage::user_text(guest.root.to_owned(), guest.text), &guest.id).await?;
+
+            let request = harness.model.next_request().await;
+            assert!(request.tools.is_empty());
+            assert!(!format!("{:?}", request.chat_history).contains("private owner history"));
+            let preamble = request.preamble.as_deref().ok_or("missing guest prompt")?;
+            assert!(preamble.contains("guest"));
+            assert!(!preamble.contains("owner secret"));
+
+            let management = harness.authority.admit_management(&guest.root, &Cap::Schedules).await;
+            assert!(matches!(management, Err(Denied::NotGranted(_))));
+            reply(&mut harness, &mut handle, "hello guest").await;
+            harness.system.shutdown().await;
+
+            Ok(())
+        })
+        .await
+    }
+
+    /// Stored guest grants keep following guest caps after a restart;
+    /// removed tools are both hidden and refused at dispatch.
+    #[tokio::test(flavor = "current_thread")]
+    async fn guest_tools_follow_current_guest_policy() -> Result<(), BoxError> {
+        within(async {
+            let db = Db::in_memory()?;
+            let mut policy = testing::policy(&[Cap::Schedules], Limits::default());
+            Arc::get_mut(&mut policy).ok_or("policy is shared")?.discord_guests.insert(Cap::Now);
+            let mut harness = testing::start_with(&db, policy).await?;
+            let guest = discord_input(&db, Adapter::DiscordGuest).await?;
+            let mut handle = attach(&mut harness, &guest.root).await?;
+            handle.send(InputMessage::user_text(guest.root.to_owned(), guest.text), &guest.id).await?;
+
+            let request = harness.model.next_request().await;
+            assert_eq!(request.tools.len(), 1);
+            assert_eq!(request.tools[0].name, "now");
+            assert!(harness.authority.admit_tool(&guest.root, &Cap::Now).await.is_ok());
+            reply(&mut harness, &mut handle, "hello guest").await;
+            harness.system.shutdown().await;
+
+            let mut after = testing::start(&db).await?;
+            let input = discord_input(&db, Adapter::DiscordGuest).await?;
+            assert_eq!(input.root, guest.root);
+            let mut handle = attach(&mut after, &input.root).await?;
+            handle.send(InputMessage::user_text(input.root.to_owned(), input.text), &input.id).await?;
+            assert!(after.model.next_request().await.tools.is_empty());
+
+            let direct = after.authority.admit_tool(&input.root, &Cap::Now).await;
+            assert!(matches!(direct, Err(Denied::NotGranted(_))));
+            reply(&mut after, &mut handle, "hello again").await;
+            after.system.shutdown().await;
+
+            Ok(())
+        })
+        .await
     }
 
     /// A root that exists but has no grant is as dead as an unknown thread.

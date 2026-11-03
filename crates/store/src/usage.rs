@@ -88,7 +88,7 @@ impl Usages {
                                   (SELECT u2.input_tokens FROM usage u2 JOIN threads t2 ON t2.id = u2.thread_id
                                    WHERE t2.root_id = t.root_id ORDER BY u2.id DESC LIMIT 1),
                                   MAX(u.at), COALESCE(g.origin, 'unknown'), COALESCE(g.source, ''),
-                                  COALESCE(r.status, h.status, CASE WHEN g.origin = 'chat' THEN 'chat' ELSE 'unavailable' END),
+                                  COALESCE(r.status, h.status, CASE WHEN g.origin IN ('chat', 'guest') THEN 'chat' ELSE 'unavailable' END),
                                   CASE WHEN COUNT(u.estimated_usd) = COUNT(*) THEN SUM(u.estimated_usd) END
                            FROM usage u JOIN threads t ON t.id = u.thread_id
                            LEFT JOIN grants g ON g.root_id = t.root_id

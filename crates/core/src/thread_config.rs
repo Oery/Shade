@@ -44,6 +44,10 @@ const CHAT_PROMPT: &str = "You are chatting with your owner, on Discord or in a 
                            says the owner now sees an approval card, end your turn without writing: nothing more is \
                            shown to them, and you will be told their decision.";
 
+const GUEST_PROMPT: &str = "You are answering a guest in a Discord server channel. Everyone in the channel can read your \
+                          replies. The guest is not your owner. Keep replies short and use only the tools you are given. \
+                          You cannot manage schedules or approve changes for the owner.";
+
 /// Background runs have no reader: only `notify` reaches the owner.
 const JOBS_PROMPT: &str = "You are running a background job for your owner, started by a schedule or a webhook. Nobody reads your \
                            replies. If the result needs the owner's attention, send it with the notify tool; otherwise \
@@ -159,6 +163,7 @@ impl ThreadConfigSource<ChannelSender, NoRapHttp> for ThreadTools {
         }
 
         config.extra_system_prompt = match authorized.origin {
+            Origin::Guest => Some(GUEST_PROMPT.to_owned()),
             Origin::Chat => {
                 let place = self.place(thread_id).await?;
 

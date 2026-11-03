@@ -184,7 +184,7 @@ impl Work {
                 Ok(channels) => channels.unwrap_or_default(),
                 Err(error) => return Err(format!("cannot read this job's channels: {error}")),
             },
-            Origin::Watch | Origin::Webhook => vec!["dm".to_owned()],
+            Origin::Guest | Origin::Watch | Origin::Webhook => vec!["dm".to_owned()],
         };
 
         channels::job_destination(&channels, requested, names)

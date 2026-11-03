@@ -71,7 +71,7 @@ impl Audit {
                        ), recent AS (SELECT root_id, MAX(at) AS at FROM activity GROUP BY root_id HAVING MAX(at) >= ?1)
                        SELECT g.root_id, g.origin, g.source, g.caps,
                               COALESCE(r.id, h.id),
-                              COALESCE(r.status, h.status, CASE WHEN g.origin = 'chat' THEN 'chat' ELSE 'unavailable' END)
+                              COALESCE(r.status, h.status, CASE WHEN g.origin IN ('chat', 'guest') THEN 'chat' ELSE 'unavailable' END)
                        FROM grants g JOIN recent a ON a.root_id = g.root_id
                        LEFT JOIN runs r ON r.root_id = g.root_id
                        LEFT JOIN hook_events h ON h.root_id = g.root_id

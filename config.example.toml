@@ -65,18 +65,26 @@ caps = ["now"]
 # Development only: run commands on the host with your full authority.
 # isolation = "off"
 
-# Owner chat over Discord: DMs, and messages that mention the bot in server
-# channels. Each channel is its own conversation; the `/new` slash command
-# starts a fresh one.
+# Discord: owners may DM or mention the bot in server channels. Other users
+# may mention it in server channels with separate guest permissions.
+# Each channel has separate owner and guest conversations. The `/new` slash
+# command starts a fresh owner conversation; only owners may use it or approvals.
 # Replies in a server channel are visible to everyone in it, so keep private
 # work in DMs. Enable the Message Content intent for the bot in the Developer
 # Portal: Discord hides the text of messages that mention the bot's role.
 # [discord]
 # Variable holding the bot token, read like model.api_key_env.
 # token_env = "DISCORD_BOT_TOKEN"
-# Discord user IDs allowed to chat (Developer Mode, then "Copy User ID").
+# Discord user IDs with [chat] permissions (Developer Mode, then "Copy User ID").
 # The first one is `dm` for notifications, and receives failure notices.
 # owners = [123456789012345678]
+# Everyone else can get answers by mentioning the bot, with no tools by default.
+# Guest caps are independent of [chat]; schedules and watches are owner-only.
+# `notify`, if granted, can message only the owner. Granting a server also
+# shares its tools and any memory tied to it. All guests in a channel share
+# one guest conversation, separate from the owners' history and custom prompt.
+# [discord.guests]
+# caps = ["now"]
 # Channels notifications and jobs can name (right-click, "Copy Channel ID").
 # Owner chat may also post to any channel by ID or #mention; a scheduled run
 # only to its job's channels.
