@@ -11,6 +11,14 @@ use crate::policy::{Grant, Origin};
 use crate::store::db::{Db, DbError};
 use crate::store::grants::{insert_grant, start_budget};
 
+/// Which conversation an input belongs to.
+pub enum Target {
+    /// A new root reachable by no name (`shade ask`).
+    Fresh,
+    /// A named conversation, created on first use.
+    Named(String),
+}
+
 /// Where a named conversation lives. Names are scoped per adapter.
 #[derive(Clone, Copy)]
 pub enum Adapter {
@@ -35,44 +43,6 @@ impl Roots {
         Self { db }
     }
 
-    /// A root for a one-shot run, reachable by no conversation name.
-    pub async fn fresh(&self, adapter: Adapter) -> Result<ThreadId, DbError> {
-        let id = new_id();
-
-        self.db
-            .call(move |connection| {
-                let transaction = connection.transaction()?;
-                register(&transaction, &id, adapter)?;
-                start_budget(&transaction, &id)?;
-                transaction.commit()?;
-
-                Ok(ThreadId::from(id))
-            })
-            .await
-    }
-
-    /// Starts a turn in the conversation `key` names, creating it on first use.
-    /// Each turn gets its own budget.
-    pub async fn turn(&self, adapter: Adapter, key: String) -> Result<ThreadId, DbError> {
-        self.db
-            .call(move |connection| {
-                let transaction = connection.transaction()?;
-                let sql = "SELECT root_id FROM conversations WHERE adapter = ?1 AND key = ?2";
-                let found: Option<String> = transaction.query_row(sql, params![adapter.name(), &key], |row| row.get(0)).optional()?;
-
-                let id = match found {
-                    Some(id) => id,
-                    None => point(&transaction, adapter, &key)?,
-                };
-
-                start_budget(&transaction, &id)?;
-                transaction.commit()?;
-
-                Ok(ThreadId::from(id))
-            })
-            .await
-    }
-
     /// Points `key` at a new root. The previous root keeps its history.
     pub async fn replace(&self, adapter: Adapter, key: String) -> Result<ThreadId, DbError> {
         self.db
@@ -84,6 +54,33 @@ impl Roots {
                 Ok(ThreadId::from(id))
             })
             .await
+    }
+}
+
+/// Starts a turn in `target`'s root, creating it on first use. Each turn
+/// gets its own budget. Runs inside the caller's transaction.
+pub fn turn(connection: &Connection, adapter: Adapter, target: &Target) -> Result<String, DbError> {
+    let id = match target {
+        Target::Fresh => {
+            let id = new_id();
+            register(connection, &id, adapter)?;
+            id
+        }
+        Target::Named(key) => named(connection, adapter, key)?,
+    };
+
+    start_budget(connection, &id)?;
+
+    Ok(id)
+}
+
+fn named(connection: &Connection, adapter: Adapter, key: &str) -> Result<String, DbError> {
+    let sql = "SELECT root_id FROM conversations WHERE adapter = ?1 AND key = ?2";
+    let found: Option<String> = connection.query_row(sql, params![adapter.name(), key], |row| row.get(0)).optional()?;
+
+    match found {
+        Some(id) => Ok(id),
+        None => point(connection, adapter, key),
     }
 }
 
@@ -114,12 +111,29 @@ fn new_id() -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{Adapter, Roots};
+    use infinity_agent_core::ThreadId;
+
+    use super::{Adapter, Roots, Target};
     use crate::error::BoxError;
-    use crate::store::db::Db;
+    use crate::store::db::{Db, DbError};
 
     async fn count(db: &Db, sql: &'static str) -> Result<i64, BoxError> {
         Ok(db.call(move |connection| Ok(connection.query_row(sql, [], |row| row.get(0))?)).await?)
+    }
+
+    impl Roots {
+        /// A turn in the terminal conversation `key`, in its own transaction.
+        pub async fn turn(&self, adapter: Adapter, key: String) -> Result<ThreadId, DbError> {
+            self.db
+                .call(move |connection| {
+                    let transaction = connection.transaction()?;
+                    let id = super::turn(&transaction, adapter, &Target::Named(key))?;
+                    transaction.commit()?;
+
+                    Ok(ThreadId::from(id))
+                })
+                .await
+        }
     }
 
     /// Two first messages racing for one name must share one root.

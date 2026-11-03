@@ -5,16 +5,25 @@
 //! else an explicit unknown outcome. Nothing is run again.
 
 use infinity_agent_core::ThreadId;
-use infinity_agent_core::traits::InputSender;
 
 use crate::error::BoxError;
 use crate::store::operations::Operations;
-use crate::tools;
 
 /// The result of a call whose outcome was lost.
 pub const UNKNOWN_OUTCOME: &str = "Interrupted before the result was recorded. The action may have completed. Verify its outcome before retrying an action with side effects.";
 
-pub async fn recover<M: InputSender>(operations: &Operations, sender: &M) -> Result<(), BoxError> {
+/// The answer owed to one waiting call.
+pub struct Answer {
+    pub thread: ThreadId,
+    pub id: String,
+    pub call_id: Option<String>,
+    pub text: String,
+}
+
+/// Settles every waiting call and returns the answers to deliver.
+pub async fn answers(operations: &Operations) -> Result<Vec<Answer>, BoxError> {
+    let mut answers = Vec::new();
+
     for (thread, calls) in operations.unanswered().await? {
         let thread = ThreadId::from(thread);
 
@@ -30,11 +39,11 @@ pub async fn recover<M: InputSender>(operations: &Operations, sender: &M) -> Res
                 }
             };
 
-            tools::deliver(sender, thread.to_owned(), call.id, call.call_id, text).await?;
+            answers.push(Answer { thread: thread.to_owned(), id: call.id, call_id: call.call_id, text });
         }
     }
 
-    Ok(())
+    Ok(answers)
 }
 
 #[cfg(test)]
@@ -46,13 +55,14 @@ mod tests {
     use infinity_agent_core::ThreadId;
     use infinity_agent_core::message::InputMessage;
 
-    use super::{UNKNOWN_OUTCOME, recover};
+    use super::{UNKNOWN_OUTCOME, answers};
     use crate::error::BoxError;
     use crate::policy::{Cap, Limits};
     use crate::store::conversation::Conversations;
     use crate::store::db::Db;
     use crate::store::operations::Operations;
     use crate::testing::{self, Dirs, attach, within};
+    use crate::tools;
 
     /// Each run of the command appends a line here.
     const RUNS: &str = "runs";
@@ -114,7 +124,11 @@ mod tests {
 
     async fn second_daemon(db: &Db, expected: &str) -> Result<(), BoxError> {
         let mut harness = testing::start(db).await?;
-        recover(&Operations::new(db.clone()), &harness.system.sender()).await?;
+        let sender = harness.system.sender();
+
+        for answer in answers(&Operations::new(db.clone())).await? {
+            tools::deliver(&sender, answer.thread, answer.id, answer.call_id, answer.text).await?;
+        }
 
         // A result under any other call ID would be ignored, and this would time out.
         let request = harness.model.next_request().await;

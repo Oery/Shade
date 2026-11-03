@@ -17,6 +17,7 @@ use crate::authority::{Authority, Metered};
 use crate::config::{Isolation, SandboxConfig};
 use crate::error::BoxError;
 use crate::policy::{Cap, Limits, Policy};
+use crate::router::Router;
 use crate::sandbox::paths::Protected;
 use crate::sandbox::{Runner, Sandbox, SandboxError, find_on_path};
 use crate::store::conversation::Conversations;
@@ -43,7 +44,7 @@ pub fn policy(caps: &[Cap], limits: Limits) -> Arc<Policy> {
 }
 
 /// Runs `test` on a `LocalSet`, failing it after ten seconds instead of hanging.
-pub async fn within<F: Future<Output = Result<(), BoxError>>>(test: F) -> Result<(), BoxError> {
+pub async fn within<T, F: Future<Output = Result<T, BoxError>>>(test: F) -> Result<T, BoxError> {
     let local = LocalSet::new();
 
     match tokio::time::timeout(Duration::from_secs(10), local.run_until(test)).await {
@@ -80,6 +81,13 @@ pub async fn start_sandboxed(db: &Db, policy: Arc<Policy>, sandbox: Option<Arc<S
     let system = builder.without_builtin_tools().thread_config(tools).start();
 
     Ok(Harness { system, model, conversations, authority })
+}
+
+/// A router on `db` with a scripted model, as the daemon builds it.
+pub async fn router(db: &Db, policy: Arc<Policy>) -> Result<(Router, MockModelController), BoxError> {
+    let Harness { system, model, .. } = start_with(db, policy).await?;
+
+    Ok((Router::new(db.clone(), system), model))
 }
 
 /// Attaches to a registered thread and waits out the idle its attach-spawned driver emits.

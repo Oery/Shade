@@ -31,6 +31,7 @@ const MIGRATIONS: &[&str] = &[
     include_str!("../../migrations/0003_conversation_names.sql"),
     include_str!("../../migrations/0004_grants.sql"),
     include_str!("../../migrations/0005_tool_operations.sql"),
+    include_str!("../../migrations/0006_inbox.sql"),
 ];
 
 type Job = Box<dyn FnOnce(&mut Connection) + Send>;
@@ -96,6 +97,12 @@ impl Db {
         }
 
         Ok(Self { jobs })
+    }
+
+    /// Waits until every job queued before this call has finished. Jobs run in
+    /// order, so this is a barrier for writes still in the queue at shutdown.
+    pub async fn flush(&self) -> Result<(), DbError> {
+        self.call(|_| Ok(())).await
     }
 
     /// Runs `job` on the worker thread and returns its result.

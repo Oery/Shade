@@ -111,13 +111,14 @@ crates/
         roots.rs            root registration and conversation names
         grants.rs           grants, per-turn budgets, atomic charging
         operations.rs       tool operations and unanswered-call lookup
+        inbox.rs            accepted input and its acknowledgment
       thread_config.rs      per-thread tools (close_thread for compaction threads)
       policy.rs             capabilities, origins, ceilings, limit checks
       authority.rs          grant/budget admission for config, provider requests, tools
       model.rs              provider and completion-budget enforcement
-      router.rs             routing, registration, output pumps, shutdown
-      delivery.rs           persisted ingress/results and replay
-      runs.rs               run lifecycle, shared limits, cancellation
+      router.rs             durable ingress, routing, output pumps, resume, shutdown
+      router/turn.rs        what a turn's sender sees
+      runs.rs               run lifecycle, shared limits, cancellation (M11)
       scheduler.rs          schedule claims and overlap handling
       condition.rs          pure typed comparisons and watch transitions
       watcher.rs            MCP subscriptions and reconnects
@@ -258,7 +259,7 @@ max_concurrent_background_runs = 4
 max_notifications = 10
 ```
 
-These are example defaults, to be tuned during implementation. Each limit is added with the feature it bounds: M5 enforces rounds, tool calls, and run time; `max_children` waits for model-controlled spawning, `max_concurrent_background_runs` for M8, and `max_notifications` for M10. A completion round is one provider request, retries included. Limits cap accepted work; they are not a guarantee of an exact currency amount. Token usage is recorded when available; a token/spend budget can be added later without replacing these basic bounds.
+These are example defaults, to be tuned during implementation. Each limit is added with the feature it bounds: M5 enforces rounds, tool calls, and run time; `max_children` waits for model-controlled spawning, `max_concurrent_background_runs` for M11 (the first background producer), and `max_notifications` for M10. A completion round is one provider request, retries included. Limits cap accepted work; they are not a guarantee of an exact currency amount. Token usage is recorded when available; a token/spend budget can be added later without replacing these basic bounds.
 
 For background work, the root run is one trigger occurrence. For chat, the budget covers a user turn and its descendant work, not the entire weeks-long conversation. Persist the budget scope ID and counters so restart or spawning cannot reset them. A new chat input cannot silently reset limits for still-running descendants from an earlier turn.
 
@@ -606,7 +607,7 @@ Each milestone is one reviewable PR. `Check` is a manual demonstration; `Tests` 
 - **Tests:** output retention stays bounded, UTF-8-safe truncation, process-tree cleanup on timeout/exit/death, result replay, and unknown-outcome recovery with stable call IDs.
 - **Done:** `shell` is an async tool offered with `shell` (the description says whether `shell_network` is held). `execute` returns at once and the command runs in a `spawn_local` task on the core thread. The task admits the call (grant and budget), validates `command` and `timeout_seconds` (30 s default, `[sandbox] max_timeout_seconds` cap, 300 by default), records a `tool_operations` row as `running`, runs the sandbox, stores the rendered result as `done`, then delivers it with the call ID as dedup ID. A repeated dispatch of a recorded call never runs again: it gets the captured result or the unknown-outcome text. Each stream keeps its first and last 16 KiB with an omitted-bytes marker; a character cut by the omission is dropped whole. Startup recovery (`recovery.rs`, before the router serves) scans open threads for calls in the trailing run of calls/results that have no result (Infinity ignores late results anywhere else; `close_thread` is skipped), and answers each with its captured result or the F12 unknown-outcome text, marking the row `unknown`. Recovery failure stops startup. Graceful shutdown drops the `LocalSet`, so `kill_on_drop` kills running commands and their rows recover as `unknown`. `tool_operations` doubles as the basic audit record; the arguments stay in history only. The client turn pump no longer ends at a completion that stops on an async tool call: it counts `ToolCall`/`ToolResult` events and waits for the completion that follows the result.
 - **Check (done):** against OpenCode Go with a scratch config: listing, `ls /nonexistent` (exit 2 and stderr), a 2 s timeout, and `kill -9` of `shaded` during `sleep 20`. After restart the call was answered with the unknown-outcome text, the model verified the workspace instead of rerunning, and the killed command never wrote its second line.
-- **Finding for M8:** recovery continues threads that no client is attached to, so the model's reply after a recovered result lands in history but is shown nowhere until the conversation is next used. Output pumps for every root belong to M8.
+- **Finding for M8 (resolved in M8):** recovery continues threads that no client is attached to, so the model's reply after a recovered result lands in history but is shown nowhere until the conversation is next used. Output pumps for every root belong to M8.
 - **Finding (from reading Infinity, not yet tested):** a recovered result is charged to the interrupted turn's budget. When that budget's `max_run_seconds` has passed (a restart after long downtime), the completion is refused and the result stays in memory only; once the thread idles, the next user message settles the call as interrupted, while `tool_operations` keeps the real result. Revisit with the M8 run lifecycle rather than resetting budgets.
 
 ### M8 — Daemon router and durable ingress
@@ -615,6 +616,9 @@ Each milestone is one reviewable PR. `Check` is a manual demonstration; `Tests` 
 - **Scope:** `Inbound`/`Outbound`, persisted inbox/runs, safe thread/grant registration before attachment, bounded channels, output pumps, replay, concurrency admission, graceful daemon shutdown; refactor socket sessions onto the path.
 - **Check:** terminal behavior preserved; accepted queued work survives restart; a slow tool does not stall ingress or database work.
 - **Tests:** crash before/after commit, enqueue, durable acceptance, and acknowledgment; replay uses the same root/input ID; no accepted input is lost because it only reached a volatile queue. Shutdown drains critical writes.
+- **Done:** adapters send `Inbound::Prompt { target, text, outbound }`. The router records the input in `inbox` in the same transaction that registers the root (on first use) and starts the turn's budget, then sends it under the row's ID and spawns a pump. There is no acknowledgment write: an input is settled when its ID is in `processed_ids` (written with the history that holds it) or when its turn ended with an error, which the pump records *before* the sender sees it, so a failure the owner saw is never rerun behind their back. Pumps run to the end of the turn even after the client leaves. `Outbound` is `Client` (a socket connection) or `Detached` (resumed work, logged). `Router::resume`, before serving, answers waiting tool calls (M7) and resends unsettled inputs with their own IDs, each with a detached pump, which resolves the M7 output finding for terminal roots; Discord roots get a standing destination in M9. Shutdown stops the socket and router loops, shuts Infinity down (flushing streamed history), then waits on a no-op database job, which drains every write queued before it. Queues are bounded at the adapter edge (16 inbound, 64 replies per connection). Tests cover a crash after commit, after enqueue, and after the answer (the input appears exactly once, in its own root, under its own ID) and a failed turn being settled before its sender hears.
+- **Deferred to M11:** the `runs` table and `max_concurrent_background_runs`. Nothing creates background runs before the scheduler, and M11 already scopes the run schema and global capacity, so they arrive with their first producer and its tests.
+- **Check (done):** against OpenCode Go with a scratch config: terminal chat unchanged; an `ask` answered while another conversation ran `sleep 20` in the shell; a chat message accepted and then `kill -9`ed before the model answered was resent at startup and answered once (the model, asked afterwards, knew the fact and said it was told once).
 
 ### M9 — Discord adapter
 

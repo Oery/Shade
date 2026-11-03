@@ -62,7 +62,7 @@ pub enum Error {
     #[error(transparent)]
     Sandbox(#[from] SandboxError),
 
-    #[error("cannot recover interrupted tool calls: {0}")]
+    #[error("cannot resume work interrupted by the last shutdown: {0}")]
     Recovery(BoxError),
 
     #[error("cannot start the async runtime: {0}")]

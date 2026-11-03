@@ -1,10 +1,21 @@
-//! Owns the Infinity system: registers roots, routes inputs, pumps output.
+//! Owns the Infinity system: accepts input durably, routes it, pumps output.
+//!
+//! Every input takes one path: it is recorded in the inbox with its root
+//! before Infinity sees it, then sent under its stable ID, and a pump follows
+//! its turn to the end. A pump outlives its client, so a turn's outcome is
+//! always settled. Work interrupted by a restart re-enters the same path.
+
+mod turn;
+
+#[cfg(test)]
+mod tests;
 
 use std::sync::Arc;
 
+use infinity_agent_core::ThreadId;
 use infinity_agent_core::message::InputMessage;
 use infinity_agent_core::system::local::{LaunchingSystem, ThreadHandle};
-use infinity_agent_core::system::{AgentEvent, AgentSystemBuilder, NoRapHttp};
+use infinity_agent_core::system::{AgentSystemBuilder, NoRapHttp};
 use shade_proto::Response;
 use tokio::sync::mpsc;
 
@@ -13,38 +24,56 @@ use crate::error::BoxError;
 use crate::model::Model;
 use crate::policy::Policy;
 use crate::recovery;
+use crate::router::turn::Turn;
 use crate::sandbox::Sandbox;
 use crate::store::conversation::Conversations;
 use crate::store::db::Db;
 use crate::store::grants::Grants;
+use crate::store::inbox::{Inbox, Input};
 use crate::store::operations::Operations;
-use crate::store::roots::{Adapter, Roots};
+use crate::store::roots::{Adapter, Roots, Target};
 use crate::store::state::States;
 use crate::thread_config::ThreadTools;
+use crate::tools;
 
 /// Capacity of each reply stream between the router and a socket connection.
 pub const REPLY_QUEUE: usize = 64;
 
-/// Work for the router. Each command answers on its `reply` channel.
-pub enum Command {
+pub type System = LaunchingSystem<Conversations, States, NoRapHttp>;
+
+/// Input from an adapter.
+pub enum Inbound {
     /// User text for a conversation.
-    Prompt { target: Target, text: String, reply: mpsc::Sender<Response> },
+    Prompt { target: Target, text: String, outbound: Outbound },
     /// Points a terminal conversation name at a fresh root.
     NewConversation { key: String, reply: mpsc::Sender<Response> },
 }
 
-/// Which conversation a prompt belongs to.
-pub enum Target {
-    /// A new root reachable by no name (`shade ask`).
-    Fresh,
-    /// A named terminal conversation, created on first use.
-    Terminal(String),
+/// Where a turn's output goes. The turn runs to its end either way.
+pub enum Outbound {
+    /// A connected client. If it leaves, the turn finishes without it.
+    Client(mpsc::Sender<Response>),
+    /// Nobody: work resumed after a restart. The outcome is logged.
+    Detached,
+}
+
+impl Outbound {
+    async fn send(&self, thread: &str, response: Response) {
+        match self {
+            Self::Client(reply) => {
+                let _ = reply.send(response).await;
+            }
+            Self::Detached => log_detached(thread, &response),
+        }
+    }
 }
 
 pub struct Router {
+    db: Db,
+    inbox: Inbox,
     roots: Roots,
     operations: Operations,
-    system: LaunchingSystem<Conversations, States, NoRapHttp>,
+    system: System,
 }
 
 impl Router {
@@ -52,72 +81,96 @@ impl Router {
     pub fn start(model: Model, db: Db, policy: Arc<Policy>, sandbox: Option<Arc<Sandbox>>) -> Self {
         let authority = Authority::new(Grants::new(db.clone()), policy);
         let conversations = Conversations::new(db.clone());
-        let operations = Operations::new(db.clone());
-        let tools = ThreadTools::new(conversations.clone(), authority.clone(), operations.clone(), sandbox);
+        let tools = ThreadTools::new(conversations.clone(), authority.clone(), Operations::new(db.clone()), sandbox);
         let model = Metered::new(model, authority);
         let builder = AgentSystemBuilder::new_local(conversations, States::new(db.clone()), model);
         let system = builder.without_builtin_tools().thread_config(tools).start();
 
-        Self { roots: Roots::new(db), operations, system }
+        Self::new(db, system)
     }
 
-    /// Answers the tool calls an earlier daemon left waiting. Runs before any new work.
-    pub async fn recover(&self) -> Result<(), BoxError> {
-        recovery::recover(&self.operations, &self.system.sender()).await
+    pub fn new(db: Db, system: System) -> Self {
+        let inbox = Inbox::new(db.clone());
+        let roots = Roots::new(db.clone());
+        let operations = Operations::new(db.clone());
+
+        Self { db, inbox, roots, operations, system }
     }
 
-    /// Handles commands until the channel closes. Must run inside a `LocalSet`.
-    pub async fn serve(&self, mut commands: mpsc::Receiver<Command>) {
-        while let Some(command) = commands.recv().await {
-            match command {
-                Command::Prompt { target, text, reply } => self.prompt(target, text, reply).await,
-                Command::NewConversation { key, reply } => self.new_conversation(key, reply).await,
+    /// Handles input until the channel closes. Must run inside a `LocalSet`.
+    pub async fn serve(&self, mut inbound: mpsc::Receiver<Inbound>) {
+        while let Some(input) = inbound.recv().await {
+            match input {
+                Inbound::Prompt { target, text, outbound } => self.prompt(target, text, outbound).await,
+                Inbound::NewConversation { key, reply } => self.new_conversation(key, reply).await,
             }
         }
     }
 
-    /// Interrupts active completions, flushes their history, and stops every thread.
-    pub async fn shutdown(self) {
-        self.system.shutdown().await;
+    /// Finishes what a previous daemon left: answers its waiting tool calls,
+    /// then sends its unprocessed inputs again under their own IDs. Runs
+    /// before any new input is accepted.
+    pub async fn resume(&self) -> Result<(), BoxError> {
+        for answer in recovery::answers(&self.operations).await? {
+            let handle = self.attach(&answer.thread).await?;
+            tools::deliver(&self.system.sender(), answer.thread, answer.id, answer.call_id, answer.text).await?;
+            tokio::task::spawn_local(pump(handle, Turn::continuing(), Outbound::Detached, None));
+        }
+
+        for input in self.inbox.unsettled().await? {
+            tracing::info!(root = %input.root, input = %input.id, "resending an input accepted before the restart");
+            self.dispatch(input, Outbound::Detached).await;
+        }
+
+        Ok(())
     }
 
-    async fn prompt(&self, target: Target, text: String, reply: mpsc::Sender<Response>) {
-        let handle = match self.attach(target).await {
+    /// Interrupts active completions, flushes their history, stops every
+    /// thread, then waits for the database to finish queued writes.
+    pub async fn shutdown(self) {
+        self.system.shutdown().await;
+
+        if let Err(error) = self.db.flush().await {
+            tracing::error!(%error, "cannot flush the database at shutdown");
+        }
+    }
+
+    async fn prompt(&self, target: Target, text: String, outbound: Outbound) {
+        match self.inbox.accept(Adapter::Terminal, target, text).await {
+            Ok(input) => self.dispatch(input, outbound).await,
+            Err(error) => outbound.send("", error_response(format!("cannot accept the message: {error}"))).await,
+        }
+    }
+
+    /// Sends a recorded input and follows its turn.
+    async fn dispatch(&self, input: Input, outbound: Outbound) {
+        let Input { root, id, text } = input;
+
+        let handle = match self.attach(&root).await {
             Ok(handle) => handle,
             Err(message) => {
-                let _ = reply.send(Response::Error { message }).await;
+                settle(&self.inbox, &id, &message).await;
+                outbound.send(root.as_str(), error_response(message)).await;
                 return;
             }
         };
 
-        let input_id = uuid::Uuid::new_v4().to_string();
-        let input = InputMessage::user_text(handle.thread_id().to_owned(), text);
-
-        if handle.send(input, &input_id).await.is_err() {
-            let message = "the daemon is shutting down".to_owned();
-            let _ = reply.send(Response::Error { message }).await;
+        // Unsettled until processed: if this fails, the next start sends it again.
+        if handle.send(InputMessage::user_text(root, text), &id).await.is_err() {
+            let message = "the daemon is shutting down; the message will be answered after it restarts".to_owned();
+            outbound.send(handle.thread_id().as_str(), error_response(message)).await;
             return;
         }
 
-        tokio::task::spawn_local(pump(handle, reply));
+        tokio::task::spawn_local(pump(handle, Turn::default(), outbound, Some((self.inbox.clone(), id))));
     }
 
-    /// Registers the root before attaching, so configuration never resolves for an unregistered thread.
-    async fn attach(&self, target: Target) -> Result<ThreadHandle, String> {
-        let root = match target {
-            Target::Fresh => self.roots.fresh(Adapter::Terminal).await,
-            Target::Terminal(key) => self.roots.turn(Adapter::Terminal, key).await,
-        };
-
-        let root = match root {
-            Ok(root) => root,
-            Err(error) => return Err(format!("cannot register conversation: {error}")),
-        };
-
-        match self.system.thread_handle(&root).await {
+    /// Roots are registered before this, so configuration never resolves for an unregistered thread.
+    async fn attach(&self, root: &ThreadId<str>) -> Result<ThreadHandle, String> {
+        match self.system.thread_handle(root).await {
             Ok(Some(handle)) => Ok(handle),
-            Ok(None) => Err("registered conversation is missing".to_owned()),
-            Err(error) => Err(format!("cannot attach to conversation: {error}")),
+            Ok(None) => Err(format!("conversation {root} is missing")),
+            Err(error) => Err(format!("cannot attach to conversation {root}: {error}")),
         }
     }
 
@@ -136,208 +189,44 @@ impl Router {
     }
 }
 
-/// Forwards one turn's text to the client. A closed client stops forwarding, not the turn.
-async fn pump(mut handle: ThreadHandle, reply: mpsc::Sender<Response>) {
-    let mut turn = Turn::default();
-
+/// Follows one turn to its end and forwards it to `outbound`. An input whose
+/// turn fails is settled before its sender hears of it, so it is never run
+/// again after a restart. A pump cut short by shutdown leaves its input to
+/// be resent.
+async fn pump(mut handle: ThreadHandle, mut turn: Turn, outbound: Outbound, input: Option<(Inbox, String)>) {
     while let Some(event) = handle.recv().await {
         let Some(response) = turn.on_event(event) else {
             continue;
         };
 
-        let terminal = !matches!(response, Response::Text { .. });
+        let last = !matches!(response, Response::Text { .. });
 
-        if reply.send(response).await.is_err() || terminal {
+        if let (Response::Error { message }, Some((inbox, id))) = (&response, &input) {
+            settle(inbox, id, message).await;
+        }
+
+        outbound.send(handle.thread_id().as_str(), response).await;
+
+        if last {
             return;
         }
     }
 }
 
-/// Tracks one turn's events and decides what the client sees.
-///
-/// A resumed conversation may still be finishing an earlier turn when this
-/// one's input arrives. Completion events count only after Infinity accepts
-/// the input (`UserInput`), so that turn's tail cannot end this one.
-///
-/// A completion that ends on an asynchronous tool call does not end the
-/// turn: the tool's result starts another completion. Synchronous tools
-/// answer inside the completion, so their results arrive before it finishes.
-#[derive(Default)]
-struct Turn {
-    accepted: bool,
-    started: bool,
-    /// Tool calls seen without their results.
-    pending_tools: usize,
-    failure: Option<String>,
-}
-
-impl Turn {
-    fn on_event(&mut self, event: AgentEvent) -> Option<Response> {
-        match event {
-            AgentEvent::UserInput { .. } if self.accepted => Some(Self::superseded()),
-            AgentEvent::UserInput { .. } => {
-                self.accepted = true;
-                None
-            }
-            AgentEvent::Info { text } => self.on_info(text),
-            _ if !self.accepted => None,
-            AgentEvent::TextChunk { text } => Some(Response::Text { text }),
-            AgentEvent::CompletionStarted => {
-                self.started = true;
-                None
-            }
-            AgentEvent::ToolCall { .. } => {
-                self.pending_tools += 1;
-                None
-            }
-            AgentEvent::ToolResult { .. } => {
-                self.pending_tools = self.pending_tools.saturating_sub(1);
-                None
-            }
-            AgentEvent::CompletionFinished { .. } if self.pending_tools > 0 && self.failure.is_none() => {
-                self.started = false;
-                None
-            }
-            AgentEvent::CompletionFinished { .. } => Some(self.finish()),
-            _ => None,
-        }
-    }
-
-    /// Before a completion starts, an error means none will run, so it ends the turn.
-    fn on_info(&mut self, text: String) -> Option<Response> {
-        let message = text.strip_prefix("Error: ")?.to_owned();
-
-        if !self.started {
-            return Some(Response::Error { message });
-        }
-
-        self.failure = Some(message);
-
-        None
-    }
-
-    /// Newer input for the same conversation (another terminal) interrupted this turn.
-    fn superseded() -> Response {
-        let message = "interrupted by newer input to this conversation".to_owned();
-
-        Response::Error { message }
-    }
-
-    fn finish(&mut self) -> Response {
-        match self.failure.take() {
-            Some(message) => Response::Error { message },
-            None => Response::Done,
-        }
+async fn settle(inbox: &Inbox, id: &str, message: &str) {
+    if let Err(error) = inbox.fail(id, message).await {
+        tracing::error!(%error, input = %id, "cannot record a failed input; it will be resent after a restart");
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use infinity_agent_core::system::AgentEvent;
-    use shade_proto::Response;
+fn error_response(message: String) -> Response {
+    Response::Error { message }
+}
 
-    use super::Turn;
-
-    fn text(text: &str) -> AgentEvent {
-        AgentEvent::TextChunk { text: text.to_owned() }
-    }
-
-    fn error(text: &str) -> AgentEvent {
-        AgentEvent::Info { text: format!("Error: {text}") }
-    }
-
-    fn finished() -> AgentEvent {
-        AgentEvent::CompletionFinished { usage: None }
-    }
-
-    fn accepted() -> AgentEvent {
-        AgentEvent::UserInput { text: "hi".to_owned() }
-    }
-
-    fn tool_call() -> AgentEvent {
-        AgentEvent::ToolCall { name: "shell".to_owned(), args: serde_json::json!({}), display_as: None }
-    }
-
-    fn tool_result() -> AgentEvent {
-        AgentEvent::ToolResult { segments: Vec::new() }
-    }
-
-    /// What the client sees for each event sequence, ending at the first final response.
-    fn render(events: Vec<AgentEvent>) -> Vec<String> {
-        let mut turn = Turn::default();
-        let mut seen = Vec::new();
-
-        for event in events {
-            match turn.on_event(event) {
-                Some(Response::Text { text }) => seen.push(text),
-                Some(Response::Done) => {
-                    seen.push("done".to_owned());
-                    break;
-                }
-                Some(Response::Error { message }) => {
-                    seen.push(format!("error: {message}"));
-                    break;
-                }
-                None => {}
-            }
-        }
-
-        seen
-    }
-
-    #[test]
-    fn turns_end_on_their_own_events() {
-        let cases = [
-            // The tail of an earlier turn arrives before this input is accepted.
-            (
-                vec![text("old"), finished(), accepted(), AgentEvent::CompletionStarted, text("new"), finished()],
-                vec!["new", "done"],
-            ),
-            // Configuration failed: no completion will run, and no input is accepted.
-            (vec![error("no grant")], vec!["error: no grant"]),
-            // The provider failed mid-turn; the turn still finishes first.
-            (
-                vec![accepted(), AgentEvent::CompletionStarted, text("par"), error("timeout"), finished()],
-                vec!["par", "error: timeout"],
-            ),
-            // Another terminal's input interrupts this turn; its reply is not ours.
-            (
-                vec![accepted(), AgentEvent::CompletionStarted, text("par"), accepted(), text("theirs"), finished()],
-                vec!["par", "error: interrupted by newer input to this conversation"],
-            ),
-            // An asynchronous tool's result starts another completion that belongs to this turn.
-            (
-                vec![
-                    accepted(),
-                    AgentEvent::CompletionStarted,
-                    tool_call(),
-                    finished(),
-                    tool_result(),
-                    AgentEvent::CompletionStarted,
-                    text("answer"),
-                    finished(),
-                ],
-                vec!["answer", "done"],
-            ),
-            // A synchronous tool answers inside the completion.
-            (
-                vec![accepted(), AgentEvent::CompletionStarted, tool_call(), tool_result(), text("12:00"), finished()],
-                vec!["12:00", "done"],
-            ),
-            // The completion after a tool result could not start.
-            (
-                vec![accepted(), AgentEvent::CompletionStarted, tool_call(), finished(), tool_result(), error("limit")],
-                vec!["error: limit"],
-            ),
-            // Informational lines are not errors.
-            (
-                vec![accepted(), AgentEvent::Info { text: "retrying".to_owned() }, AgentEvent::CompletionStarted, finished()],
-                vec!["done"],
-            ),
-        ];
-
-        for (events, expected) in cases {
-            assert_eq!(render(events), expected);
-        }
+fn log_detached(thread: &str, response: &Response) {
+    match response {
+        Response::Text { .. } => {}
+        Response::Done => tracing::info!(%thread, "finished resumed work"),
+        Response::Error { message } => tracing::warn!(%thread, %message, "resumed work failed"),
     }
 }
