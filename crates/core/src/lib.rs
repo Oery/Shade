@@ -12,7 +12,6 @@ mod policy;
 mod receipt;
 mod recovery;
 mod router;
-mod sandbox;
 mod schedule;
 mod secrets;
 mod store;
@@ -22,9 +21,10 @@ mod thread_config;
 mod tools;
 mod usage;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use shade_sandbox::Sandbox;
 use tokio::signal::unix::{SignalKind, signal};
 use tokio::sync::mpsc;
 use tokio::task::LocalSet;
@@ -37,6 +37,7 @@ use crate::config::Config;
 use crate::jobfiles::JobFiles;
 use crate::model::Model;
 use crate::notify::Notifier;
+use crate::policy::{Cap, Policy};
 use crate::router::{Inbound, Router};
 use crate::secrets::Secrets;
 use crate::store::db::{self, Db};
@@ -75,7 +76,7 @@ async fn serve(config_path: Option<PathBuf>) -> Result<(), Error> {
     let _lock = lock::acquire(&data_dir)?;
 
     // Probed now, so a broken sandbox stops the daemon before it accepts work.
-    let sandbox = sandbox::start(sandbox, &policy, &data_dir, &config_path).await?;
+    let sandbox = start_sandbox(sandbox, &policy, &data_dir, &config_path).await?;
     let model = Model::new(model, &mut secrets)?;
     let db = Db::open(&data_dir.join(db::DB_FILE))?;
 
@@ -110,6 +111,26 @@ async fn serve(config_path: Option<PathBuf>) -> Result<(), Error> {
     router.shutdown().await;
 
     result
+}
+
+/// The sandbox for shell commands, or `None` when no origin holds `shell`.
+///
+/// Fails closed: with `shell` granted, a missing section, an exposed path,
+/// or a sandbox that cannot actually run a command stops the daemon.
+async fn start_sandbox(
+    config: Option<shade_sandbox::Config>, policy: &Policy, data_dir: &Path, config_path: &Path,
+) -> Result<Option<Sandbox>, Error> {
+    if !policy.grants_anywhere(Cap::Shell) {
+        return Ok(None);
+    }
+
+    let Some(config) = config else {
+        return Err(Error::SandboxNotConfigured);
+    };
+
+    let sandbox = shade_sandbox::start(config, data_dir, config_path).await?;
+
+    Ok(Some(sandbox))
 }
 
 /// Notifications go to Discord, the one adapter that can reach the owner

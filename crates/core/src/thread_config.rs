@@ -17,13 +17,13 @@ use infinity_agent_core::system::local::ChannelSender;
 use infinity_agent_core::system::{NoRapHttp, ThreadConfig, ThreadConfigSource};
 use infinity_agent_core::tools::thread::CloseThreadTool;
 use infinity_agent_core::traits::ConversationStore;
+use shade_sandbox::Sandbox;
 
 use crate::authority::Authority;
 use crate::error::BoxError;
 use crate::jobfiles::JobFiles;
 use crate::notify::Notifier;
 use crate::policy::{Cap, Origin};
-use crate::sandbox::Sandbox;
 use crate::store::conversation::Conversations;
 use crate::store::db::Db;
 use crate::store::operations::Operations;

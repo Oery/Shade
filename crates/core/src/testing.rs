@@ -11,17 +11,16 @@ use infinity_agent_core::system::local::{LaunchingSystem, ThreadHandle, ThreadLi
 use infinity_agent_core::system::{AgentEvent, AgentSystemBuilder, NoRapHttp, StaticModel};
 use infinity_provider_protocol::mock::{MockModelController, mock_model};
 use infinity_provider_protocol::{ModelEntry, SingleModelProvider};
+use shade_sandbox::paths::Protected;
+use shade_sandbox::{Config, Isolation, Runner, Sandbox, find_on_path};
 use tokio::task::LocalSet;
 
 use crate::authority::{Authority, Metered};
-use crate::config::{Isolation, SandboxConfig};
 use crate::error::BoxError;
 use crate::jobfiles::JobFiles;
 use crate::notify::Notifier;
 use crate::policy::{Cap, Limits, Policy};
 use crate::router::Router;
-use crate::sandbox::paths::Protected;
-use crate::sandbox::{Runner, Sandbox, SandboxError, find_on_path};
 use crate::store::conversation::Conversations;
 use crate::store::db::Db;
 use crate::store::grants::Grants;
@@ -163,21 +162,18 @@ impl Dirs {
         Self { root, workspace, vault }
     }
 
-    pub fn sandbox(&self, runner: Runner, vault: bool) -> Result<Sandbox, SandboxError> {
-        let config = SandboxConfig {
+    /// A real bubblewrap sandbox with the vault configured.
+    pub fn bubblewrap(&self) -> Sandbox {
+        let config = Config {
             workspace: self.workspace.clone(),
-            vault: vault.then(|| self.vault.clone()),
+            vault: Some(self.vault.clone()),
             env: Vec::new(),
             isolation: Isolation::Bubblewrap,
             max_timeout_seconds: 60,
         };
+        let runner = Runner::Bubblewrap(find_on_path("bwrap").unwrap());
 
-        Sandbox::new(runner, config, &Protected { paths: Vec::new(), home: None })
-    }
-
-    /// A real bubblewrap sandbox with the vault configured.
-    pub fn bubblewrap(&self) -> Sandbox {
-        self.sandbox(Runner::Bubblewrap(find_on_path("bwrap").unwrap()), true).unwrap()
+        Sandbox::new(runner, config, &Protected { paths: Vec::new(), home: None }).unwrap()
     }
 }
 

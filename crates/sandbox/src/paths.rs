@@ -9,7 +9,7 @@
 use std::io;
 use std::path::{Path, PathBuf};
 
-use crate::sandbox::SandboxError;
+use crate::SandboxError;
 
 /// Host paths the shell must never reach, all canonical.
 pub struct Protected {

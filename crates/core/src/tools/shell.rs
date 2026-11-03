@@ -15,12 +15,12 @@ use infinity_agent_core::tools::{Tool, ToolContext};
 use infinity_agent_core::traits::InputSender;
 use rap_protocol::{ProviderCallId, ToolCallId};
 use serde::Deserialize;
+use shade_sandbox::{Access, Exit, Finished, Sandbox};
 
 use crate::authority::Authority;
 use crate::error::BoxError;
 use crate::policy::Cap;
 use crate::recovery::UNKNOWN_OUTCOME;
-use crate::sandbox::{Access, Exit, Finished, Sandbox};
 use crate::store::operations::Operations;
 use crate::tools;
 

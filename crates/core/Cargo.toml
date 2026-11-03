@@ -7,6 +7,7 @@ publish.workspace = true
 
 [dependencies]
 shade-proto.workspace = true
+shade-sandbox.workspace = true
 async-trait.workspace = true
 chrono.workspace = true
 chrono-tz.workspace = true

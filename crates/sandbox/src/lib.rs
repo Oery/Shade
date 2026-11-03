@@ -10,7 +10,7 @@
 //! out, or the daemon dies, the namespace's init dies and the kernel kills
 //! every process left in it, including ones that called `setsid`. The
 //! kernel tracks the parent per thread, so commands must be started from a
-//! thread that lives as long as the daemon, such as the core's.
+//! thread that lives as long as the daemon, such as the one running Shade's core.
 
 pub mod output;
 pub mod paths;
@@ -24,14 +24,13 @@ use std::path::{Path, PathBuf};
 use std::process::{ExitStatus, Stdio};
 use std::time::Duration;
 
+use serde::Deserialize;
 use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::{Child, Command};
 
-use crate::config::{Isolation, SandboxConfig};
-use crate::policy::{Cap, Policy};
-use crate::sandbox::output::{KEEP, Output};
-use crate::sandbox::paths::Protected;
+use crate::output::{KEEP, Output};
+use crate::paths::Protected;
 
 /// Where the workspace appears inside the sandbox.
 pub const WORKSPACE: &str = "/workspace";
@@ -71,11 +70,39 @@ const PROBE_FILE: &str = ".shade-probe";
 /// Longest time the startup probe may take.
 const PROBE_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// The `[sandbox]` config section.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Config {
+    /// Host directory mounted read-write at `/workspace`, the shell's working directory.
+    pub workspace: PathBuf,
+    /// Host directory mounted read-write at `/vault`, only for roots granted `vault`.
+    pub vault: Option<PathBuf>,
+    /// Variables copied from the daemon's environment. Everything else is cleared.
+    #[serde(default)]
+    pub env: Vec<String>,
+    #[serde(default)]
+    pub isolation: Isolation,
+    /// The longest a command may run when it asks for more than the default 30 seconds.
+    #[serde(default = "default_max_timeout")]
+    pub max_timeout_seconds: u64,
+}
+
+fn default_max_timeout() -> u64 {
+    300
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Isolation {
+    #[default]
+    Bubblewrap,
+    /// Development only: shell commands run on the host with the owner's full authority.
+    Off,
+}
+
 #[derive(Debug, Error)]
 pub enum SandboxError {
-    #[error("`shell` is granted but the config has no [sandbox] section")]
-    NotConfigured,
-
     #[error("[sandbox] path {path}: {source}")]
     Path { path: PathBuf, source: io::Error },
 
@@ -139,21 +166,11 @@ pub struct Sandbox {
     env: Vec<(String, OsString)>,
 }
 
-/// The sandbox for shell commands, or `None` when no origin holds `shell`.
+/// The sandbox for the daemon using `data_dir` and `config_path`, probed.
 ///
-/// Fails closed: with `shell` granted, a missing section, an exposed path,
-/// or a sandbox that cannot actually run a command stops the daemon.
-pub async fn start(
-    config: Option<SandboxConfig>, policy: &Policy, data_dir: &Path, config_path: &Path,
-) -> Result<Option<Sandbox>, SandboxError> {
-    if !policy.grants_anywhere(Cap::Shell) {
-        return Ok(None);
-    }
-
-    let Some(config) = config else {
-        return Err(SandboxError::NotConfigured);
-    };
-
+/// Fails closed: an exposed path or a sandbox that cannot actually run a
+/// command is an error.
+pub async fn start(config: Config, data_dir: &Path, config_path: &Path) -> Result<Sandbox, SandboxError> {
     let runner = match config.isolation {
         Isolation::Bubblewrap => Runner::Bubblewrap(find_bubblewrap()?),
         Isolation::Off => {
@@ -166,12 +183,12 @@ pub async fn start(
     let sandbox = Sandbox::new(runner, config, &protected)?;
     sandbox.probe().await?;
 
-    Ok(Some(sandbox))
+    Ok(sandbox)
 }
 
 impl Sandbox {
     /// Resolves and checks the configured paths against `protected`.
-    pub fn new(runner: Runner, config: SandboxConfig, protected: &Protected) -> Result<Self, SandboxError> {
+    pub fn new(runner: Runner, config: Config, protected: &Protected) -> Result<Self, SandboxError> {
         let workspace = paths::directory(config.workspace)?;
 
         let vault = match config.vault {

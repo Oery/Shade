@@ -1,9 +1,9 @@
 use std::path::PathBuf;
 
+use shade_sandbox::SandboxError;
 use thiserror::Error;
 
 use crate::adapters::discord::DiscordError;
-use crate::sandbox::SandboxError;
 
 pub type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
@@ -62,6 +62,9 @@ pub enum Error {
 
     #[error("cannot set up the model: {0}")]
     Model(BoxError),
+
+    #[error("`shell` is granted but the config has no [sandbox] section")]
+    SandboxNotConfigured,
 
     #[error(transparent)]
     Sandbox(#[from] SandboxError),

@@ -2298,6 +2298,7 @@ dependencies = [
  "serde_json",
  "serenity",
  "shade-proto",
+ "shade-sandbox",
  "thiserror 2.0.21",
  "tokio",
  "toml",
@@ -2320,6 +2321,18 @@ name = "shade-proto"
 version = "0.1.0"
 dependencies = [
  "serde",
+]
+
+[[package]]
+name = "shade-sandbox"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "shade-proto",
+ "thiserror 2.0.21",
+ "tokio",
+ "tracing",
+ "uuid",
 ]
 
 [[package]]

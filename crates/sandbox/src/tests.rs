@@ -7,10 +7,8 @@ use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
-use crate::config::{Isolation, SandboxConfig};
-use crate::sandbox::paths::Protected;
-use crate::sandbox::{Access, Exit, Finished, Runner, Sandbox, SandboxError, find_on_path};
-use crate::testing::Dirs;
+use crate::paths::Protected;
+use crate::{Access, Config, Exit, Finished, Isolation, Runner, Sandbox, SandboxError, find_on_path};
 
 const NONE: Access = Access { network: false, vault: false };
 const TIMEOUT: Duration = Duration::from_secs(10);
@@ -20,6 +18,48 @@ const DETACH: &str = "setsid sh -c 'touch /workspace/started; sleep 1; touch /wo
 
 /// Set for the helper process of `daemon_death_kills_the_sandbox`: the workspace to use.
 const HOLDER_ENV: &str = "SHADE_TEST_SANDBOX_HOLDER";
+
+/// A workspace and a vault under the system temp dir, removed when dropped.
+struct Dirs {
+    root: PathBuf,
+    workspace: PathBuf,
+    vault: PathBuf,
+}
+
+impl Dirs {
+    fn new() -> Self {
+        let root = std::env::temp_dir().join(format!("shade-test-{}", uuid::Uuid::new_v4()));
+        let workspace = root.join("workspace");
+        let vault = root.join("vault");
+        fs::create_dir_all(&workspace).unwrap();
+        fs::create_dir_all(&vault).unwrap();
+
+        Self { root, workspace, vault }
+    }
+
+    fn sandbox(&self, runner: Runner) -> Result<Sandbox, SandboxError> {
+        let config = Config {
+            workspace: self.workspace.clone(),
+            vault: Some(self.vault.clone()),
+            env: Vec::new(),
+            isolation: Isolation::Bubblewrap,
+            max_timeout_seconds: 60,
+        };
+
+        Sandbox::new(runner, config, &Protected { paths: Vec::new(), home: None })
+    }
+
+    /// A real bubblewrap sandbox with the vault configured.
+    fn bubblewrap(&self) -> Sandbox {
+        self.sandbox(Runner::Bubblewrap(find_on_path("bwrap").unwrap())).unwrap()
+    }
+}
+
+impl Drop for Dirs {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.root);
+    }
+}
 
 fn stdout(finished: &Finished) -> String {
     finished.stdout.text()
@@ -118,7 +158,7 @@ async fn broken_sandbox_fails_the_probe() {
 
     for bwrap in runners {
         let dirs = Dirs::new();
-        let sandbox = dirs.sandbox(Runner::Bubblewrap(bwrap.clone()), true).unwrap();
+        let sandbox = dirs.sandbox(Runner::Bubblewrap(bwrap.clone())).unwrap();
 
         assert!(sandbox.probe().await.is_err(), "{} passed the probe", bwrap.display());
     }
@@ -134,7 +174,7 @@ fn symlinked_workspace_is_resolved() {
     let link = dirs.root.join("link");
     std::os::unix::fs::symlink(&dirs.vault, &link).unwrap();
 
-    let config = SandboxConfig { workspace: link, vault: None, env: Vec::new(), isolation: Isolation::Bubblewrap, max_timeout_seconds: 60 };
+    let config = Config { workspace: link, vault: None, env: Vec::new(), isolation: Isolation::Bubblewrap, max_timeout_seconds: 60 };
     let protected = Protected { paths: vec![dirs.vault.canonicalize().unwrap()], home: None };
     let result = Sandbox::new(Runner::Host, config, &protected);
 
@@ -147,7 +187,7 @@ fn daemon_death_kills_the_sandbox() {
     let dirs = Dirs::new();
 
     let mut holder = Command::new(std::env::current_exe().unwrap())
-        .args(["--exact", "sandbox::tests::sandbox_holder", "--ignored"])
+        .args(["--exact", "tests::sandbox_holder", "--ignored"])
         .env(HOLDER_ENV, &dirs.workspace)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -176,7 +216,7 @@ async fn sandbox_holder() {
         return;
     };
 
-    let config = SandboxConfig {
+    let config = Config {
         workspace: PathBuf::from(workspace),
         vault: None,
         env: Vec::new(),
