@@ -14,6 +14,7 @@ use infinity_provider_protocol::{ModelEntry, SingleModelProvider};
 use shade_policy::{Cap, Limits, Policy};
 use shade_sandbox::paths::Protected;
 use shade_sandbox::{Config, Isolation, Runner, Sandbox, find_on_path};
+use shade_schedule::jobfiles::JobFiles;
 use shade_store::conversation::Conversations;
 use shade_store::db::Db;
 use shade_store::grants::Grants;
@@ -23,7 +24,6 @@ use tokio::task::LocalSet;
 
 use crate::authority::{Authority, Metered};
 use crate::error::BoxError;
-use crate::jobfiles::JobFiles;
 use crate::notify::Notifier;
 use crate::router::Router;
 use crate::thread_config::{Services, ThreadTools};

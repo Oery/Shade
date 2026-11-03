@@ -98,7 +98,9 @@ crates/
   daemon/                   shade-daemon: the `shaded` binary
     src/main.rs             --config, logging, signals, calls shade_core::run
   policy/                   shade-policy: capabilities, origins, ceilings, limit checks
-    src/lib.rs
+    src/
+      lib.rs
+      channels.rs           channel names and where a scheduled run may post
   store/                    shade-store: the SQLite adapter; the only crate with rusqlite
     migrations/             schema, applied in order by db.rs
     src/
@@ -111,6 +113,11 @@ crates/
       inbox.rs              accepted input and its acknowledgment
       schedules.rs          scheduled jobs and their runs
       usage.rs              token usage per request
+  schedule/                 shade-schedule: pure scheduling rules
+    src/
+      lib.rs                cron timing, DST rules, listings, the text a run starts with
+      receipt.rs            receipt cards and cron in words
+      jobfiles.rs           the job file format: jobs/<id>.toml next to the config
   sandbox/                  shade-sandbox: bubblewrap for shell commands
     src/
       lib.rs                mounts, environment, bounded runs, startup probe

@@ -26,14 +26,15 @@ use serenity::all::{
     GatewayIntents, Http, HttpError, Interaction, Message, MessageId, Ready, ShardManager, Typing, UserId,
 };
 use serenity::async_trait;
+use shade_policy::channels::Destination;
+use shade_schedule::receipt::{Card, Verb};
 use shade_store::roots::{Adapter, Target};
 
 use thiserror::Error;
 use tokio::sync::mpsc;
 
 use crate::config::DiscordConfig;
-use crate::notify::{Destination, Failure, Notice};
-use crate::receipt::{Card, Verb};
+use crate::notify::{Failure, Notice};
 use crate::router::turn::Step;
 use crate::router::{Inbound, Outbound};
 use crate::secrets::Secrets;

@@ -7,6 +7,9 @@
 //! that no longer matches the pattern is skipped, and so is the second pass
 //! of a repeated local time.
 
+pub mod jobfiles;
+pub mod receipt;
+
 use chrono::{DateTime, LocalResult, NaiveDateTime, TimeZone, Utc};
 use chrono_tz::Tz;
 use croner::Cron;

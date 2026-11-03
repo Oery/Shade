@@ -5,19 +5,17 @@
 use chrono::{DateTime, Utc};
 use infinity_agent_core::ThreadId;
 use shade_proto::{Manage, Response};
+use shade_schedule::{APPROVAL_WINDOW, Trigger};
+use shade_store::db::DbError;
+use shade_store::schedules::{Change, Definition, Due, Pending, Run, Schedules};
 use tokio::sync::mpsc;
 
 use super::{Outbound, Router, SUPERSEDED};
 use crate::notify::Notifier;
 use crate::router::turn::Step;
-use crate::schedule::APPROVAL_WINDOW;
 
 /// How long a one-shot job stays listed after its run, in seconds.
 const ARCHIVE_AFTER: i64 = 24 * 3600;
-use shade_store::db::DbError;
-use shade_store::schedules::{Change, Definition, Due, Pending, Run, Schedules};
-
-use crate::schedule::{self, Trigger};
 
 impl Router {
     /// Claims every due occurrence, then starts queued runs while capacity
@@ -65,7 +63,7 @@ impl Router {
     async fn start_queued(&self, now: DateTime<Utc>) -> Result<(), DbError> {
         for queued in self.schedules.startable(self.policy.limits.max_concurrent_background_runs).await? {
             let scheduled_for = DateTime::from_timestamp(queued.scheduled_for, 0).unwrap_or(now);
-            let text = schedule::input(&queued.title, &queued.job, &queued.timezone, scheduled_for, now, &queued.prompt);
+            let text = shade_schedule::input(&queued.title, &queued.job, &queued.timezone, scheduled_for, now, &queued.prompt);
 
             let Some(input) = self.schedules.start(queued.run.to_owned(), text).await? else {
                 continue;
@@ -262,7 +260,7 @@ impl Router {
     async fn list_jobs(&self) -> Result<String, String> {
         match self.schedules.list().await {
             Ok(jobs) => match self.schedules.waiting(APPROVAL_WINDOW).await {
-                Ok(waiting) => Ok(schedule::list(&jobs, &waiting)),
+                Ok(waiting) => Ok(shade_schedule::list(&jobs, &waiting)),
                 Err(error) => Err(format!("cannot read pending changes: {error}")),
             },
             Err(error) => Err(format!("cannot read jobs: {error}")),
@@ -303,13 +301,13 @@ impl Router {
             Err(error) => return Err(format!("cannot read jobs: {error}")),
         };
 
-        let next = schedule::resumed_next(&job, now)?;
+        let next = shade_schedule::resumed_next(&job, now)?;
 
         if let Err(error) = self.schedules.resume(id.to_owned(), next).await {
             return Err(format!("cannot resume {id}: {error}"));
         }
 
-        Ok(format!("Resumed {id}. Next run: {}", schedule::when(Some(next), &job.timezone)))
+        Ok(format!("Resumed {id}. Next run: {}", shade_schedule::when(Some(next), &job.timezone)))
     }
 }
 
@@ -320,7 +318,7 @@ fn next_after_approval(definition: &Definition, code: &str, now: DateTime<Utc>) 
         return Ok(definition.next_at);
     }
 
-    let next = schedule::resumed_next(definition, now)?;
+    let next = shade_schedule::resumed_next(definition, now)?;
 
     if next <= now.timestamp() {
         return Err(format!("the time of change {code} has passed; ask for it again"));

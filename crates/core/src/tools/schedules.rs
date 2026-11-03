@@ -18,7 +18,11 @@ use infinity_agent_core::traits::InputSender;
 use rap_protocol::{ProviderCallId, ToolCallId};
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
+use shade_policy::channels;
 use shade_policy::{Cap, Caps};
+use shade_schedule::TriggerArgs;
+use shade_schedule::jobfiles::{self, JobFiles};
+use shade_schedule::receipt::{Card, Proposal, Verb};
 use shade_store::db::Db;
 use shade_store::operations::Operations;
 use shade_store::roots::{Adapter, Roots};
@@ -26,10 +30,6 @@ use shade_store::schedules::{Applied, Change, Definition, MAX_JOBS, Pending, Rec
 
 use crate::authority::Authority;
 use crate::error::BoxError;
-use crate::jobfiles::{self, JobFiles};
-use crate::notify;
-use crate::receipt::{Card, Proposal, Verb};
-use crate::schedule::{self, TriggerArgs};
 use crate::tools::{self, Shown};
 
 const MAX_TITLE: usize = 100;
@@ -255,8 +255,8 @@ impl Work {
 
     async fn list(&self) -> Result<String, String> {
         match self.schedules.list().await {
-            Ok(jobs) => match self.schedules.waiting(schedule::APPROVAL_WINDOW).await {
-                Ok(waiting) => Ok(schedule::list(&jobs, &waiting)),
+            Ok(jobs) => match self.schedules.waiting(shade_schedule::APPROVAL_WINDOW).await {
+                Ok(waiting) => Ok(shade_schedule::list(&jobs, &waiting)),
                 Err(error) => Err(format!("cannot read pending changes: {error}")),
             },
             Err(error) => Err(format!("cannot read jobs: {error}")),
@@ -275,7 +275,7 @@ impl Work {
     }
 
     async fn create(&self, args: CreateArgs, held: &Caps, thread: &ThreadId, now: DateTime<Utc>) -> Result<Prepared, String> {
-        let timing = schedule::timing(args.trigger, self.authority.policy().timezone, now)?;
+        let timing = shade_schedule::timing(args.trigger, self.authority.policy().timezone, now)?;
 
         let channels = match args.channels {
             Some(channels) => self.channels(channels)?,
@@ -359,7 +359,7 @@ impl Work {
     /// The channel of the conversation `thread` belongs to, or the owner's DMs.
     async fn home_channel(&self, thread: &ThreadId) -> Result<String, String> {
         match self.roots.conversation_of(thread).await {
-            Ok(Some((Adapter::Discord, key))) => Ok(notify::channel(&key, &self.authority.policy().channels)?.0),
+            Ok(Some((Adapter::Discord, key))) => Ok(channels::channel(&key, &self.authority.policy().channels)?.0),
             Ok(_) => Ok("dm".to_owned()),
             Err(error) => Err(format!("cannot find this conversation's channel: {error}")),
         }
@@ -374,7 +374,7 @@ impl Work {
         let mut channels = Vec::new();
 
         for channel in written {
-            let (stored, _) = notify::channel(&channel, &self.authority.policy().channels)?;
+            let (stored, _) = channels::channel(&channel, &self.authority.policy().channels)?;
 
             if !channels.contains(&stored) {
                 channels.push(stored);
@@ -413,14 +413,14 @@ impl Work {
         }
 
         if let Some(trigger) = args.trigger {
-            let timing = schedule::timing(trigger, self.authority.policy().timezone, now)?;
+            let timing = shade_schedule::timing(trigger, self.authority.policy().timezone, now)?;
             definition.kind = timing.kind.to_owned();
             definition.spec = timing.spec;
             definition.timezone = timing.timezone.name().to_owned();
             definition.next_at = Some(timing.next_at.timestamp());
             definition.enabled = true;
         } else if args.paused == Some(false) && !definition.enabled {
-            definition.next_at = Some(schedule::resumed_next(&definition, now)?);
+            definition.next_at = Some(shade_schedule::resumed_next(&definition, now)?);
         }
 
         if let Some(paused) = args.paused {
@@ -672,6 +672,7 @@ mod tests {
     use infinity_agent_core::ThreadId;
     use serde_json::json;
     use shade_policy::{Cap, Limits};
+    use shade_schedule::jobfiles::JobFiles;
     use shade_store::conversation::Conversations;
     use shade_store::db::Db;
     use shade_store::grants::Grants;
@@ -680,7 +681,6 @@ mod tests {
     use super::{Action, Answer, Call, Work};
     use crate::authority::Authority;
     use crate::error::BoxError;
-    use crate::jobfiles::JobFiles;
     use crate::testing::{self, Dirs};
 
     struct Setup {

@@ -16,12 +16,12 @@ use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use shade_policy::channels::channel;
 use shade_policy::{Cap, Caps, Policy};
 use shade_store::schedules::{Definition, Job};
 use tokio::sync::{Mutex, MutexGuard};
 
-use crate::notify;
-use crate::schedule::{self, TriggerArgs};
+use crate::TriggerArgs;
 
 /// The longest job file name, without `.toml`.
 const MAX_NAME: usize = 40;
@@ -185,7 +185,7 @@ fn definition(file: JobFile, policy: &Policy, previous: Option<&Definition>, now
     } else {
         file.channels
     } {
-        let (stored, _) = notify::channel(&written, &policy.channels)?;
+        let (stored, _) = channel(&written, &policy.channels)?;
 
         if !channels.contains(&stored) {
             channels.push(stored);
@@ -220,7 +220,7 @@ fn definition(file: JobFile, policy: &Policy, previous: Option<&Definition>, now
         return Ok(definition);
     }
 
-    let timing = schedule::timing(trigger, policy.timezone, now)?;
+    let timing = crate::timing(trigger, policy.timezone, now)?;
     definition.kind = timing.kind.to_owned();
     definition.spec = timing.spec;
     definition.timezone = timing.timezone.name().to_owned();

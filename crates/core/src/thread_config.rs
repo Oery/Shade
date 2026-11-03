@@ -19,13 +19,13 @@ use infinity_agent_core::tools::thread::CloseThreadTool;
 use infinity_agent_core::traits::ConversationStore;
 use shade_policy::{Cap, Origin};
 use shade_sandbox::Sandbox;
+use shade_schedule::jobfiles::JobFiles;
 use shade_store::conversation::Conversations;
 use shade_store::db::Db;
 use shade_store::operations::Operations;
 
 use crate::authority::Authority;
 use crate::error::BoxError;
-use crate::jobfiles::JobFiles;
 use crate::notify::Notifier;
 use crate::tools::notify::Notify;
 use crate::tools::now::Now;

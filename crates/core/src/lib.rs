@@ -4,16 +4,13 @@ mod adapters;
 mod authority;
 mod config;
 mod error;
-mod jobfiles;
 mod lock;
 mod model;
 mod notify;
-mod receipt;
 mod recovery;
 #[cfg(test)]
 mod replay;
 mod router;
-mod schedule;
 mod secrets;
 #[cfg(test)]
 mod testing;
@@ -32,13 +29,13 @@ use tokio::task::LocalSet;
 pub use error::Error;
 
 use shade_policy::{Cap, Policy};
+use shade_schedule::jobfiles::{self, JobFiles};
 use shade_store::db::{self, Db};
 use shade_store::grants::Grants;
 
 use crate::adapters::discord::Discord;
 use crate::adapters::socket::ControlSocket;
 use crate::config::Config;
-use crate::jobfiles::JobFiles;
 use crate::model::Model;
 use crate::notify::Notifier;
 use crate::router::{Inbound, Router};

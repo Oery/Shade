@@ -2284,7 +2284,6 @@ dependencies = [
  "async-trait",
  "chrono",
  "chrono-tz",
- "croner",
  "dotenvy",
  "futures-util",
  "http",
@@ -2299,6 +2298,7 @@ dependencies = [
  "shade-policy",
  "shade-proto",
  "shade-sandbox",
+ "shade-schedule",
  "shade-store",
  "thiserror 2.0.21",
  "tokio",
@@ -2343,6 +2343,20 @@ dependencies = [
  "tokio",
  "tracing",
  "uuid",
+]
+
+[[package]]
+name = "shade-schedule"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "chrono-tz",
+ "croner",
+ "serde",
+ "shade-policy",
+ "shade-store",
+ "tokio",
+ "toml",
 ]
 
 [[package]]

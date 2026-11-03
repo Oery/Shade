@@ -4,6 +4,8 @@
 //! process. A root's authority is its stored grant bounded by the current
 //! policy, so capabilities removed from the config disappear on restart.
 
+pub mod channels;
+
 use std::collections::{BTreeMap, BTreeSet};
 
 use chrono_tz::Tz;

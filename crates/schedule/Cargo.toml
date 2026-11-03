@@ -1,0 +1,23 @@
+[package]
+name = "shade-schedule"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[features]
+# Example data that other crates' tests use.
+testing = []
+
+[dependencies]
+shade-policy.workspace = true
+shade-store.workspace = true
+chrono.workspace = true
+chrono-tz.workspace = true
+croner.workspace = true
+serde.workspace = true
+tokio.workspace = true
+toml.workspace = true
+
+[lints]
+workspace = true

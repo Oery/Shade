@@ -120,9 +120,9 @@ impl Turn {
 #[cfg(test)]
 mod tests {
     use infinity_agent_core::system::AgentEvent;
+    use shade_schedule::receipt::{Card, Proposal, Verb};
 
     use super::{Step, Turn};
-    use crate::receipt::{Card, Proposal, Verb};
     use crate::tools::{self, Shown};
     use rap_protocol::DisplaySegment;
 

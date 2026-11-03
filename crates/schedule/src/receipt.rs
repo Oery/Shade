@@ -275,8 +275,9 @@ fn friendly(instant: DateTime<Utc>, zone: Tz, home: Tz, now: DateTime<Utc>) -> S
     format!("{day}, {}{suffix}", local.format("%H:%M"))
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "testing"))]
 impl Card {
+    /// A card for tests that render one.
     pub fn example(verb: Verb) -> Self {
         Self {
             verb,

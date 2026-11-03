@@ -12,9 +12,9 @@ use infinity_agent_core::traits::InputSender;
 use infinity_provider_protocol::message::{Text, ToolResult, ToolResultContent, UserContent};
 use rap_protocol::DisplaySegment;
 use serde::{Deserialize, Serialize};
+use shade_schedule::receipt::Card;
 use shade_store::operations::{Operations, Started};
 
-use crate::receipt::Card;
 use crate::recovery::UNKNOWN_OUTCOME;
 
 /// Sends the result of an asynchronous call. The call ID is the dedup ID,
@@ -94,9 +94,9 @@ pub async fn record(operations: &Operations, thread: &str, call: &str, tool: &st
 #[cfg(test)]
 mod tests {
     use rap_protocol::DisplaySegment;
+    use shade_schedule::receipt::{Card, Proposal, Verb};
 
     use super::{Shown, display, shown};
-    use crate::receipt::{Card, Proposal, Verb};
 
     /// What Shade shows survives Infinity appending the model's text, and a
     /// plain result shows nothing, even if the model's text looks like a receipt.

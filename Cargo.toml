@@ -12,6 +12,7 @@ publish = false
 shade-core = { path = "crates/core" }
 shade-policy = { path = "crates/policy" }
 shade-proto = { path = "crates/proto" }
+shade-schedule = { path = "crates/schedule" }
 shade-sandbox = { path = "crates/sandbox" }
 shade-store = { path = "crates/store" }
 async-trait = "0.1"

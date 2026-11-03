@@ -17,6 +17,7 @@ use infinity_agent_core::tools::{Tool, ToolContext};
 use infinity_agent_core::traits::InputSender;
 use rap_protocol::{ProviderCallId, ToolCallId};
 use serde::Deserialize;
+use shade_policy::channels::{self, Destination};
 use shade_policy::{Cap, Origin};
 use shade_store::db::Db;
 use shade_store::operations::Operations;
@@ -25,7 +26,7 @@ use shade_store::schedules::Schedules;
 
 use crate::authority::Authority;
 use crate::error::BoxError;
-use crate::notify::{self, Destination, Notifier};
+use crate::notify::Notifier;
 use crate::recovery::UNKNOWN_OUTCOME;
 use crate::tools;
 
@@ -188,17 +189,17 @@ impl Work {
             Origin::Watch | Origin::Webhook => vec!["dm".to_owned()],
         };
 
-        notify::job_destination(&channels, requested, names)
+        channels::job_destination(&channels, requested, names)
     }
 
     /// Owner chat may post anywhere; by default where it is talking.
     async fn chat_destination(&self, thread: &ThreadId, requested: Option<&str>) -> Result<Destination, String> {
         if let Some(written) = requested {
-            return Ok(notify::channel(written, &self.authority.policy().channels)?.1);
+            return Ok(channels::channel(written, &self.authority.policy().channels)?.1);
         }
 
         match self.roots.conversation_of(thread).await {
-            Ok(Some((Adapter::Discord, key))) => Ok(notify::channel(&key, &self.authority.policy().channels)?.1),
+            Ok(Some((Adapter::Discord, key))) => Ok(channels::channel(&key, &self.authority.policy().channels)?.1),
             Ok(_) => Ok(Destination::Owner),
             Err(error) => Err(format!("cannot find this conversation's channel: {error}")),
         }
@@ -238,6 +239,7 @@ fn parse(args: serde_json::Value) -> Result<(String, Option<String>), String> {
 mod tests {
     use infinity_agent_core::ThreadId;
     use infinity_agent_core::message::InputMessage;
+    use shade_policy::channels::Destination;
     use shade_policy::{Cap, Limits};
     use shade_store::conversation::Conversations;
     use shade_store::db::Db;
@@ -246,7 +248,7 @@ mod tests {
     use tokio::sync::{mpsc, oneshot};
 
     use crate::error::BoxError;
-    use crate::notify::{Destination, Failure, Notice, Notifier};
+    use crate::notify::{Failure, Notice, Notifier};
     use crate::recovery::{self, UNKNOWN_OUTCOME};
     use crate::testing::{self, attach, within};
     use crate::tools;
