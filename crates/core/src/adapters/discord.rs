@@ -304,7 +304,13 @@ impl Reply {
         }
     }
 
+    /// A message never starts with blank lines.
     fn append(&mut self, text: &str) {
+        let text = if self.buffer.is_empty() {
+            text.trim_start_matches('\n')
+        } else {
+            text
+        };
         let room = MAX_BUFFER.saturating_sub(self.buffer.len());
         let kept = &text[..text.floor_char_boundary(room)];
         self.buffer.push_str(kept);

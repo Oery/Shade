@@ -46,6 +46,11 @@ pub struct Turn {
     /// An approval card was shown: the rest of the turn is hidden, and the
     /// model speaks again once the owner has decided.
     quiet: bool,
+    /// The current completion has written text.
+    spoke: bool,
+    /// The next text continues after a completion that wrote and then
+    /// paused on a tool: it starts on a new paragraph.
+    separate: bool,
     failure: Option<String>,
 }
 
@@ -70,9 +75,10 @@ impl Turn {
             AgentEvent::Info { text } => self.on_info(text),
             _ if !self.accepted => None,
             AgentEvent::TextChunk { .. } if self.quiet => None,
-            AgentEvent::TextChunk { text } => Some(Step::Text(text)),
+            AgentEvent::TextChunk { text } => Some(self.text(text)),
             AgentEvent::CompletionStarted => {
                 self.started = true;
+                self.spoke = false;
                 None
             }
             AgentEvent::ToolCall { .. } => {
@@ -88,11 +94,22 @@ impl Turn {
             }
             AgentEvent::CompletionFinished { .. } if self.pending_tools > 0 && self.failure.is_none() => {
                 self.started = false;
+                self.separate |= self.spoke;
                 Some(Step::Paused)
             }
             AgentEvent::CompletionFinished { .. } => Some(self.finish()),
             _ => None,
         }
+    }
+
+    fn text(&mut self, text: String) -> Step {
+        self.spoke = true;
+
+        if !std::mem::take(&mut self.separate) {
+            return Step::Text(text);
+        }
+
+        Step::Text(format!("\n\n{text}"))
     }
 
     /// Before a completion starts, an error means none will run, so it ends the turn.
@@ -215,6 +232,22 @@ mod tests {
             (
                 vec![input("hi"), started(), tool_call(), finished(), tool_result(), started(), text("answer"), finished()],
                 vec!["paused", "answer", "done"],
+            ),
+            // Text after a tool call starts a new paragraph when text came before it.
+            (
+                vec![
+                    input("hi"),
+                    started(),
+                    text("checking."),
+                    tool_call(),
+                    finished(),
+                    tool_result(),
+                    started(),
+                    text("found"),
+                    text(" it"),
+                    finished(),
+                ],
+                vec!["checking.", "paused", "\n\nfound", " it", "done"],
             ),
             // After an approval card, the model's words wait for the owner's decision.
             (
