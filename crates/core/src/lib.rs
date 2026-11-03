@@ -7,6 +7,7 @@ mod error;
 mod lock;
 mod model;
 mod policy;
+mod recovery;
 mod router;
 mod sandbox;
 mod secrets;
@@ -61,8 +62,8 @@ async fn serve(config_path: Option<PathBuf>) -> Result<(), Error> {
     // Declared before the socket so the socket file is removed while the lock is still held.
     let _lock = lock::acquire(&data_dir)?;
 
-    // Probed now so a broken sandbox stops the daemon; the shell tool will run commands through it.
-    let _sandbox = sandbox::start(sandbox, &policy, &data_dir, &config_path).await?;
+    // Probed now, so a broken sandbox stops the daemon before it accepts work.
+    let sandbox = sandbox::start(sandbox, &policy, &data_dir, &config_path).await?;
     let model = Model::new(model, &mut secrets)?;
     let db = Db::open(&data_dir.join(db::DB_FILE))?;
 
@@ -70,7 +71,12 @@ async fn serve(config_path: Option<PathBuf>) -> Result<(), Error> {
     let socket = ControlSocket::bind(shade_proto::socket_path(&data_dir), commands)?;
     tracing::info!(path = %socket.path().display(), model = %model.id(), "listening");
 
-    let router = Router::start(model, db, Arc::new(policy));
+    let router = Router::start(model, db, Arc::new(policy), sandbox.map(Arc::new));
+
+    if let Err(source) = router.recover().await {
+        router.shutdown().await;
+        return Err(Error::Recovery(source));
+    }
 
     let result = tokio::select! {
         () = socket.serve() => Ok(()),

@@ -9,11 +9,15 @@ use shade_proto::Response;
 use tokio::sync::mpsc;
 
 use crate::authority::{Authority, Metered};
+use crate::error::BoxError;
 use crate::model::Model;
 use crate::policy::Policy;
+use crate::recovery;
+use crate::sandbox::Sandbox;
 use crate::store::conversation::Conversations;
 use crate::store::db::Db;
 use crate::store::grants::Grants;
+use crate::store::operations::Operations;
 use crate::store::roots::{Adapter, Roots};
 use crate::store::state::States;
 use crate::thread_config::ThreadTools;
@@ -39,20 +43,27 @@ pub enum Target {
 
 pub struct Router {
     roots: Roots,
+    operations: Operations,
     system: LaunchingSystem<Conversations, States, NoRapHttp>,
 }
 
 impl Router {
     /// Built-in tools stay off: spawning has no limit hook (see docs/infinity-notes.md).
-    pub fn start(model: Model, db: Db, policy: Arc<Policy>) -> Self {
+    pub fn start(model: Model, db: Db, policy: Arc<Policy>, sandbox: Option<Arc<Sandbox>>) -> Self {
         let authority = Authority::new(Grants::new(db.clone()), policy);
         let conversations = Conversations::new(db.clone());
-        let tools = ThreadTools::new(conversations.clone(), authority.clone());
+        let operations = Operations::new(db.clone());
+        let tools = ThreadTools::new(conversations.clone(), authority.clone(), operations.clone(), sandbox);
         let model = Metered::new(model, authority);
         let builder = AgentSystemBuilder::new_local(conversations, States::new(db.clone()), model);
         let system = builder.without_builtin_tools().thread_config(tools).start();
 
-        Self { roots: Roots::new(db), system }
+        Self { roots: Roots::new(db), operations, system }
+    }
+
+    /// Answers the tool calls an earlier daemon left waiting. Runs before any new work.
+    pub async fn recover(&self) -> Result<(), BoxError> {
+        recovery::recover(&self.operations, &self.system.sender()).await
     }
 
     /// Handles commands until the channel closes. Must run inside a `LocalSet`.
@@ -147,10 +158,16 @@ async fn pump(mut handle: ThreadHandle, reply: mpsc::Sender<Response>) {
 /// A resumed conversation may still be finishing an earlier turn when this
 /// one's input arrives. Completion events count only after Infinity accepts
 /// the input (`UserInput`), so that turn's tail cannot end this one.
+///
+/// A completion that ends on an asynchronous tool call does not end the
+/// turn: the tool's result starts another completion. Synchronous tools
+/// answer inside the completion, so their results arrive before it finishes.
 #[derive(Default)]
 struct Turn {
     accepted: bool,
     started: bool,
+    /// Tool calls seen without their results.
+    pending_tools: usize,
     failure: Option<String>,
 }
 
@@ -167,6 +184,18 @@ impl Turn {
             AgentEvent::TextChunk { text } => Some(Response::Text { text }),
             AgentEvent::CompletionStarted => {
                 self.started = true;
+                None
+            }
+            AgentEvent::ToolCall { .. } => {
+                self.pending_tools += 1;
+                None
+            }
+            AgentEvent::ToolResult { .. } => {
+                self.pending_tools = self.pending_tools.saturating_sub(1);
+                None
+            }
+            AgentEvent::CompletionFinished { .. } if self.pending_tools > 0 && self.failure.is_none() => {
+                self.started = false;
                 None
             }
             AgentEvent::CompletionFinished { .. } => Some(self.finish()),
@@ -225,6 +254,14 @@ mod tests {
         AgentEvent::UserInput { text: "hi".to_owned() }
     }
 
+    fn tool_call() -> AgentEvent {
+        AgentEvent::ToolCall { name: "shell".to_owned(), args: serde_json::json!({}), display_as: None }
+    }
+
+    fn tool_result() -> AgentEvent {
+        AgentEvent::ToolResult { segments: Vec::new() }
+    }
+
     /// What the client sees for each event sequence, ending at the first final response.
     fn render(events: Vec<AgentEvent>) -> Vec<String> {
         let mut turn = Turn::default();
@@ -267,6 +304,30 @@ mod tests {
             (
                 vec![accepted(), AgentEvent::CompletionStarted, text("par"), accepted(), text("theirs"), finished()],
                 vec!["par", "error: interrupted by newer input to this conversation"],
+            ),
+            // An asynchronous tool's result starts another completion that belongs to this turn.
+            (
+                vec![
+                    accepted(),
+                    AgentEvent::CompletionStarted,
+                    tool_call(),
+                    finished(),
+                    tool_result(),
+                    AgentEvent::CompletionStarted,
+                    text("answer"),
+                    finished(),
+                ],
+                vec!["answer", "done"],
+            ),
+            // A synchronous tool answers inside the completion.
+            (
+                vec![accepted(), AgentEvent::CompletionStarted, tool_call(), tool_result(), text("12:00"), finished()],
+                vec!["12:00", "done"],
+            ),
+            // The completion after a tool result could not start.
+            (
+                vec![accepted(), AgentEvent::CompletionStarted, tool_call(), finished(), tool_result(), error("limit")],
+                vec!["error: limit"],
             ),
             // Informational lines are not errors.
             (

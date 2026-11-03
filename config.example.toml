@@ -45,6 +45,8 @@ caps = ["now"]
 # vault = "/home/me/notes"
 # Variables copied from the daemon's environment; everything else is cleared.
 # env = ["LANG"]
+# Commands run for 30 seconds unless they ask for more, up to this limit.
+# max_timeout_seconds = 300
 # Development only: run commands on the host with your full authority.
 # isolation = "off"
 

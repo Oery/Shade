@@ -54,6 +54,13 @@ pub struct SandboxConfig {
     pub env: Vec<String>,
     #[serde(default)]
     pub isolation: Isolation,
+    /// The longest a command may run when it asks for more than the default 30 seconds.
+    #[serde(default = "default_max_timeout")]
+    pub max_timeout_seconds: u64,
+}
+
+fn default_max_timeout() -> u64 {
+    300
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize)]

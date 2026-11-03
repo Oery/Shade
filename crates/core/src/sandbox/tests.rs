@@ -4,57 +4,25 @@ use std::fs;
 use std::net::TcpListener;
 use std::os::unix::net::UnixListener;
 use std::path::PathBuf;
-use std::time::Duration;
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 
 use crate::config::{Isolation, SandboxConfig};
 use crate::sandbox::paths::Protected;
 use crate::sandbox::{Access, Exit, Finished, Runner, Sandbox, SandboxError, find_on_path};
+use crate::testing::Dirs;
 
 const NONE: Access = Access { network: false, vault: false };
 const TIMEOUT: Duration = Duration::from_secs(10);
 
-/// A workspace and a vault, removed when dropped.
-struct Dirs {
-    root: PathBuf,
-    workspace: PathBuf,
-    vault: PathBuf,
-}
+/// Starts a detached process that writes `escaped` unless it is killed within a second.
+const DETACH: &str = "setsid sh -c 'touch /workspace/started; sleep 1; touch /workspace/escaped' & sleep 0.3";
 
-impl Dirs {
-    fn new() -> Self {
-        let root = std::env::temp_dir().join(format!("shade-sandbox-{}", uuid::Uuid::new_v4()));
-        let workspace = root.join("workspace");
-        let vault = root.join("vault");
-        fs::create_dir_all(&workspace).unwrap();
-        fs::create_dir_all(&vault).unwrap();
-
-        Self { root, workspace, vault }
-    }
-
-    fn sandbox(&self, runner: Runner) -> Result<Sandbox, SandboxError> {
-        let config = SandboxConfig {
-            workspace: self.workspace.clone(),
-            vault: Some(self.vault.clone()),
-            env: Vec::new(),
-            isolation: Isolation::Bubblewrap,
-        };
-
-        Sandbox::new(runner, config, &Protected { paths: Vec::new(), home: None })
-    }
-
-    fn bubblewrap(&self) -> Sandbox {
-        self.sandbox(Runner::Bubblewrap(find_on_path("bwrap").unwrap())).unwrap()
-    }
-}
-
-impl Drop for Dirs {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.root);
-    }
-}
+/// Set for the helper process of `daemon_death_kills_the_sandbox`: the workspace to use.
+const HOLDER_ENV: &str = "SHADE_TEST_SANDBOX_HOLDER";
 
 fn stdout(finished: &Finished) -> String {
-    String::from_utf8_lossy(&finished.stdout).into_owned()
+    finished.stdout.text()
 }
 
 #[tokio::test]
@@ -77,7 +45,7 @@ async fn host_secrets_sockets_and_environment_are_hidden() {
     }
 
     let finished = dirs.bubblewrap().run(&format!("{script}true"), NONE, TIMEOUT).await.unwrap();
-    assert_eq!(finished.exit, Exit::Code(0), "{}", String::from_utf8_lossy(&finished.stderr));
+    assert_eq!(finished.exit, Exit::Code(0), "{}", finished.stderr.text());
     assert_eq!(stdout(&finished), "", "visible inside the sandbox");
 
     let finished = dirs.bubblewrap().run("env | cut -d= -f1", NONE, TIMEOUT).await.unwrap();
@@ -127,11 +95,9 @@ async fn network_needs_shell_network() {
 
 #[tokio::test]
 async fn detached_descendants_die_with_the_command() {
-    let detach = "setsid sh -c 'touch /workspace/started; sleep 1; touch /workspace/escaped' & sleep 0.3";
-
     let cases = [
-        (format!("{detach}; exit 3"), TIMEOUT, Exit::Code(3)),
-        (format!("{detach}; sleep 30"), Duration::from_millis(600), Exit::TimedOut),
+        (format!("{DETACH}; exit 3"), TIMEOUT, Exit::Code(3)),
+        (format!("{DETACH}; sleep 30"), Duration::from_millis(600), Exit::TimedOut),
     ];
 
     for (script, timeout, exit) in cases {
@@ -152,7 +118,7 @@ async fn broken_sandbox_fails_the_probe() {
 
     for bwrap in runners {
         let dirs = Dirs::new();
-        let sandbox = dirs.sandbox(Runner::Bubblewrap(bwrap.clone())).unwrap();
+        let sandbox = dirs.sandbox(Runner::Bubblewrap(bwrap.clone()), true).unwrap();
 
         assert!(sandbox.probe().await.is_err(), "{} passed the probe", bwrap.display());
     }
@@ -168,9 +134,57 @@ fn symlinked_workspace_is_resolved() {
     let link = dirs.root.join("link");
     std::os::unix::fs::symlink(&dirs.vault, &link).unwrap();
 
-    let config = SandboxConfig { workspace: link, vault: None, env: Vec::new(), isolation: Isolation::Bubblewrap };
+    let config = SandboxConfig { workspace: link, vault: None, env: Vec::new(), isolation: Isolation::Bubblewrap, max_timeout_seconds: 60 };
     let protected = Protected { paths: vec![dirs.vault.canonicalize().unwrap()], home: None };
     let result = Sandbox::new(Runner::Host, config, &protected);
 
     assert!(matches!(result, Err(SandboxError::Exposed(_))), "a link into a protected path was accepted");
+}
+
+/// The daemon dies abruptly (SIGKILL) while a command runs: nothing it started survives.
+#[test]
+fn daemon_death_kills_the_sandbox() {
+    let dirs = Dirs::new();
+
+    let mut holder = Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "sandbox::tests::sandbox_holder", "--ignored"])
+        .env(HOLDER_ENV, &dirs.workspace)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+
+    let deadline = Instant::now() + TIMEOUT;
+
+    while !dirs.workspace.join("started").exists() {
+        assert!(Instant::now() < deadline, "the holder never started its command");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    holder.kill().unwrap();
+    holder.wait().unwrap();
+    std::thread::sleep(Duration::from_millis(1500));
+
+    assert!(!dirs.workspace.join("escaped").exists(), "a sandboxed process outlived the daemon");
+}
+
+/// Stands in for the daemon in `daemon_death_kills_the_sandbox`; does nothing when run directly.
+#[tokio::test]
+#[ignore = "helper process for daemon_death_kills_the_sandbox"]
+async fn sandbox_holder() {
+    let Some(workspace) = std::env::var_os(HOLDER_ENV) else {
+        return;
+    };
+
+    let config = SandboxConfig {
+        workspace: PathBuf::from(workspace),
+        vault: None,
+        env: Vec::new(),
+        isolation: Isolation::Bubblewrap,
+        max_timeout_seconds: 60,
+    };
+    let runner = Runner::Bubblewrap(find_on_path("bwrap").unwrap());
+    let sandbox = Sandbox::new(runner, config, &Protected { paths: Vec::new(), home: None }).unwrap();
+
+    let _ = sandbox.run(&format!("{DETACH}; sleep 30"), NONE, Duration::from_secs(60)).await;
 }

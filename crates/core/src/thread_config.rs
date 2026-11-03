@@ -9,6 +9,7 @@
 //! Compaction threads therefore get that one tool and nothing else.
 
 use std::rc::Rc;
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use infinity_agent_core::ThreadId;
@@ -20,17 +21,23 @@ use infinity_agent_core::traits::ConversationStore;
 use crate::authority::Authority;
 use crate::error::BoxError;
 use crate::policy::{Cap, Origin};
+use crate::sandbox::Sandbox;
 use crate::store::conversation::Conversations;
+use crate::store::operations::Operations;
 use crate::tools::now::Now;
+use crate::tools::shell::Shell;
 
 pub struct ThreadTools {
     conversations: Conversations,
     authority: Authority,
+    operations: Operations,
+    /// Present whenever some origin holds `shell`.
+    sandbox: Option<Arc<Sandbox>>,
 }
 
 impl ThreadTools {
-    pub fn new(conversations: Conversations, authority: Authority) -> Self {
-        Self { conversations, authority }
+    pub fn new(conversations: Conversations, authority: Authority, operations: Operations, sandbox: Option<Arc<Sandbox>>) -> Self {
+        Self { conversations, authority, operations, sandbox }
     }
 }
 
@@ -51,6 +58,14 @@ impl ThreadConfigSource<ChannelSender, NoRapHttp> for ThreadTools {
 
         if authorized.caps.contains(&Cap::Now) {
             config.tools.push(Rc::new(Now::new(self.authority.clone(), policy.timezone)));
+        }
+
+        if authorized.caps.contains(&Cap::Shell)
+            && let Some(sandbox) = &self.sandbox
+        {
+            let network = authorized.caps.contains(&Cap::ShellNetwork);
+            let shell = Shell::new(Arc::clone(sandbox), self.authority.clone(), self.operations.clone(), network);
+            config.tools.push(Rc::new(shell));
         }
 
         if authorized.origin == Origin::Chat {

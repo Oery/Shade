@@ -110,6 +110,7 @@ crates/
         state.rs            Infinity StateStore
         roots.rs            root registration and conversation names
         grants.rs           grants, per-turn budgets, atomic charging
+        operations.rs       tool operations and unanswered-call lookup
       thread_config.rs      per-thread tools (close_thread for compaction threads)
       policy.rs             capabilities, origins, ceilings, limit checks
       authority.rs          grant/budget admission for config, provider requests, tools
@@ -121,7 +122,7 @@ crates/
       condition.rs          pure typed comparisons and watch transitions
       watcher.rs            MCP subscriptions and reconnects
       memory.rs             bounded authorized memory index
-      recovery.rs           unresolved operation classification
+      recovery.rs           answers tool calls left waiting by a previous daemon
       tools/
         mod.rs
         shell.rs
@@ -131,6 +132,7 @@ crates/
         now.rs
       sandbox.rs            bubblewrap mounts, environment, bounded runs, startup probe
       sandbox/paths.rs      protected-path validation
+      sandbox/output.rs     bounded head/tail capture
       adapters/
         socket.rs           control socket server
         discord.rs
@@ -602,6 +604,10 @@ Each milestone is one reviewable PR. `Check` is a manual demonstration; `Tests` 
 - **Scope:** async shell tool, streaming bounded capture, deadlines, operation IDs, durable captured results, interruption classification, startup recovery, basic audit records, and shutdown cleanup. Startup recovery must answer every trailing unanswered call (see M3 finding).
 - **Check:** list workspace; report nonzero exit; timeout; kill the daemon mid-command and recover without a hung tool or automatic blind retry.
 - **Tests:** output retention stays bounded, UTF-8-safe truncation, process-tree cleanup on timeout/exit/death, result replay, and unknown-outcome recovery with stable call IDs.
+- **Done:** `shell` is an async tool offered with `shell` (the description says whether `shell_network` is held). `execute` returns at once and the command runs in a `spawn_local` task on the core thread. The task admits the call (grant and budget), validates `command` and `timeout_seconds` (30 s default, `[sandbox] max_timeout_seconds` cap, 300 by default), records a `tool_operations` row as `running`, runs the sandbox, stores the rendered result as `done`, then delivers it with the call ID as dedup ID. A repeated dispatch of a recorded call never runs again: it gets the captured result or the unknown-outcome text. Each stream keeps its first and last 16 KiB with an omitted-bytes marker; a character cut by the omission is dropped whole. Startup recovery (`recovery.rs`, before the router serves) scans open threads for calls in the trailing run of calls/results that have no result (Infinity ignores late results anywhere else; `close_thread` is skipped), and answers each with its captured result or the F12 unknown-outcome text, marking the row `unknown`. Recovery failure stops startup. Graceful shutdown drops the `LocalSet`, so `kill_on_drop` kills running commands and their rows recover as `unknown`. `tool_operations` doubles as the basic audit record; the arguments stay in history only. The client turn pump no longer ends at a completion that stops on an async tool call: it counts `ToolCall`/`ToolResult` events and waits for the completion that follows the result.
+- **Check (done):** against OpenCode Go with a scratch config: listing, `ls /nonexistent` (exit 2 and stderr), a 2 s timeout, and `kill -9` of `shaded` during `sleep 20`. After restart the call was answered with the unknown-outcome text, the model verified the workspace instead of rerunning, and the killed command never wrote its second line.
+- **Finding for M8:** recovery continues threads that no client is attached to, so the model's reply after a recovered result lands in history but is shown nowhere until the conversation is next used. Output pumps for every root belong to M8.
+- **Finding (from reading Infinity, not yet tested):** a recovered result is charged to the interrupted turn's budget. When that budget's `max_run_seconds` has passed (a restart after long downtime), the completion is refused and the result stays in memory only; once the thread idles, the next user message settles the call as interrupted, while `tool_operations` keeps the real result. Revisit with the M8 run lifecycle rather than resetting budgets.
 
 ### M8 — Daemon router and durable ingress
 

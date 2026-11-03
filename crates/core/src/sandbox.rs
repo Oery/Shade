@@ -12,6 +12,7 @@
 //! kernel tracks the parent per thread, so commands must be started from a
 //! thread that lives as long as the daemon, such as the core's.
 
+pub mod output;
 pub mod paths;
 #[cfg(test)]
 mod tests;
@@ -29,6 +30,7 @@ use tokio::process::{Child, Command};
 
 use crate::config::{Isolation, SandboxConfig};
 use crate::policy::{Cap, Policy};
+use crate::sandbox::output::{KEEP, Output};
 use crate::sandbox::paths::Protected;
 
 /// Where the workspace appears inside the sandbox.
@@ -36,9 +38,6 @@ pub const WORKSPACE: &str = "/workspace";
 
 /// Where the vault appears inside the sandbox.
 pub const VAULT: &str = "/vault";
-
-/// Bytes kept from each of stdout and stderr. The rest is read and dropped.
-const OUTPUT_LIMIT: usize = 16 * 1024;
 
 /// `PATH` inside the sandbox. The first entry is NixOS's system profile.
 const PATH: &str = "/run/current-system/sw/bin:/usr/local/bin:/usr/bin:/bin";
@@ -122,17 +121,18 @@ pub enum Exit {
     TimedOut,
 }
 
-/// A finished command and the start of its output.
+/// A finished command and the ends of its output.
 pub struct Finished {
     pub exit: Exit,
-    pub stdout: Vec<u8>,
-    pub stderr: Vec<u8>,
+    pub stdout: Output,
+    pub stderr: Output,
 }
 
 pub struct Sandbox {
     runner: Runner,
     workspace: PathBuf,
     vault: Option<PathBuf>,
+    max_timeout: Duration,
     /// Arguments shared by every bubblewrap command: namespaces, system mounts, environment.
     base: Vec<OsString>,
     /// Variables copied from the daemon's environment when the sandbox was built.
@@ -186,7 +186,14 @@ impl Sandbox {
         let env = copy_env(&config.env);
         let base = base_args(&env);
 
-        Ok(Self { runner, workspace, vault, base, env })
+        let max_timeout = Duration::from_secs(config.max_timeout_seconds);
+
+        Ok(Self { runner, workspace, vault, max_timeout, base, env })
+    }
+
+    /// The longest timeout a command may ask for.
+    pub fn max_timeout(&self) -> Duration {
+        self.max_timeout
     }
 
     /// Runs `script` with `sh -c`, killing every process it started once it
@@ -197,8 +204,8 @@ impl Sandbox {
             Err(source) => return Err(SandboxError::Spawn(source)),
         };
 
-        let mut stdout = Vec::new();
-        let mut stderr = Vec::new();
+        let mut stdout = Output::new(KEEP);
+        let mut stderr = Output::new(KEEP);
         let streams = (child.stdout.take(), child.stderr.take());
 
         let finished = tokio::time::timeout(timeout, async {
@@ -346,7 +353,7 @@ fn find_bubblewrap() -> Result<PathBuf, SandboxError> {
     }
 }
 
-fn find_on_path(name: &str) -> Option<PathBuf> {
+pub fn find_on_path(name: &str) -> Option<PathBuf> {
     let path = std::env::var_os("PATH")?;
 
     for dir in std::env::split_paths(&path) {
@@ -360,9 +367,8 @@ fn find_on_path(name: &str) -> Option<PathBuf> {
     None
 }
 
-/// Reads `stream` to the end, keeping its first [`OUTPUT_LIMIT`] bytes.
-/// Draining the rest keeps a chatty command from blocking on a full pipe.
-async fn retain<R: AsyncRead + Unpin>(stream: Option<R>, kept: &mut Vec<u8>) {
+/// Reads `stream` to the end into a bounded capture.
+async fn retain<R: AsyncRead + Unpin>(stream: Option<R>, kept: &mut Output) {
     let Some(mut stream) = stream else {
         return;
     };
@@ -375,8 +381,7 @@ async fn retain<R: AsyncRead + Unpin>(stream: Option<R>, kept: &mut Vec<u8>) {
             Ok(read) => read,
         };
 
-        let room = OUTPUT_LIMIT.saturating_sub(kept.len());
-        kept.extend_from_slice(&chunk[..read.min(room)]);
+        kept.push(&chunk[..read]);
     }
 }
 
@@ -397,9 +402,7 @@ fn exit_of(status: ExitStatus) -> Exit {
 }
 
 fn probe_failure(finished: &Finished) -> String {
-    let stderr = String::from_utf8_lossy(&finished.stderr);
-    let stdout = String::from_utf8_lossy(&finished.stdout);
-    let output = format!("{}{}", stderr.trim(), stdout.trim());
+    let output = format!("{}{}", finished.stderr.text().trim(), finished.stdout.text().trim());
 
     if output.is_empty() {
         format!("a test command ended with {:?} without writing the workspace", finished.exit)

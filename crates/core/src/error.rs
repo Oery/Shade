@@ -62,6 +62,9 @@ pub enum Error {
     #[error(transparent)]
     Sandbox(#[from] SandboxError),
 
+    #[error("cannot recover interrupted tool calls: {0}")]
+    Recovery(BoxError),
+
     #[error("cannot start the async runtime: {0}")]
     Runtime(std::io::Error),
 

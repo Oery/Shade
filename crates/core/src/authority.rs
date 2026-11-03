@@ -41,6 +41,7 @@ pub enum Denied {
 }
 
 /// A thread's authority under the current policy.
+#[derive(Debug)]
 pub struct Authorized {
     pub origin: Origin,
     pub caps: Caps,
@@ -74,13 +75,17 @@ impl Authority {
         Ok(Authorized { origin: grant.origin, caps })
     }
 
-    /// Admits one call of a tool that needs `cap`.
-    pub async fn admit_tool(&self, thread: &ThreadId<str>, cap: Cap) -> Result<(), Denied> {
-        if !self.authorize(thread).await?.caps.contains(&cap) {
+    /// Admits one call of a tool that needs `cap`, returning the caller's authority.
+    pub async fn admit_tool(&self, thread: &ThreadId<str>, cap: Cap) -> Result<Authorized, Denied> {
+        let authorized = self.authorize(thread).await?;
+
+        if !authorized.caps.contains(&cap) {
             return Err(Denied::NotGranted(cap.name()));
         }
 
-        self.charge(thread, Charge::ToolCall).await
+        self.charge(thread, Charge::ToolCall).await?;
+
+        Ok(authorized)
     }
 
     /// Admits one request to the model provider.
