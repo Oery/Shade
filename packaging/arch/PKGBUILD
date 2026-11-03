@@ -3,7 +3,7 @@
 #   cd packaging/arch && makepkg -si
 
 pkgname=shade
-pkgver=r0.0000000
+pkgver=r44.688da39
 pkgrel=1
 pkgdesc='Personal agent daemon (shaded) and its client (shade)'
 arch=('x86_64')
@@ -12,9 +12,10 @@ license=('LicenseRef-unspecified')
 depends=('gcc-libs' 'glibc')
 makedepends=('cargo' 'git')
 checkdepends=('bubblewrap')
-optdepends=('bubblewrap: the sandboxed shell tool'
-            'tailscale: webhooks from your other devices')
+optdepends=('bubblewrap: the sandboxed shell tool')
 install=shade.install
+# makepkg's LTO turns the bundled C (SQLite, ring) into bitcode rustc cannot link.
+options=('!lto')
 source=("$pkgname::git+file://$(realpath "$startdir/../..")")
 sha256sums=('SKIP')
 
