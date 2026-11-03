@@ -3,6 +3,7 @@
 //! SQL lives only here. This is the one crate that depends on `rusqlite`, and
 //! [`db::Db`] runs queries only for the stores in it.
 
+pub mod backup;
 pub mod conversation;
 pub mod db;
 pub mod grants;

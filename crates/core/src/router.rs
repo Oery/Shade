@@ -12,6 +12,7 @@ pub mod turn;
 #[cfg(test)]
 mod tests;
 
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -75,6 +76,8 @@ pub enum Inbound {
     Schedule { action: Manage, reply: mpsc::Sender<Response> },
     /// A background run may start now: a webhook event was just accepted.
     StartBackground,
+    /// A copy of the database to a new file.
+    Backup { path: PathBuf, reply: mpsc::Sender<Response> },
 }
 
 /// Where a turn's output goes. The turn runs to its end either way.
@@ -184,6 +187,7 @@ impl Router {
             Inbound::Usage { reply } => self.usage(reply).await,
             Inbound::Schedule { action, reply } => self.manage(action, reply).await,
             Inbound::StartBackground => self.start_background(Utc::now()).await,
+            Inbound::Backup { path, reply } => self.backup(path, reply).await,
         }
     }
 
@@ -307,6 +311,27 @@ impl Router {
             Ok(Some(handle)) => Ok(handle),
             Ok(None) => Err(format!("conversation {root} is missing")),
             Err(error) => Err(format!("cannot attach to conversation {root}: {error}")),
+        }
+    }
+
+    /// Copies the database while the daemon keeps serving.
+    async fn backup(&self, path: PathBuf, reply: mpsc::Sender<Response>) {
+        let bytes = match self.db.backup(path.to_owned()).await {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                let _ = reply.send(Response::Error { message: format!("cannot back up: {error}") }).await;
+                return;
+            }
+        };
+
+        let text = format!(
+            "Backed up the database to {} ({} KiB). It does not include the config, its .env, job files, or the vault.",
+            path.display(),
+            bytes.div_ceil(1024)
+        );
+
+        if reply.send(Response::Text { text }).await.is_ok() {
+            let _ = reply.send(Response::Done).await;
         }
     }
 

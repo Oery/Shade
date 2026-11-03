@@ -8,6 +8,7 @@ use std::fs::OpenOptions;
 use std::io;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
@@ -78,6 +79,8 @@ pub enum OpenError {
 #[derive(Clone)]
 pub struct Db {
     jobs: mpsc::Sender<Job>,
+    /// The database file, for backups. `None` in memory.
+    path: Option<Arc<Path>>,
 }
 
 impl Db {
@@ -96,7 +99,7 @@ impl Db {
             Err(source) => return Err(OpenError::Sqlite(source)),
         };
 
-        Self::start(connection)
+        Self::start(connection, Some(Arc::from(path)))
     }
 
     #[cfg(any(test, feature = "testing"))]
@@ -106,10 +109,10 @@ impl Db {
             Err(source) => return Err(OpenError::Sqlite(source)),
         };
 
-        Self::start(connection)
+        Self::start(connection, None)
     }
 
-    fn start(mut connection: Connection) -> Result<Self, OpenError> {
+    fn start(mut connection: Connection, path: Option<Arc<Path>>) -> Result<Self, OpenError> {
         configure(&connection)?;
         migrate(&mut connection)?;
 
@@ -120,7 +123,11 @@ impl Db {
             return Err(OpenError::Worker(source));
         }
 
-        Ok(Self { jobs })
+        Ok(Self { jobs, path })
+    }
+
+    pub(crate) fn path(&self) -> Option<PathBuf> {
+        self.path.as_deref().map(Path::to_path_buf)
     }
 
     /// Waits until every job queued before this call has finished. Jobs run in

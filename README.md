@@ -1,0 +1,126 @@
+# Shade
+
+A personal agent that runs on your own machine. You talk to it in the terminal or on Discord; it can also run scheduled jobs and react to webhooks. What it may do is decided by a config file you write, not by the model: each conversation, job and webhook gets only the capabilities you grant it.
+
+- One daemon (`shaded`) and a thin client (`shade`), in Rust, on [Infinity](https://infinity.hydro.run/docs/infinity-runtime/overview/).
+- State in one SQLite database: conversations, jobs, runs, and every tool call's outcome. Work accepted before a crash is finished or reported after it, never silently dropped or repeated.
+- Tools: the time, notifications, a sandboxed shell (bubblewrap), scheduled jobs, and any MCP server you configure (each server is a capability).
+- Memory: a small index of facts the model keeps in your Obsidian vault, shown only where the vault is granted.
+
+[PLAN.md](PLAN.md) holds the design and every milestone's decisions; [AGENTS.md](AGENTS.md) the coding rules.
+
+## Install
+
+Linux only. Needs the Rust toolchain from `rust-toolchain.toml`, and `bwrap` (bubblewrap) if anything is granted `shell`.
+
+```sh
+cargo install --locked --path crates/daemon   # shaded
+cargo install --locked --path crates/cli      # shade
+```
+
+Both land in `~/.cargo/bin`, which the systemd unit below expects.
+
+## Configure
+
+```sh
+mkdir -p ~/.config/shade
+cp config.example.toml ~/.config/shade/config.toml
+touch ~/.config/shade/.env && chmod 600 ~/.config/shade/.env
+```
+
+`config.example.toml` documents every section. Secrets never go in the config: it names environment variables (`api_key_env`, `token_env`, an MCP server's `env`), read from the environment or the `.env` next to the config, which must be `chmod 600`. A minimal setup is `[model]` plus `[chat] caps = ["now"]`; add capabilities one at a time:
+
+| Section | Gives |
+| --- | --- |
+| `[chat]` | What owner chat may use: `now`, `notify`, `shell`, `shell_network`, `schedules`, and MCP server names. |
+| `[discord]` | Owner chat on Discord (DMs and mentions), notifications, approval buttons. |
+| `[sandbox]` | Where `shell` runs. Required when anything holds `shell`. |
+| `[mcp.<name>]` | An MCP server over stdio; its name becomes a capability. |
+| `[memory]` | Memories in the vault of one MCP server. |
+| `jobs/*.toml` | Long-lived scheduled jobs, next to the config. Owner chat can draft them; you approve each change. |
+| `[hooks.<name>]`, `[http]` | Webhooks, for this machine and your tailnet. |
+| `[limits]` | Bounds on every turn and run, and on background work. |
+
+The config is read once: restart `shaded` to apply a change.
+
+## Run
+
+```sh
+shaded &                  # or the systemd service below
+shade chat                # terminal chat; `shade chat --thread work` for another conversation
+shade ask "what time is it?"
+shade schedule list       # jobs; also pause, resume, rm, approve, reject
+shade usage               # tokens per conversation
+```
+
+### As a systemd user service
+
+```sh
+mkdir -p ~/.config/systemd/user
+cp deploy/shaded.service ~/.config/systemd/user/
+systemctl --user daemon-reload
+systemctl --user enable --now shaded
+loginctl enable-linger "$USER"     # start at boot, without logging in
+journalctl --user -u shaded -f     # logs
+```
+
+The service restarts on failure. On stop it gets 30 seconds to finish gracefully, then anything left (MCP servers, sandboxed commands) is killed; work it was doing is recovered at the next start.
+
+### Webhooks over Tailscale
+
+Webhooks are served on loopback or a Tailscale address only. Keep the default `127.0.0.1:8787` and put Tailscale in front:
+
+```sh
+tailscale serve --bg --https=443 http://127.0.0.1:8787
+```
+
+Then `POST https://<machine>.<tailnet>.ts.net/hook/<name>` with `Authorization: Bearer <token>`. Generate tokens with `openssl rand -hex 32`.
+
+## Back up and restore
+
+A backup is a consistent copy of the database, taken while the daemon keeps serving:
+
+```sh
+shade backup ~/shade-backup.db      # refuses an existing file; creates it 0600
+```
+
+Daily backups, kept 14 days in `~/.local/state/shade/backups`:
+
+```sh
+cp deploy/shade-backup.service deploy/shade-backup.timer ~/.config/systemd/user/
+systemctl --user daemon-reload
+systemctl --user enable --now shade-backup.timer
+```
+
+A backup holds the database only: conversations, jobs (including job files' state), runs, tool outcomes, and usage. Back up the rest yourself: `~/.config/shade` (the config, its `.env`, and `jobs/`), the sandbox workspace, and your vault.
+
+To restore:
+
+```sh
+systemctl --user stop shaded
+cd ~/.local/share/shade
+mkdir -m 700 replaced && mv shade.db shade.db-wal shade.db-shm replaced/ 2>/dev/null
+cp ~/.local/state/shade/backups/shade-<date>.db shade.db && chmod 600 shade.db
+systemctl --user start shaded
+```
+
+At start, Shade finishes or reports whatever the backup had in flight: unanswered inputs are sent again, tool calls whose result was not recorded are reported as unknown, and runs that cannot resume are marked interrupted.
+
+To rehearse a restore without touching anything real, open the backup in an isolated data directory with a config that cannot reach any service: `[model] base_url` pointing at a closed local port, no `[discord]`, `[mcp]` or `[hooks]`, and `[limits] max_concurrent_background_runs = 0`.
+
+```sh
+mkdir -p /tmp/restore/shade && cp <backup> /tmp/restore/shade/shade.db
+XDG_DATA_HOME=/tmp/restore shaded --config /tmp/rehearsal/config.toml &
+XDG_DATA_HOME=/tmp/restore shade schedule list
+XDG_DATA_HOME=/tmp/restore shade usage
+```
+
+## Operating limits
+
+- **One owner.** The control socket trusts the local user who runs `shaded`; Discord answers only the configured owners. There are no other users.
+- **No exactly-once side effects.** A tool call interrupted before its result was recorded is reported as possibly done, never retried blindly. Notifications and MCP writes can therefore be missed or, if the model retries after checking, done once more.
+- **Grants limit, they do not judge.** A conversation, job or webhook can only use what it was granted, but whatever writes to it (a webhook sender, a web page the shell fetches, a note in the vault) can steer what it does within those caps. Grant narrowly.
+- **The sandbox isolates, it does not meter.** Shell commands see only the workspace and get no network without `shell_network`; time and output are bounded, CPU, memory and disk are not.
+- **Config changes need a restart.** Nothing is reloaded live; a capability removed from the config disappears from existing conversations at the next start.
+- **Memory is small on purpose.** The index the model sees is at most 4 KiB.
+- **Backups exclude secrets and files.** See above.
