@@ -1,18 +1,22 @@
 //! Shade runtime. The `shaded` binary is a thin wrapper around [`run`].
 
 mod adapters;
+mod authority;
 mod config;
 mod error;
 mod lock;
 mod model;
+mod policy;
 mod router;
 mod secrets;
 mod store;
 #[cfg(test)]
 mod testing;
 mod thread_config;
+mod tools;
 
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use tokio::signal::unix::{SignalKind, signal};
 use tokio::sync::mpsc;
@@ -21,6 +25,7 @@ use tokio::task::LocalSet;
 pub use error::Error;
 
 use crate::adapters::socket::ControlSocket;
+use crate::config::Config;
 use crate::model::Model;
 use crate::router::Router;
 use crate::secrets::Secrets;
@@ -42,7 +47,8 @@ pub fn run(config: Option<PathBuf>) -> Result<(), Error> {
 
 async fn serve(config_path: Option<PathBuf>) -> Result<(), Error> {
     let config_path = config::path(config_path)?;
-    let config = config::load(&config_path)?;
+    let Config { model, timezone, chat, hooks, limits } = config::load(&config_path)?;
+    let policy = config::policy(&config_path, chat, hooks, limits, timezone)?;
     let mut secrets = Secrets::load(secrets::path_for(&config_path))?;
 
     let Some(data_dir) = shade_proto::data_dir() else {
@@ -53,14 +59,14 @@ async fn serve(config_path: Option<PathBuf>) -> Result<(), Error> {
 
     // Declared before the socket so the socket file is removed while the lock is still held.
     let _lock = lock::acquire(&data_dir)?;
-    let model = Model::new(config.model, &mut secrets)?;
+    let model = Model::new(model, &mut secrets)?;
     let db = Db::open(&data_dir.join(db::DB_FILE))?;
 
     let (commands, command_queue) = mpsc::channel(COMMAND_QUEUE);
     let socket = ControlSocket::bind(shade_proto::socket_path(&data_dir), commands)?;
     tracing::info!(path = %socket.path().display(), model = %model.id(), "listening");
 
-    let router = Router::start(model, db);
+    let router = Router::start(model, db, Arc::new(policy));
 
     let result = tokio::select! {
         () = socket.serve() => Ok(()),

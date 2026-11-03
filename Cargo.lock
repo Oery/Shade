@@ -1928,6 +1928,8 @@ name = "shade-core"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "chrono",
+ "chrono-tz",
  "dotenvy",
  "http",
  "infinity-agent-core",

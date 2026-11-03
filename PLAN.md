@@ -109,8 +109,10 @@ crates/
         conversation.rs     Infinity ConversationStore
         state.rs            Infinity StateStore
         roots.rs            root registration and conversation names
+        grants.rs           grants, per-turn budgets, atomic charging
       thread_config.rs      per-thread tools (close_thread for compaction threads)
-      grants.rs             origins, capabilities, delegation, root ownership
+      policy.rs             capabilities, origins, ceilings, limit checks
+      authority.rs          grant/budget admission for config, provider requests, tools
       model.rs              provider and completion-budget enforcement
       router.rs             routing, registration, output pumps, shutdown
       delivery.rs           persisted ingress/results and replay
@@ -225,7 +227,7 @@ Rules:
 
 1. **Delegation attenuates.** A schedule/watch's requested caps must be a subset of the creator's effective caps. Reject extra caps and identify them in the tool result.
 2. **Management is chat-only.** `schedules` and `watches` cannot be delegated. Config validation rejects these caps on hooks, and management tools verify the root origin as well as the capability. A chat descendant shares its root's authority and limits.
-3. **Stored grants remain capped.** Chat and hook grants are intersected with their configured origin ceiling. Job grants are intersected with current chat caps minus management caps. Unknown or removed stored capabilities are dropped and logged. A changed MCP registration is a changed trust decision and requires owner review.
+3. **Stored grants remain capped.** Chat and hook grants store no capability list: they follow their origin's current ceiling, so a long-lived conversation gains or loses caps when `[chat]` changes. Job grants are intersected with current chat caps minus management caps. Unknown or removed stored capabilities are dropped and logged. A changed MCP registration is a changed trust decision and requires owner review.
 4. **Fail closed.** An unknown thread, missing grant, missing origin, deleted hook configuration, or broken ancestry receives no model execution or Shade tool dispatch until resolved. Log the error. Do not rely on residual built-in tools as a safe fallback.
 5. **Permission ancestry is structural.** Follow persisted parent relationships to the actual root. Fresh-context boundaries limit inherited conversation history, not grant ownership. Detect missing parents and cycles. Reuse `get_ancestor_chain` only if M1 proves it preserves the required structural lineage; otherwise walk `get_thread_parent_info`.
 6. **Tool execution checks authority.** Hiding a tool from the model is useful, but dispatch also validates the caller's root grant, origin, and remaining limits. Every bridge tool is bound to its MCP server capability.
@@ -253,7 +255,7 @@ max_concurrent_background_runs = 4
 max_notifications = 10
 ```
 
-These are example defaults, to be tuned during implementation. Limits cap accepted work; they are not a guarantee of an exact currency amount. Token usage is recorded when available; a token/spend budget can be added later without replacing these basic bounds.
+These are example defaults, to be tuned during implementation. Each limit is added with the feature it bounds: M5 enforces rounds, tool calls, and run time; `max_children` waits for model-controlled spawning, `max_concurrent_background_runs` for M8, and `max_notifications` for M10. A completion round is one provider request, retries included. Limits cap accepted work; they are not a guarantee of an exact currency amount. Token usage is recorded when available; a token/spend budget can be added later without replacing these basic bounds.
 
 For background work, the root run is one trigger occurrence. For chat, the budget covers a user turn and its descendant work, not the entire weeks-long conversation. Persist the budget scope ID and counters so restart or spawning cannot reset them. A new chat input cannot silently reset limits for still-running descendants from an earlier turn.
 
@@ -581,6 +583,8 @@ Each milestone is one reviewable PR. `Check` is a manual demonstration; `Tests` 
 - **Scope:** typed origins, grant storage, current-policy ceilings, management restrictions, dispatch checks, safe root registration, `now`, completion/tool/deadline counters, background capacity, and selected built-in policy.
 - **Check:** omitted tool is unavailable and rejected if dispatched directly; invalid hook management caps fail startup; a looping toy run reaches a visible limit.
 - **Tests:** missing grants fail closed; Fresh children retain structural root ownership; delegation cannot amplify; hooks cannot receive management authority; removed caps disappear after policy restart; child work shares limits; restart does not reset counters; new chat input does not reset old descendant budgets.
+- **Done:** `policy.rs` holds typed caps and origins, config validation (`shell_network` needs `shell`; hooks cannot hold `schedules`/`watches`), ceilings, and limit checks. Grants live in `grants(root_id, origin, source, caps)`, written with the root; existing roots were migrated to terminal chat grants. A thread's authority is its `threads.root_id` grant, so Fresh children keep it. Budgets are rows per chat turn or run; `threads.budget_id` is set per turn on the root and copied to children at spawn, so a new turn never resets older work. `authority.rs` admits at three points: thread configuration (tools and prompt; missing grant fails closed), every provider request (a `ModelSource` wrapper; a refusal is `Fatal`), and every Shade tool call. Charging is one SQLite transaction; the first refusal is recorded in `budgets.exceeded` and stops everything after it. `now` is the first tool (`timezone` in config, UTC by default). Restart cannot reset counters because they exist only in SQLite, so there is no separate test. Delegation has no tool yet; its ceiling (current chat caps minus management) is tested through `Policy::effective`.
+- **Finding for M7:** a limit refusal after a synchronous tool keeps history consistent (the result is synced with the call). An async result arrives as a later input, and a refused step leaves it unpersisted. The M7 shell must persist its captured result itself (F4) and redeliver it, or the call stays unanswered.
 
 ### M6 — Sandbox foundation
 

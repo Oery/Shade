@@ -130,8 +130,16 @@ completion with a tool call is not a finished user turn.
 
 Provider errors: throttled and transient errors retry up to 10 times (30 s / 5 s
 backoff); fatal errors (e.g. 401) end the step with an `Info` error and a
-`CompletionFinished`. These retries are not counted against Shade limits; M5
-must count completion rounds at `CompletionStarted`.
+`CompletionFinished`.
+
+**Correction (M5):** `CompletionStarted` and `ModelSource::resolve` happen once
+per step, but the provider is called again inside the step after a synchronous
+tool result or an unknown-tool error ([event_processor.rs:1518][core-loop]).
+Counting rounds there would let a model loop on a missing tool without bound.
+Shade counts every `ModelProvider::invoke_model` call instead, retries
+included, and refuses with `ErrorClass::Fatal` so Infinity does not retry.
+
+[core-loop]: https://github.com/hydro-project/infinity/blob/97c2f06ea4715bd62577a0f25182aab88a54e76b/crates/infinity-agent-core/src/event_processor.rs#L1518
 
 `Info("Error: …")` before `CompletionStarted` means no completion will run for
 that input. The `ask` pump in `router.rs` relies on this.

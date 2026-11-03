@@ -30,6 +30,9 @@ pub enum Error {
     #[error("invalid config {path}: {source}")]
     ConfigParse { path: PathBuf, source: toml::de::Error },
 
+    #[error("invalid config {path}: {message}")]
+    ConfigInvalid { path: PathBuf, message: String },
+
     #[error("cannot read secrets {path}: {source}")]
     SecretsRead { path: PathBuf, source: BoxError },
 

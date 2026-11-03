@@ -1,14 +1,19 @@
 //! Owns the Infinity system: registers roots, routes inputs, pumps output.
 
+use std::sync::Arc;
+
 use infinity_agent_core::message::InputMessage;
 use infinity_agent_core::system::local::{LaunchingSystem, ThreadHandle};
 use infinity_agent_core::system::{AgentEvent, AgentSystemBuilder, NoRapHttp};
 use shade_proto::Response;
 use tokio::sync::mpsc;
 
+use crate::authority::{Authority, Metered};
 use crate::model::Model;
+use crate::policy::Policy;
 use crate::store::conversation::Conversations;
 use crate::store::db::Db;
+use crate::store::grants::Grants;
 use crate::store::roots::{Adapter, Roots};
 use crate::store::state::States;
 use crate::thread_config::ThreadTools;
@@ -39,9 +44,11 @@ pub struct Router {
 
 impl Router {
     /// Built-in tools stay off: spawning has no limit hook (see docs/infinity-notes.md).
-    pub fn start(model: Model, db: Db) -> Self {
+    pub fn start(model: Model, db: Db, policy: Arc<Policy>) -> Self {
+        let authority = Authority::new(Grants::new(db.clone()), policy);
         let conversations = Conversations::new(db.clone());
-        let tools = ThreadTools::new(conversations.clone());
+        let tools = ThreadTools::new(conversations.clone(), authority.clone());
+        let model = Metered::new(model, authority);
         let builder = AgentSystemBuilder::new_local(conversations, States::new(db.clone()), model);
         let system = builder.without_builtin_tools().thread_config(tools).start();
 
@@ -87,8 +94,8 @@ impl Router {
     /// Registers the root before attaching, so configuration never resolves for an unregistered thread.
     async fn attach(&self, target: Target) -> Result<ThreadHandle, String> {
         let root = match target {
-            Target::Fresh => self.roots.fresh().await,
-            Target::Terminal(key) => self.roots.current(Adapter::Terminal, key).await,
+            Target::Fresh => self.roots.fresh(Adapter::Terminal).await,
+            Target::Terminal(key) => self.roots.turn(Adapter::Terminal, key).await,
         };
 
         let root = match root {

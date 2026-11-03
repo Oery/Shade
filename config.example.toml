@@ -1,5 +1,8 @@
 # Copy to ~/.config/shade/config.toml (or pass `shaded --config PATH`).
 
+# IANA time zone used by the `now` tool. UTC when absent.
+timezone = "Europe/Paris"
+
 [model]
 provider = "anthropic"
 id = "claude-opus-5-5"
@@ -23,3 +26,20 @@ max_output_tokens = 128000
 # api_key_env = "OPENCODE_API_KEY"
 # context_window = 1048576
 # max_output_tokens = 131072
+
+# Owner chat (terminal and Discord). Without this section chat has no tools.
+# Known caps: now, notify, shell, shell_network, schedules, watches.
+[chat]
+caps = ["now"]
+# prompt = "You are chatting with your owner."
+
+# Webhook sources. Hooks can never hold `schedules` or `watches`.
+# [hooks.github]
+# caps = ["now", "notify"]
+
+# Shared bounds on one chat turn or background run, children included.
+# These are the defaults.
+[limits]
+max_completion_rounds = 40
+max_tool_calls = 100
+max_run_seconds = 900

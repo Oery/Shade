@@ -1,11 +1,12 @@
 //! Per-thread configuration resolved by Infinity on each thread load.
 //!
+//! The root's grant decides which tools a thread gets. Resolution fails for
+//! threads without one (unregistered, ungranted, or whose hook was removed),
+//! so Infinity's habit of loading any ID it is sent cannot reach the model.
+//!
 //! Built-in tools are off (spawning has no limit hook), but Infinity's
 //! auto-compaction child must call `close_thread` to hand back its summary.
 //! Compaction threads therefore get that one tool and nothing else.
-//!
-//! Resolution fails for threads Shade never registered, so Infinity's habit of
-//! loading any ID it is sent cannot reach the model.
 
 use std::rc::Rc;
 
@@ -16,31 +17,44 @@ use infinity_agent_core::system::{NoRapHttp, ThreadConfig, ThreadConfigSource};
 use infinity_agent_core::tools::thread::CloseThreadTool;
 use infinity_agent_core::traits::ConversationStore;
 
+use crate::authority::Authority;
 use crate::error::BoxError;
+use crate::policy::{Cap, Origin};
 use crate::store::conversation::Conversations;
+use crate::tools::now::Now;
 
 pub struct ThreadTools {
     conversations: Conversations,
+    authority: Authority,
 }
 
 impl ThreadTools {
-    pub fn new(conversations: Conversations) -> Self {
-        Self { conversations }
+    pub fn new(conversations: Conversations, authority: Authority) -> Self {
+        Self { conversations, authority }
     }
 }
 
 #[async_trait(?Send)]
 impl ThreadConfigSource<ChannelSender, NoRapHttp> for ThreadTools {
     async fn resolve(&self, thread_id: &ThreadId<str>) -> Result<ThreadConfig<ChannelSender, NoRapHttp>, BoxError> {
-        if !self.conversations.thread_exists(thread_id).await? {
-            return Err(format!("thread {thread_id} is not registered").into());
-        }
-
+        let authorized = self.authority.authorize(thread_id).await?;
         let mut config = ThreadConfig { tools: Vec::new(), extra_system_prompt: None, rap_notifier: None };
 
         if self.conversations.is_compaction_thread(thread_id).await? {
             let close = CloseThreadTool::<_, NoRapHttp> { conversation_store: self.conversations.clone(), rap_notifier: None };
             config.tools.push(Rc::new(close));
+
+            return Ok(config);
+        }
+
+        let policy = self.authority.policy();
+
+        if authorized.caps.contains(&Cap::Now) {
+            config.tools.push(Rc::new(Now::new(self.authority.clone(), policy.timezone)));
+        }
+
+        if authorized.origin == Origin::Chat {
+            config.extra_system_prompt = policy.chat_prompt.clone();
         }
 
         Ok(config)

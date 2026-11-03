@@ -18,7 +18,7 @@ use rap_protocol::ToolCallId;
 use rusqlite::{Connection, OptionalExtension, Statement, params};
 
 #[cfg(test)]
-use super::roots::insert_root;
+use super::roots::{Adapter, register};
 use crate::store::db::{Db, DbError};
 
 #[derive(Clone)]
@@ -39,12 +39,22 @@ impl Conversations {
         Self { db }
     }
 
-    /// Creates a root with a chosen ID, for tests. Entry points use [`Roots`](super::roots::Roots).
+    /// Registers a terminal chat root with a chosen ID and starts its first
+    /// turn, for tests. Entry points use [`Roots`](super::roots::Roots).
     #[cfg(test)]
     pub async fn register_root(&self, thread_id: &ThreadId<str>) -> Result<(), DbError> {
         let id = thread_id.as_str().to_owned();
 
-        self.db.call(move |connection| insert_root(connection, &id)).await
+        self.db
+            .call(move |connection| {
+                let transaction = connection.transaction()?;
+                register(&transaction, &id, Adapter::Terminal)?;
+                super::grants::start_budget(&transaction, &id)?;
+                transaction.commit()?;
+
+                Ok(())
+            })
+            .await
     }
 
     /// Reads one boolean column of a thread. Unknown threads read as `false`, as in the reference store.
@@ -125,7 +135,7 @@ impl ConversationStore for Conversations {
         self.db.call(move |connection| append(connection, &id, &rows)).await
     }
 
-    /// The parent must exist; the child joins its root.
+    /// The parent must exist; the child joins its root and its current budget.
     async fn spawn_thread(
         &self, parent_thread_id: &ThreadId<str>, spawn_tool_call_id: &ToolCallId<str>, is_for_subscription_event: bool,
         context: SpawnContext,
@@ -143,8 +153,8 @@ impl ConversationStore for Conversations {
             .db
             .call(move |connection| {
                 let inserted = connection.execute(
-                    "INSERT INTO threads (id, parent_id, root_id, spawn_order, spawn_tool_call_id, subscription_event, fresh_context)
-                     SELECT ?1, id, root_id, ?3, ?4, ?5, ?6 FROM threads WHERE id = ?2",
+                    "INSERT INTO threads (id, parent_id, root_id, budget_id, spawn_order, spawn_tool_call_id, subscription_event, fresh_context)
+                     SELECT ?1, id, root_id, budget_id, ?3, ?4, ?5, ?6 FROM threads WHERE id = ?2",
                     params![&id, &parent, order, &tool_call, is_for_subscription_event, fresh],
                 )?;
 

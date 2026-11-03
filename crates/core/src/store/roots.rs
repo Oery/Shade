@@ -1,12 +1,15 @@
 //! Root registration: the only way conversations come into existence.
 //!
-//! Every entry point creates roots here, before Infinity attaches, so thread
-//! configuration never resolves for a thread Shade did not register.
+//! Every entry point creates roots here, together with their grant, before
+//! Infinity attaches, so thread configuration never resolves for a thread
+//! Shade did not register.
 
 use infinity_agent_core::ThreadId;
 use rusqlite::{Connection, OptionalExtension, params};
 
+use crate::policy::{Grant, Origin};
 use crate::store::db::{Db, DbError};
+use crate::store::grants::{insert_grant, start_budget};
 
 /// Where a named conversation lives. Names are scoped per adapter.
 #[derive(Clone, Copy)]
@@ -33,20 +36,24 @@ impl Roots {
     }
 
     /// A root for a one-shot run, reachable by no conversation name.
-    pub async fn fresh(&self) -> Result<ThreadId, DbError> {
+    pub async fn fresh(&self, adapter: Adapter) -> Result<ThreadId, DbError> {
         let id = new_id();
 
         self.db
             .call(move |connection| {
-                insert_root(connection, &id)?;
+                let transaction = connection.transaction()?;
+                register(&transaction, &id, adapter)?;
+                start_budget(&transaction, &id)?;
+                transaction.commit()?;
 
                 Ok(ThreadId::from(id))
             })
             .await
     }
 
-    /// The root `key` names, created on first use.
-    pub async fn current(&self, adapter: Adapter, key: String) -> Result<ThreadId, DbError> {
+    /// Starts a turn in the conversation `key` names, creating it on first use.
+    /// Each turn gets its own budget.
+    pub async fn turn(&self, adapter: Adapter, key: String) -> Result<ThreadId, DbError> {
         self.db
             .call(move |connection| {
                 let transaction = connection.transaction()?;
@@ -58,6 +65,7 @@ impl Roots {
                     None => point(&transaction, adapter, &key)?,
                 };
 
+                start_budget(&transaction, &id)?;
                 transaction.commit()?;
 
                 Ok(ThreadId::from(id))
@@ -79,16 +87,19 @@ impl Roots {
     }
 }
 
-pub fn insert_root(connection: &Connection, id: &str) -> Result<(), DbError> {
+/// Creates a chat root and its grant. Chat grants follow the current `[chat]` policy.
+pub fn register(connection: &Connection, id: &str, adapter: Adapter) -> Result<(), DbError> {
     connection.execute("INSERT INTO threads (id, root_id) VALUES (?1, ?1)", [id])?;
 
-    Ok(())
+    let grant = Grant { origin: Origin::Chat, source: adapter.name().to_owned(), caps: None };
+
+    insert_grant(connection, id, &grant)
 }
 
 /// Creates a root and points `key` at it.
 fn point(connection: &Connection, adapter: Adapter, key: &str) -> Result<String, DbError> {
     let id = new_id();
-    insert_root(connection, &id)?;
+    register(connection, &id, adapter)?;
 
     let sql = "INSERT INTO conversations (adapter, key, root_id) VALUES (?1, ?2, ?3)
                ON CONFLICT (adapter, key) DO UPDATE SET root_id = excluded.root_id";
@@ -118,8 +129,8 @@ mod tests {
         let roots = Roots::new(db.clone());
 
         let (first, second) = tokio::join!(
-            roots.current(Adapter::Terminal, "default".to_owned()),
-            roots.current(Adapter::Terminal, "default".to_owned())
+            roots.turn(Adapter::Terminal, "default".to_owned()),
+            roots.turn(Adapter::Terminal, "default".to_owned())
         );
 
         assert_eq!(first?, second?);
@@ -134,13 +145,13 @@ mod tests {
         let db = Db::in_memory()?;
         let roots = Roots::new(db.clone());
 
-        let old = roots.current(Adapter::Terminal, "default".to_owned()).await?;
-        let other = roots.current(Adapter::Terminal, "work".to_owned()).await?;
+        let old = roots.turn(Adapter::Terminal, "default".to_owned()).await?;
+        let other = roots.turn(Adapter::Terminal, "work".to_owned()).await?;
         let new = roots.replace(Adapter::Terminal, "default".to_owned()).await?;
 
         assert_ne!(old, new);
-        assert_eq!(roots.current(Adapter::Terminal, "default".to_owned()).await?, new);
-        assert_eq!(roots.current(Adapter::Terminal, "work".to_owned()).await?, other);
+        assert_eq!(roots.turn(Adapter::Terminal, "default".to_owned()).await?, new);
+        assert_eq!(roots.turn(Adapter::Terminal, "work".to_owned()).await?, other);
         assert_eq!(count(&db, "SELECT COUNT(*) FROM threads").await?, 3);
 
         Ok(())
