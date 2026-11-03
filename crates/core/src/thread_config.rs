@@ -29,6 +29,11 @@ use crate::tools::notify::Notify;
 use crate::tools::now::Now;
 use crate::tools::shell::Shell;
 
+/// Background runs have no reader: only `notify` reaches the owner.
+const JOBS_PROMPT: &str = "You are running a background job for your owner, started by a schedule. Nobody reads your \
+                           replies. If the result needs the owner's attention, send it with the notify tool; otherwise \
+                           finish without notifying.";
+
 pub struct ThreadTools {
     conversations: Conversations,
     authority: Authority,
@@ -80,9 +85,11 @@ impl ThreadConfigSource<ChannelSender, NoRapHttp> for ThreadTools {
             config.tools.push(Rc::new(shell));
         }
 
-        if authorized.origin == Origin::Chat {
-            config.extra_system_prompt = policy.chat_prompt.clone();
-        }
+        config.extra_system_prompt = match authorized.origin {
+            Origin::Chat => policy.chat_prompt.clone(),
+            Origin::Schedule | Origin::Watch => Some(policy.jobs_prompt.as_deref().unwrap_or(JOBS_PROMPT).to_owned()),
+            Origin::Webhook => None,
+        };
 
         Ok(config)
     }

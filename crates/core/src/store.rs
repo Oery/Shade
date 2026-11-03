@@ -6,6 +6,7 @@ pub mod grants;
 pub mod inbox;
 pub mod operations;
 pub mod roots;
+pub mod schedules;
 pub mod state;
 pub mod usage;
 

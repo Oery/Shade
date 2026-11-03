@@ -66,6 +66,13 @@ caps = ["now"]
 # The first one also receives `notify` messages and failure notices in DMs.
 # owners = [123456789012345678]
 
+# Background runs started by scheduled jobs. Each run gets only the caps its
+# job was given, never more than [chat] holds, and never schedules/watches.
+# [jobs]
+# Replaces Shade's default instructions, which tell the model that nobody
+# reads its replies and to use `notify` when the owner should know.
+# prompt = "You are running a background job."
+
 # Webhook sources. Hooks can never hold `schedules` or `watches`.
 # [hooks.github]
 # caps = ["now", "notify"]
@@ -79,3 +86,5 @@ max_run_seconds = 900
 # Messages the model may send with `notify`. A run's failure notice from
 # Shade itself does not count against this.
 max_notifications = 10
+# Scheduled runs at once; the rest wait in the queue, across restarts too.
+max_concurrent_background_runs = 4

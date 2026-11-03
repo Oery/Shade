@@ -5,20 +5,24 @@
 //! its turn to the end. A pump outlives its client, so a turn's outcome is
 //! always settled. Work interrupted by a restart re-enters the same path.
 
+mod schedules;
 pub mod turn;
 
 #[cfg(test)]
 mod tests;
 
 use std::sync::Arc;
+use std::time::Duration;
 
+use chrono::Utc;
 use infinity_agent_core::ThreadId;
 use infinity_agent_core::message::InputMessage;
 use infinity_agent_core::system::local::{LaunchingSystem, ThreadHandle};
 use infinity_agent_core::system::{AgentSystemBuilder, NoRapHttp};
 use serenity::all::Http;
-use shade_proto::Response;
+use shade_proto::{Manage, Response};
 use tokio::sync::mpsc;
+use tokio::time::MissedTickBehavior;
 
 use crate::adapters::discord::Reply;
 use crate::authority::{Authority, Metered};
@@ -35,6 +39,7 @@ use crate::store::grants::Grants;
 use crate::store::inbox::{Inbox, Input};
 use crate::store::operations::Operations;
 use crate::store::roots::{Adapter, Roots, Target};
+use crate::store::schedules::{Run, Schedules};
 use crate::store::state::States;
 use crate::store::usage::Usages;
 use crate::thread_config::ThreadTools;
@@ -42,6 +47,9 @@ use crate::{tools, usage};
 
 /// Capacity of each reply stream between the router and a socket connection.
 pub const REPLY_QUEUE: usize = 64;
+
+/// How often due jobs are claimed and queued runs started.
+const SCHEDULE_TICK: Duration = Duration::from_secs(30);
 
 pub type System = LaunchingSystem<Conversations, States, NoRapHttp>;
 
@@ -60,6 +68,8 @@ pub enum Inbound {
     NewConversation { adapter: Adapter, key: String, reply: mpsc::Sender<Response> },
     /// Token usage by conversation.
     Usage { reply: mpsc::Sender<Response> },
+    /// Owner management of scheduled jobs.
+    Schedule { action: Manage, reply: mpsc::Sender<Response> },
 }
 
 /// Where a turn's output goes. The turn runs to its end either way.
@@ -71,6 +81,8 @@ pub enum Outbound {
     /// Nobody: resumed work in a conversation no adapter listens to. The
     /// outcome is logged, and a failure is sent to the owner when possible.
     Detached(Option<Notifier>),
+    /// A scheduled run. Its outcome is recorded, and a failure is sent to the owner.
+    Run { run: Run, schedules: Schedules, notifier: Option<Notifier> },
 }
 
 impl Outbound {
@@ -86,19 +98,23 @@ impl Outbound {
                 log_detached(thread, &step);
 
                 if let (Step::Failed(message), Some(notifier)) = (&step, notifier) {
-                    notifier.failure(&ThreadId::from(thread.to_owned()), message).await;
+                    let text = format!("⚠️ Work resumed after a restart failed in conversation {thread}: {message}");
+                    notifier.failure(&ThreadId::from(thread.to_owned()), text).await;
                 }
             }
+            Self::Run { run, schedules, notifier } => schedules::report(run, schedules, notifier.as_ref(), thread, step).await,
         }
     }
 }
 
 pub struct Router {
     db: Db,
+    policy: Arc<Policy>,
     inbox: Inbox,
     roots: Roots,
     operations: Operations,
     usages: Usages,
+    schedules: Schedules,
     system: System,
     /// For replies to resumed work in Discord conversations.
     discord: Option<Arc<Http>>,
@@ -111,7 +127,7 @@ impl Router {
     pub fn start(
         model: Model, db: Db, policy: Arc<Policy>, sandbox: Option<Arc<Sandbox>>, discord: Option<Arc<Http>>, notifier: Option<Notifier>,
     ) -> Self {
-        let authority = Authority::new(Grants::new(db.clone()), policy);
+        let authority = Authority::new(Grants::new(db.clone()), Arc::clone(&policy));
         let conversations = Conversations::new(db.clone());
         let operations = Operations::new(db.clone());
         let tools = ThreadTools::new(conversations.clone(), authority.clone(), operations, sandbox, notifier.clone());
@@ -119,28 +135,45 @@ impl Router {
         let builder = AgentSystemBuilder::new_local(conversations, States::new(db.clone()), model);
         let system = builder.without_builtin_tools().thread_config(tools).start();
 
-        Self::new(db, system, discord, notifier)
+        Self::new(db, system, policy, discord, notifier)
     }
 
-    pub fn new(db: Db, system: System, discord: Option<Arc<Http>>, notifier: Option<Notifier>) -> Self {
+    pub fn new(db: Db, system: System, policy: Arc<Policy>, discord: Option<Arc<Http>>, notifier: Option<Notifier>) -> Self {
         let inbox = Inbox::new(db.clone());
         let roots = Roots::new(db.clone());
         let operations = Operations::new(db.clone());
         let usages = Usages::new(db.clone());
+        let schedules = Schedules::new(db.clone());
 
-        Self { db, inbox, roots, operations, usages, system, discord, notifier }
+        Self { db, policy, inbox, roots, operations, usages, schedules, system, discord, notifier }
     }
 
-    /// Handles input until the channel closes. Must run inside a `LocalSet`.
+    /// Handles input and runs due jobs until the channel closes. Must run
+    /// inside a `LocalSet`. The first tick is immediate, so jobs missed
+    /// while the daemon was down run at startup.
     pub async fn serve(&self, mut inbound: mpsc::Receiver<Inbound>) {
-        while let Some(input) = inbound.recv().await {
-            match input {
-                Inbound::Prompt { adapter, target, text, source_key, outbound } => {
-                    self.prompt(adapter, target, text, source_key, outbound).await;
-                }
-                Inbound::NewConversation { adapter, key, reply } => self.new_conversation(adapter, key, reply).await,
-                Inbound::Usage { reply } => self.usage(reply).await,
+        let mut ticks = tokio::time::interval(SCHEDULE_TICK);
+        ticks.set_missed_tick_behavior(MissedTickBehavior::Delay);
+
+        loop {
+            tokio::select! {
+                input = inbound.recv() => match input {
+                    Some(input) => self.handle(input).await,
+                    None => return,
+                },
+                _ = ticks.tick() => self.schedule(Utc::now()).await,
             }
+        }
+    }
+
+    async fn handle(&self, input: Inbound) {
+        match input {
+            Inbound::Prompt { adapter, target, text, source_key, outbound } => {
+                self.prompt(adapter, target, text, source_key, outbound).await;
+            }
+            Inbound::NewConversation { adapter, key, reply } => self.new_conversation(adapter, key, reply).await,
+            Inbound::Usage { reply } => self.usage(reply).await,
+            Inbound::Schedule { action, reply } => self.manage(action, reply).await,
         }
     }
 
@@ -148,9 +181,12 @@ impl Router {
     /// then sends its unprocessed inputs again under their own IDs. Runs
     /// before any new input is accepted.
     pub async fn resume(&self) -> Result<(), BoxError> {
+        let mut resumed = Vec::new();
+
         for answer in recovery::answers(&self.operations).await? {
             let handle = self.attach(&answer.thread).await?;
             let outbound = self.outbound_for(&answer.thread).await;
+            resumed.push(answer.thread.as_str().to_owned());
             tools::deliver(&self.system.sender(), answer.thread, answer.id, answer.call_id, answer.text).await?;
             tokio::task::spawn_local(pump(handle, Turn::continuing(), outbound, None));
         }
@@ -158,8 +194,11 @@ impl Router {
         for input in self.inbox.unsettled().await? {
             tracing::info!(root = %input.root, input = %input.id, "resending an input accepted before the restart");
             let outbound = self.outbound_for(&input.root).await;
+            resumed.push(input.root.as_str().to_owned());
             self.dispatch(input, outbound).await;
         }
+
+        self.interrupt_runs(resumed).await?;
 
         Ok(())
     }
@@ -209,6 +248,12 @@ impl Router {
 
     /// Where resumed work in `thread` reports: its Discord channel, if it is one.
     async fn outbound_for(&self, thread: &ThreadId<str>) -> Outbound {
+        match self.schedules.run_of(thread).await {
+            Ok(Some(run)) => return self.run_outbound(run),
+            Ok(None) => {}
+            Err(error) => tracing::warn!(%error, %thread, "cannot tell whether resumed work is a scheduled run"),
+        }
+
         let detached = Outbound::Detached(self.notifier.clone());
 
         let Some(http) = &self.discord else {

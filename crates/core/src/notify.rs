@@ -63,13 +63,13 @@ impl Notifier {
     }
 
     /// Tells the owner that work in `thread` failed, once per budget. The
-    /// model's own notifications cannot use this allowance up.
-    pub async fn failure(&self, thread: &ThreadId<str>, cause: &str) {
+    /// model's own notifications cannot use this allowance up. `text` is
+    /// cut to a bounded length.
+    pub async fn failure(&self, thread: &ThreadId<str>, mut text: String) {
         if !self.claim_failure_notice(thread).await {
             return;
         }
 
-        let mut text = format!("⚠️ Work in conversation {thread} failed: {cause}");
         text.truncate(text.floor_char_boundary(MAX_FAILURE_NOTICE));
 
         if let Err(error) = self.send(text).await {

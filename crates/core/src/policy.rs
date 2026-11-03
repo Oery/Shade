@@ -102,11 +102,19 @@ pub struct Limits {
     pub max_run_seconds: u32,
     /// Messages the model may send the owner with `notify`.
     pub max_notifications: u32,
+    /// Scheduled runs running at once. Others wait, durably, in the queue.
+    pub max_concurrent_background_runs: u32,
 }
 
 impl Default for Limits {
     fn default() -> Self {
-        Self { max_completion_rounds: 40, max_tool_calls: 100, max_run_seconds: 900, max_notifications: 10 }
+        Self {
+            max_completion_rounds: 40,
+            max_tool_calls: 100,
+            max_run_seconds: 900,
+            max_notifications: 10,
+            max_concurrent_background_runs: 4,
+        }
     }
 }
 
@@ -147,6 +155,8 @@ impl Limits {
 pub struct Policy {
     pub chat: Caps,
     pub chat_prompt: Option<String>,
+    /// Replaces the default system prompt addition of background runs.
+    pub jobs_prompt: Option<String>,
     pub hooks: BTreeMap<String, Caps>,
     pub limits: Limits,
     pub timezone: Tz,
@@ -230,7 +240,7 @@ mod tests {
     fn policy(chat: &[Cap], hooks: Hooks<'_>) -> Policy {
         let hooks = hooks.iter().map(|(name, list)| ((*name).to_owned(), caps(list))).collect::<BTreeMap<_, _>>();
 
-        Policy { chat: caps(chat), chat_prompt: None, hooks, limits: Limits::default(), timezone: chrono_tz::UTC }
+        Policy { chat: caps(chat), chat_prompt: None, jobs_prompt: None, hooks, limits: Limits::default(), timezone: chrono_tz::UTC }
     }
 
     fn grant(origin: Origin, source: &str, requested: Option<&[&str]>) -> Grant {
@@ -295,7 +305,7 @@ mod tests {
 
     #[test]
     fn limits_refuse_at_the_boundary() {
-        let limits = Limits { max_completion_rounds: 2, max_tool_calls: 1, max_run_seconds: 60, max_notifications: 1 };
+        let limits = Limits { max_completion_rounds: 2, max_tool_calls: 1, max_run_seconds: 60, max_notifications: 1, ..Limits::default() };
         let usage =
             |completions, tool_calls, notifications, elapsed_seconds| Usage { completions, tool_calls, notifications, elapsed_seconds };
 

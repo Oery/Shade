@@ -14,6 +14,7 @@ shade-proto = { path = "crates/proto" }
 async-trait = "0.1"
 chrono = { version = "0.4.45", default-features = false, features = ["clock", "std"] }
 chrono-tz = "0.10.4"
+croner = "=4.0.2"
 clap = { version = "4.6.7", features = ["derive"] }
 dotenvy = "0.15.7"
 futures-util = { version = "0.3.34", default-features = false }

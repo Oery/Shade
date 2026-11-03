@@ -7,7 +7,7 @@
 //! is unsettled and is sent again, with the same ID, when the daemon starts.
 
 use infinity_agent_core::ThreadId;
-use rusqlite::{OptionalExtension, params};
+use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::store::db::{Db, DbError};
 use crate::store::roots::{self, Adapter, Target};
@@ -48,8 +48,7 @@ impl Inbox {
 
                 let root = roots::turn(&transaction, adapter, &target)?;
 
-                let sql = "INSERT INTO inbox (id, root_id, text, source_key) VALUES (?1, ?2, ?3, ?4)";
-                transaction.execute(sql, params![&id, &root, &text, &source_key])?;
+                insert(&transaction, &id, &root, &text, source_key.as_deref())?;
                 transaction.commit()?;
 
                 Ok(Some(Input { root: ThreadId::from(root), id, text }))
@@ -92,4 +91,12 @@ impl Inbox {
             })
             .await
     }
+}
+
+/// Records an input for `root`. Runs inside the caller's transaction.
+pub fn insert(connection: &Connection, id: &str, root: &str, text: &str, source_key: Option<&str>) -> Result<(), DbError> {
+    let sql = "INSERT INTO inbox (id, root_id, text, source_key) VALUES (?1, ?2, ?3, ?4)";
+    connection.execute(sql, params![id, root, text, source_key])?;
+
+    Ok(())
 }

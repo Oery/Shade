@@ -176,6 +176,7 @@ async fn handle(stream: UnixStream, owner_uid: u32, inbound: mpsc::Sender<Inboun
             forward(new, &inbound, &mut write).await
         }
         Request::Usage => forward(|reply| Inbound::Usage { reply }, &inbound, &mut write).await,
+        Request::Schedule { action } => forward(|reply| Inbound::Schedule { action, reply }, &inbound, &mut write).await,
         other => write_message(&mut write, &not_implemented(other)).await,
     }
 }

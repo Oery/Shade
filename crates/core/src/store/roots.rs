@@ -113,11 +113,16 @@ fn named(connection: &Connection, adapter: Adapter, key: &str) -> Result<String,
 
 /// Creates a chat root and its grant. Chat grants follow the current `[chat]` policy.
 pub fn register(connection: &Connection, id: &str, adapter: Adapter) -> Result<(), DbError> {
-    connection.execute("INSERT INTO threads (id, root_id) VALUES (?1, ?1)", [id])?;
-
     let grant = Grant { origin: Origin::Chat, source: adapter.name().to_owned(), caps: None };
 
-    insert_grant(connection, id, &grant)
+    insert_root(connection, id, &grant)
+}
+
+/// Creates a root with its grant: the only way a root comes to exist.
+pub fn insert_root(connection: &Connection, id: &str, grant: &Grant) -> Result<(), DbError> {
+    connection.execute("INSERT INTO threads (id, root_id) VALUES (?1, ?1)", [id])?;
+
+    insert_grant(connection, id, grant)
 }
 
 /// Creates a root and points `key` at it.
@@ -132,7 +137,7 @@ fn point(connection: &Connection, adapter: Adapter, key: &str) -> Result<String,
     Ok(id)
 }
 
-fn new_id() -> String {
+pub fn new_id() -> String {
     uuid::Uuid::new_v4().to_string()
 }
 

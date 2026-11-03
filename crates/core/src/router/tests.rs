@@ -5,6 +5,7 @@
 
 use std::time::Duration;
 
+use chrono::{DateTime, Utc};
 use infinity_agent_core::ThreadId;
 use infinity_agent_core::message::InfinityMessage;
 use infinity_agent_core::traits::ConversationStore;
@@ -13,11 +14,12 @@ use tokio::sync::mpsc;
 
 use super::{Outbound, REPLY_QUEUE, Router};
 use crate::error::BoxError;
-use crate::policy::Limits;
+use crate::policy::{Cap, Limits};
 use crate::store::conversation::Conversations;
 use crate::store::db::Db;
 use crate::store::inbox::Input;
 use crate::store::roots::{Adapter, Target};
+use crate::store::schedules::Schedules;
 use crate::testing::{self, within};
 
 const TEXT: &str = "remember the milk";
@@ -166,4 +168,66 @@ async fn message_delivered_twice_is_accepted_once() -> Result<(), BoxError> {
         Ok(())
     })
     .await
+}
+
+#[derive(Clone, Copy, Debug)]
+enum RunCrash {
+    /// The occurrence was claimed; the run never started.
+    Claimed,
+    /// The run started and the model was answering.
+    Started,
+}
+
+/// A job five hours overdue runs once, not five times, and a crash after
+/// its claim or its start neither loses the run nor starts a second one.
+#[tokio::test(flavor = "current_thread")]
+async fn missed_occurrences_run_once_across_a_crash() -> Result<(), BoxError> {
+    for crash in [RunCrash::Claimed, RunCrash::Started] {
+        let db = Db::in_memory()?;
+        let schedules = Schedules::new(db.clone());
+        let now = Utc::now();
+        schedules.add("weather", "cron", "0 * * * *", now.timestamp() - 5 * 3600).await?;
+
+        within(first_scheduler(&db, now, crash)).await?;
+        within(second_scheduler(&db, now)).await?;
+
+        assert_eq!(schedules.statuses().await?, ["completed"], "{crash:?}");
+        let next = schedules.list().await?.into_iter().find_map(|job| job.next_at);
+        assert!(next > Some(now.timestamp()), "{crash:?}: the job did not move past now");
+    }
+
+    Ok(())
+}
+
+async fn first_scheduler(db: &Db, now: DateTime<Utc>, crash: RunCrash) -> Result<(), BoxError> {
+    let (router, mut model) = testing::router(db, testing::policy(&[Cap::Now], Limits::default())).await?;
+
+    match crash {
+        RunCrash::Claimed => router.claim_due(now).await?,
+        RunCrash::Started => {
+            router.schedule(now).await;
+            model.next_request().await;
+        }
+    }
+
+    Ok(())
+}
+
+async fn second_scheduler(db: &Db, now: DateTime<Utc>) -> Result<(), BoxError> {
+    let (router, mut model) = testing::router(db, testing::policy(&[Cap::Now], Limits::default())).await?;
+    router.resume().await?;
+    router.schedule(now).await;
+
+    let request = model.next_request().await;
+    assert_eq!(format!("{:?}", request.chat_history).matches("check the weather").count(), 1);
+    model.send_text("sunny");
+    model.finish();
+
+    let schedules = Schedules::new(db.clone());
+
+    while schedules.statuses().await? != ["completed"] {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    Ok(())
 }

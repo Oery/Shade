@@ -42,7 +42,7 @@ pub struct Harness {
 pub fn policy(caps: &[Cap], limits: Limits) -> Arc<Policy> {
     let chat = caps.iter().copied().collect();
 
-    Arc::new(Policy { chat, chat_prompt: None, hooks: Default::default(), limits, timezone: chrono_tz::UTC })
+    Arc::new(Policy { chat, chat_prompt: None, jobs_prompt: None, hooks: Default::default(), limits, timezone: chrono_tz::UTC })
 }
 
 /// Runs `test` on a `LocalSet`, failing it after ten seconds instead of hanging.
@@ -90,9 +90,9 @@ pub async fn start_with_tools(
 
 /// A router on `db` with a scripted model, as the daemon builds it.
 pub async fn router(db: &Db, policy: Arc<Policy>) -> Result<(Router, MockModelController), BoxError> {
-    let Harness { system, model, .. } = start_with(db, policy).await?;
+    let Harness { system, model, .. } = start_with(db, Arc::clone(&policy)).await?;
 
-    Ok((Router::new(db.clone(), system, None, None), model))
+    Ok((Router::new(db.clone(), system, policy, None, None), model))
 }
 
 /// Attaches to a registered thread and waits out the idle its attach-spawned driver emits.

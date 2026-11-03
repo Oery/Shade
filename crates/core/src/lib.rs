@@ -11,6 +11,7 @@ mod policy;
 mod recovery;
 mod router;
 mod sandbox;
+mod schedule;
 mod secrets;
 mod store;
 #[cfg(test)]
@@ -54,8 +55,8 @@ pub fn run(config: Option<PathBuf>) -> Result<(), Error> {
 
 async fn serve(config_path: Option<PathBuf>) -> Result<(), Error> {
     let config_path = config::path(config_path)?;
-    let Config { model, timezone, chat, hooks, limits, sandbox, discord } = config::load(&config_path)?;
-    let policy = config::policy(&config_path, chat, hooks, limits, timezone)?;
+    let Config { model, timezone, chat, jobs, hooks, limits, sandbox, discord } = config::load(&config_path)?;
+    let policy = config::policy(&config_path, chat, jobs, hooks, limits, timezone)?;
     let mut secrets = Secrets::load(secrets::path_for(&config_path))?;
 
     let Some(data_dir) = shade_proto::data_dir() else {

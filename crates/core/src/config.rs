@@ -19,6 +19,9 @@ pub struct Config {
     /// Without a `[chat]` section, chat has no tools.
     #[serde(default)]
     pub chat: ChatConfig,
+    /// Background runs: scheduled jobs and, later, watches.
+    #[serde(default)]
+    pub jobs: JobsConfig,
     #[serde(default)]
     pub hooks: BTreeMap<String, HookConfig>,
     #[serde(default)]
@@ -44,6 +47,13 @@ pub struct ChatConfig {
     #[serde(default)]
     pub caps: Caps,
     /// Added to the system prompt of every chat conversation.
+    pub prompt: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct JobsConfig {
+    /// Replaces Shade's default instructions for background runs.
     pub prompt: Option<String>,
 }
 
@@ -133,7 +143,7 @@ pub fn load(path: &Path) -> Result<Config, Error> {
 
 /// Builds and checks the policy, so a bad config fails at startup rather than at dispatch.
 pub fn policy(
-    path: &Path, chat: ChatConfig, hooks: BTreeMap<String, HookConfig>, limits: Limits, timezone: Option<String>,
+    path: &Path, chat: ChatConfig, jobs: JobsConfig, hooks: BTreeMap<String, HookConfig>, limits: Limits, timezone: Option<String>,
 ) -> Result<Policy, Error> {
     let timezone = match timezone {
         Some(name) => match name.parse::<Tz>() {
@@ -144,7 +154,7 @@ pub fn policy(
     };
 
     let hooks = hooks.into_iter().map(|(name, hook)| (name, hook.caps)).collect();
-    let policy = Policy { chat: chat.caps, chat_prompt: chat.prompt, hooks, limits, timezone };
+    let policy = Policy { chat: chat.caps, chat_prompt: chat.prompt, jobs_prompt: jobs.prompt, hooks, limits, timezone };
 
     if let Err(message) = policy.validate() {
         return Err(invalid(path, message));
