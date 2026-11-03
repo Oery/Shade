@@ -9,6 +9,7 @@ mod lock;
 mod model;
 mod notify;
 mod policy;
+mod receipt;
 mod recovery;
 mod router;
 mod sandbox;

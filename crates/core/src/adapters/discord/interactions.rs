@@ -158,7 +158,12 @@ fn done<T>(result: serenity::Result<T>, what: &str) -> bool {
 }
 
 /// `original` with `outcome` below it, cut to fit in one Discord message.
+/// A card has no text of its own, so the outcome stands alone above it.
 fn below(original: &str, outcome: &str) -> String {
+    if original.is_empty() {
+        return outcome.to_owned();
+    }
+
     let room = MESSAGE_LIMIT.saturating_sub(outcome.encode_utf16().count() + 2);
     let mut kept = String::new();
     let mut length = 0;

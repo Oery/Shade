@@ -22,8 +22,8 @@ use std::sync::{Arc, OnceLock};
 mod interactions;
 
 use serenity::all::{
-    ChannelId, Client, Context, CreateAllowedMentions, CreateMessage, EventHandler, GatewayIntents, Http, HttpError, Interaction, Message,
-    MessageId, Ready, ShardManager, Typing, UserId,
+    ChannelId, Client, Context, CreateAllowedMentions, CreateEmbed, CreateEmbedAuthor, CreateEmbedFooter, CreateMessage, EventHandler,
+    GatewayIntents, Http, HttpError, Interaction, Message, MessageId, Ready, ShardManager, Typing, UserId,
 };
 use serenity::async_trait;
 
@@ -32,6 +32,7 @@ use tokio::sync::mpsc;
 
 use crate::config::DiscordConfig;
 use crate::notify::{Destination, Failure, Notice};
+use crate::receipt::{Card, Verb};
 use crate::router::turn::Step;
 use crate::router::{Inbound, Outbound};
 use crate::secrets::Secrets;
@@ -306,27 +307,12 @@ impl Reply {
         self.truncated |= kept.len() < text.len();
     }
 
-    /// Posts Shade's own text; a change waiting for approval gets its buttons under the last part.
+    /// Posts Shade's own card; a change waiting for approval gets its buttons under it.
     async fn show(&mut self, shown: Shown) {
-        let (text, code) = match shown {
-            Shown::Receipt(text) => (text, None),
-            Shown::Approval { text, code } => (text, Some(code)),
-        };
+        let Shown { card, approval } = shown;
+        let mut message = addressed(CreateMessage::new().embed(embed(&card)), self.channel, self.answering.take());
 
-        let mut parts = chunks(&text, MESSAGE_LIMIT);
-        let last = parts.pop();
-
-        for part in parts {
-            post(&self.http, self.channel, &part, self.answering.take()).await;
-        }
-
-        let Some(last) = last else {
-            return;
-        };
-
-        let mut message = message(&last, self.channel, self.answering.take());
-
-        if let Some(code) = code {
+        if let Some(code) = approval {
             message = message.components(interactions::approval_buttons(&code));
         }
 
@@ -375,7 +361,11 @@ async fn post(http: &Http, channel: ChannelId, text: &str, answering: Option<Mes
 
 /// A message that pings nobody, under the one it answers if any.
 fn message(text: &str, channel: ChannelId, answering: Option<MessageId>) -> CreateMessage {
-    let message = CreateMessage::new().content(text).allowed_mentions(CreateAllowedMentions::new().replied_user(false));
+    addressed(CreateMessage::new().content(text), channel, answering)
+}
+
+fn addressed(message: CreateMessage, channel: ChannelId, answering: Option<MessageId>) -> CreateMessage {
+    let message = message.allowed_mentions(CreateAllowedMentions::new().replied_user(false));
 
     match answering {
         Some(id) => message.reference_message((channel, id)),
@@ -386,6 +376,35 @@ fn message(text: &str, channel: ChannelId, answering: Option<MessageId>) -> Crea
 async fn send(http: &Http, channel: ChannelId, message: CreateMessage) {
     if let Err(error) = channel.send_message(http, message).await {
         tracing::warn!(%error, %channel, "cannot post to Discord");
+    }
+}
+
+/// A job card: what changed above the title, the prompt as the description.
+fn embed(card: &Card) -> CreateEmbed {
+    let colour = match card.verb {
+        Verb::Created => 0x57_F2_87,
+        Verb::Updated => 0x58_65_F2,
+        Verb::Deleted => 0x99_AA_B5,
+        Verb::Proposed { .. } => 0xFE_E7_5C,
+    };
+
+    let label = format!("{} {}", card.icon(), card.label().trim_end_matches(':'));
+    let embed = CreateEmbed::new().author(CreateEmbedAuthor::new(label)).title(&card.title).colour(colour);
+
+    if card.verb == Verb::Deleted {
+        return embed;
+    }
+
+    let embed = embed
+        .description(&card.prompt)
+        .field("When", &card.cadence, true)
+        .field("Next run", card.next_run(), true)
+        .field("Posts to", card.posts_to(), true)
+        .field("Can use", card.can_use(), true);
+
+    match &card.file {
+        Some(file) => embed.footer(CreateEmbedFooter::new(format!("Saved in {file}"))),
+        None => embed,
     }
 }
 

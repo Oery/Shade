@@ -113,7 +113,6 @@ impl Turn {
 #[cfg(test)]
 mod tests {
     use infinity_agent_core::system::AgentEvent;
-    use rap_protocol::DisplaySegment;
 
     use super::{Step, Turn};
 
@@ -198,21 +197,6 @@ mod tests {
             (
                 vec![input("hi"), started(), tool_call(), finished(), tool_result(), started(), text("answer"), finished()],
                 vec!["paused", "answer", "done"],
-            ),
-            // A receipt Shade wrote is shown; the model's copy of the result is not.
-            (
-                vec![
-                    input("hi"),
-                    started(),
-                    tool_call(),
-                    finished(),
-                    AgentEvent::ToolResult {
-                        segments: vec![DisplaySegment::Text("created".to_owned()), DisplaySegment::Text("created".to_owned())],
-                    },
-                    started(),
-                    finished(),
-                ],
-                vec!["paused", "shown: Receipt(\"created\")", "done"],
             ),
             // A synchronous tool answers inside the completion.
             (

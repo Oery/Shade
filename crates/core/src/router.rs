@@ -360,9 +360,9 @@ fn response_for(step: Step) -> Option<Response> {
         Step::Paused => None,
         Step::Done => Some(Response::Done),
         Step::Failed(message) => Some(Response::Error { message }),
-        Step::Shown(Shown::Receipt(text)) => Some(Response::Text { text: format!("\n{text}\n") }),
-        Step::Shown(Shown::Approval { text, code }) => Some(Response::Text {
-            text: format!("\n{text}\nApprove with `shade schedule approve {code}`, or drop it with `shade schedule reject {code}`.\n"),
+        Step::Shown(Shown { card, approval: None }) => Some(Response::Text { text: format!("\n{}\n", card.text()) }),
+        Step::Shown(Shown { card, approval: Some(code) }) => Some(Response::Text {
+            text: format!("\n{}\n   `shade schedule approve {code}` or `shade schedule reject {code}`\n", card.text()),
         }),
         Step::Superseded => Some(Response::Error { message: SUPERSEDED.to_owned() }),
     }

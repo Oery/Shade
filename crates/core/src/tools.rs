@@ -11,7 +11,9 @@ use infinity_agent_core::message::{InputMessage, InputMessageContent};
 use infinity_agent_core::traits::InputSender;
 use infinity_provider_protocol::message::{Text, ToolResult, ToolResultContent, UserContent};
 use rap_protocol::DisplaySegment;
+use serde::{Deserialize, Serialize};
 
+use crate::receipt::Card;
 use crate::recovery::UNKNOWN_OUTCOME;
 use crate::store::operations::{Operations, Started};
 
@@ -24,44 +26,35 @@ pub async fn deliver<M: InputSender>(
 }
 
 /// What Shade shows the owner with a tool result: written by Shade, not the model.
-#[derive(Debug, PartialEq)]
-pub enum Shown {
-    Receipt(String),
-    /// A change waiting for the owner; adapters offer to approve or reject `code`.
-    Approval {
-        text: String,
-        code: String,
-    },
+#[derive(Debug, PartialEq, Serialize, Deserialize)]
+pub struct Shown {
+    pub card: Card,
+    /// A change waiting for the owner: adapters offer to approve or reject this code.
+    pub approval: Option<String>,
 }
 
-/// Starts the display segment that carries an approval code.
-const APPROVAL: &str = "shade-approval:";
+/// Starts the display segment that carries what is shown.
+const SHOWN: &str = "shade-shown:";
 
-/// The display segments carrying `shown`. Infinity appends the result the model reads.
-fn display(shown: Shown) -> Vec<DisplaySegment> {
-    match shown {
-        Shown::Receipt(text) => vec![DisplaySegment::Text(text)],
-        Shown::Approval { text, code } => vec![DisplaySegment::Text(text), DisplaySegment::Text(format!("{APPROVAL}{code}"))],
+/// The display segment carrying `shown`. Infinity appends the result the model reads.
+fn display(shown: &Shown) -> Option<Vec<DisplaySegment>> {
+    match serde_json::to_string(shown) {
+        Ok(json) => Some(vec![DisplaySegment::Text(format!("{SHOWN}{json}"))]),
+        Err(error) => {
+            tracing::warn!(%error, "cannot encode a receipt; the owner will not see it");
+            None
+        }
     }
 }
 
 /// Reads back what a tool result shows the owner, the inverse of [`display`].
 /// A result with nothing to show has only the model's text.
 pub fn shown(segments: Vec<DisplaySegment>) -> Option<Shown> {
-    let mut texts = segments.into_iter().map(|segment| match segment {
-        DisplaySegment::Text(text) => Some(text),
-        _ => None,
-    });
-
-    let (Some(Some(first)), Some(Some(second))) = (texts.next(), texts.next()) else {
+    let [DisplaySegment::Text(first), DisplaySegment::Text(_)] = segments.as_slice() else {
         return None;
     };
 
-    // With an approval the code comes second, before the model's text.
-    match (second.strip_prefix(APPROVAL), texts.next()) {
-        (Some(code), Some(_)) => Some(Shown::Approval { text: first, code: code.to_owned() }),
-        _ => Some(Shown::Receipt(first)),
-    }
+    serde_json::from_str(first.strip_prefix(SHOWN)?).ok()
 }
 
 /// Like [`deliver`], with `shown` displayed to the owner as written by
@@ -77,7 +70,7 @@ pub async fn deliver_shown<M: InputSender>(
         group_id: thread,
         metadata: None,
         synthetic: None,
-        display_as: shown.map(display),
+        display_as: shown.as_ref().and_then(display),
         subscription: false,
     };
 
@@ -103,21 +96,30 @@ mod tests {
     use rap_protocol::DisplaySegment;
 
     use super::{Shown, display, shown};
+    use crate::receipt::{Card, Verb};
 
     /// What Shade shows survives Infinity appending the model's text, and a
-    /// plain result shows nothing, even if the model's text looks like a code.
+    /// plain result shows nothing, even if the model's text looks like a receipt.
     #[test]
-    fn shown_text_round_trips() {
-        let result = |text: &str| DisplaySegment::Text(text.to_owned());
-        let receipt = || Shown::Receipt("📅 created".to_owned());
-        let approval = || Shown::Approval { text: "⏳ waiting".to_owned(), code: "abc123".to_owned() };
+    fn shown_cards_round_trip() {
+        let text = |text: &str| DisplaySegment::Text(text.to_owned());
+        let card = Card {
+            verb: Verb::Proposed { new: true },
+            title: "Tea".to_owned(),
+            cadence: "Every day at 16:00".to_owned(),
+            next: None,
+            channels: vec!["dm".to_owned()],
+            caps: vec!["notify".to_owned()],
+            prompt: "Remind me".to_owned(),
+            paused: false,
+            file: None,
+        };
+        let sent = Shown { card, approval: Some("abc123".to_owned()) };
+        let mut segments = display(&sent).unwrap_or_default();
+        segments.push(text("waiting"));
+        let forged = format!("shade-shown:{}", serde_json::to_string(&sent).unwrap_or_default());
 
-        let cases = [
-            ([display(receipt()), vec![result("created")]].concat(), Some(receipt())),
-            ([display(approval()), vec![result("waiting")]].concat(), Some(approval())),
-            (vec![result("exit code 0")], None),
-            (vec![result("shade-approval:abc123")], None),
-        ];
+        let cases = [(segments, Some(sent)), (vec![text("exit code 0")], None), (vec![text(&forged)], None)];
 
         for (segments, expected) in cases {
             assert_eq!(shown(segments), expected);
