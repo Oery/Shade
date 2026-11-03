@@ -51,7 +51,7 @@ pub fn policy(caps: &[Cap], limits: Limits) -> Arc<Policy> {
         jobs_prompt: None,
         channels,
         servers,
-        hooks: Default::default(),
+        hooks: [("ci".to_owned(), [Cap::Now].into_iter().collect())].into_iter().collect(),
         limits,
         timezone: chrono_tz::UTC,
     })

@@ -323,4 +323,51 @@ mod tests {
 
         Ok(queue)
     }
+
+    /// Infinity runs only the first tool call of a model turn and drops the
+    /// rest before they reach history (see docs/infinity-notes.md). So a
+    /// thread never has two calls outstanding: the dropped one is never
+    /// sent, and nothing is left unanswered for recovery to guess at.
+    #[tokio::test(flavor = "current_thread")]
+    async fn parallel_calls_run_one_at_a_time() -> Result<(), BoxError> {
+        within(async {
+            let db = Db::in_memory()?;
+            Conversations::new(db.clone()).register_root(&root()).await?;
+
+            let (notifier, mut queue) = Notifier::new(Grants::new(db.clone()));
+            let policy = testing::policy(&[Cap::Notify], Limits::default());
+            let mut harness = testing::start_with_tools(&db, policy, testing::services(None, Some(notifier))).await?;
+            let handle = attach(&mut harness, &root()).await?;
+
+            handle.send(InputMessage::user_text(root(), "tell me twice"), "input-1").await?;
+            harness.model.next_request().await;
+            harness.model.send_tool_call("call-1", "notify", serde_json::json!({ "message": "first" }));
+            harness.model.send_tool_call("call-2", "notify", serde_json::json!({ "message": "second" }));
+            harness.model.finish();
+
+            let Some(Notice { text, ack, .. }) = queue.recv().await else {
+                return Err("the first notice never reached the adapter".into());
+            };
+
+            assert_eq!(text, "first");
+            let _ = ack.send(Ok(()));
+
+            let history = format!("{:?}", harness.model.next_request().await.chat_history);
+            assert!(history.contains("Sent to the owner.") && !history.contains("call-2"), "{history}");
+            assert!(queue.try_recv().is_err(), "the dropped call was sent");
+
+            // Once the turn is saved, no call waits for a result. A stranded
+            // call would keep this loop going until the test times out.
+            harness.model.send_text("done");
+            harness.model.finish();
+            let operations = Operations::new(db);
+
+            while !operations.unanswered().await?.is_empty() {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+
+            Ok(())
+        })
+        .await
+    }
 }

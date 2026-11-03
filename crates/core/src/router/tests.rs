@@ -13,6 +13,7 @@ use shade_policy::{Cap, Limits};
 use shade_proto::Response;
 use shade_store::conversation::Conversations;
 use shade_store::db::Db;
+use shade_store::hooks::{Admission, HookEvents};
 use shade_store::inbox::{Inbox, Input};
 use shade_store::roots::{Adapter, Target};
 use shade_store::schedules::Schedules;
@@ -315,6 +316,92 @@ async fn job_files_sync_at_startup() -> Result<(), BoxError> {
         if let Some(dir) = path.parent() {
             std::fs::remove_dir_all(dir)?;
         }
+
+        Ok(())
+    })
+    .await
+}
+
+/// A webhook event accepted before a crash runs once after it, whether it
+/// had not started yet or the model was already answering it.
+#[tokio::test(flavor = "current_thread")]
+async fn webhook_events_run_once_across_a_crash() -> Result<(), BoxError> {
+    for started in [false, true] {
+        let db = Db::in_memory()?;
+        let events = HookEvents::new(db.clone());
+        let admission = Admission { queued: 10, per_minute: 10 };
+        events.accept("ci".to_owned(), Some("d1".to_owned()), "check the build".to_owned(), admission).await?;
+
+        within(async {
+            let (router, mut model) = testing::router(&db, testing::policy(&[Cap::Now], Limits::default())).await?;
+
+            if started {
+                router.start_background(Utc::now()).await;
+                model.next_request().await;
+            }
+
+            Ok(())
+        })
+        .await?;
+
+        within(async {
+            let (router, mut model) = testing::router(&db, testing::policy(&[Cap::Now], Limits::default())).await?;
+            router.resume().await?;
+            router.start_background(Utc::now()).await;
+
+            let request = model.next_request().await;
+            assert_eq!(format!("{:?}", request.chat_history).matches("check the build").count(), 1, "started: {started}");
+            model.send_text("green");
+            model.finish();
+
+            while events.statuses().await? != ["completed"] {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+
+            Ok(())
+        })
+        .await?;
+    }
+
+    Ok(())
+}
+
+/// A scheduled run resumed after a restart still holds its job: an
+/// occurrence that comes due meanwhile waits for it, then runs.
+#[tokio::test(flavor = "current_thread")]
+async fn resumed_runs_keep_their_jobs_overlap() -> Result<(), BoxError> {
+    let db = Db::in_memory()?;
+    let schedules = Schedules::new(db.clone());
+    let now = Utc::now();
+    schedules.add("weather", "cron", "0 * * * *", now.timestamp() - 60).await?;
+
+    within(async {
+        let (router, mut model) = testing::router(&db, testing::policy(&[Cap::Now], Limits::default())).await?;
+        router.schedule(now).await;
+        model.next_request().await;
+
+        Ok(())
+    })
+    .await?;
+
+    within(async {
+        let (router, mut model) = testing::router(&db, testing::policy(&[Cap::Now], Limits::default())).await?;
+        router.resume().await?;
+
+        let later = now + TimeDelta::hours(2);
+        router.schedule(later).await;
+        assert_eq!(schedules.statuses().await?, ["running", "queued"], "a second run of the job started");
+
+        model.next_request().await;
+        model.send_text("sunny");
+        model.finish();
+
+        while schedules.statuses().await?.first().map(String::as_str) != Some("completed") {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        router.schedule(later).await;
+        assert_eq!(schedules.statuses().await?, ["completed", "running"]);
 
         Ok(())
     })

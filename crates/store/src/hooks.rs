@@ -146,6 +146,21 @@ impl HookEvents {
     }
 }
 
+#[cfg(any(test, feature = "testing"))]
+impl HookEvents {
+    /// Every event's status, oldest first.
+    pub async fn statuses(&self) -> Result<Vec<String>, DbError> {
+        self.db
+            .call(|connection| {
+                let mut statement = connection.prepare("SELECT status FROM hook_events ORDER BY received_at, rowid")?;
+                let rows = statement.query_map([], |row| row.get(0))?;
+
+                Ok(rows.collect::<Result<_, _>>()?)
+            })
+            .await
+    }
+}
+
 /// Running scheduled runs and hook events together: the background work
 /// the shared capacity counts.
 pub(crate) fn running_background(connection: &Connection) -> Result<u32, DbError> {

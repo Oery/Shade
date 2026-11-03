@@ -144,6 +144,18 @@ included, and refuses with `ErrorClass::Fatal` so Infinity does not retry.
 `Info("Error: …")` before `CompletionStarted` means no completion will run for
 that input. The `ask` pump in `router.rs` relies on this.
 
+### One tool call per model turn
+
+A model may stream several tool calls in one turn (OpenAI-style parallel
+calls, Bedrock's concurrent ones). Infinity executes only the first: after
+it, everything but the final chunk is dropped before it reaches history
+(`event_processor.rs`, "Ignoring post-tool-call stream content"), and a
+thread holds at most one terminal action per completion (`thread.rs`,
+`assert!(action.is_none(), "bug: multiple terminal actions")`). The model
+sees only the call that ran and can make the next one in a later round.
+So a thread never has two calls outstanding, and recovery never meets a
+dropped call in history. Checked in M18 (`parallel_calls_run_one_at_a_time`).
+
 ### Interruption and shutdown
 
 User text arriving during a completion cancels it, keeps the partial turn, and
