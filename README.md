@@ -35,6 +35,23 @@ users.users.<you>.linger = true;       # start it at boot
 
 The daily backup timer is on by default (`services.shade.backups`). Each user keeps their own `~/.config/shade`. `nix build github:Oery/Shade` builds just the package.
 
+With Home Manager (NixOS or any other distribution), the user module also writes the config from Nix:
+
+```nix
+imports = [ inputs.shade.homeModules.default ];
+services.shade = {
+  enable = true;                       # shaded as a user service, daily backups
+  settings = {                         # becomes ~/.config/shade/config.toml
+    timezone = "Europe/Paris";
+    model = { provider = "anthropic"; id = "claude-opus-5-5"; api_key_env = "ANTHROPIC_API_KEY";
+              context_window = 1000000; max_output_tokens = 128000; };
+    chat.caps = [ "now" "notify" ];
+  };
+};
+```
+
+`settings` ends up in the Nix store, so it only ever names secrets; their values go in `~/.config/shade/.env` (`chmod 600`). Leave `settings` empty to keep writing `config.toml` yourself. `shaded` restarts when the generated config changes. Home Manager cannot enable lingering: `loginctl enable-linger "$USER"` once, or `users.users.<you>.linger = true` on NixOS.
+
 Elsewhere, build with the toolchain from `rust-toolchain.toml`:
 
 ```sh

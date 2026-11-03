@@ -34,5 +34,9 @@
       };
 
       nixosModules.default = import ./packaging/nix/module.nix self;
+
+      homeModules.default = import ./packaging/nix/home.nix self;
+      # The name older Home Manager setups look for.
+      homeManagerModules.default = self.homeModules.default;
     };
 }

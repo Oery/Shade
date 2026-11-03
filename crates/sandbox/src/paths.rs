@@ -27,7 +27,16 @@ impl Protected {
             Err(source) => return Err(SandboxError::Path { path: PathBuf::from("/proc/self/exe"), source }),
         };
 
-        let mut paths = vec![canonical(data_dir)?];
+        // The directory the config is named in holds its `.env` and job
+        // files; when the config is a symlink (Home Manager links it into
+        // the Nix store), that is not where the resolved file lives, so
+        // both are protected.
+        let named = match config_path.parent() {
+            Some(dir) if !dir.as_os_str().is_empty() => canonical(dir)?,
+            _ => canonical(Path::new("."))?,
+        };
+
+        let mut paths = vec![canonical(data_dir)?, named];
         paths.extend(config.parent().map(Path::to_path_buf));
         paths.extend(exe.parent().map(Path::to_path_buf));
 
@@ -141,5 +150,29 @@ mod tests {
 
             assert_eq!(result.is_ok(), allowed, "workspace {workspace}, vault {vault:?}: {result:?}");
         }
+    }
+
+    /// A symlinked config (Home Manager links it into the Nix store) keeps
+    /// the directory it is named in protected: that is where its `.env` is.
+    #[test]
+    fn a_symlinked_configs_directory_stays_protected() -> std::io::Result<()> {
+        let root = std::env::temp_dir().join(format!("shade-paths-{}", std::process::id()));
+        let (named, store, data) = (root.join("config"), root.join("store"), root.join("data"));
+
+        for dir in [&named, &store, &data] {
+            std::fs::create_dir_all(dir)?;
+        }
+
+        std::fs::write(store.join("config.toml"), "")?;
+        std::os::unix::fs::symlink(store.join("config.toml"), named.join("config.toml"))?;
+
+        let expected = [named.canonicalize()?, store.canonicalize()?];
+        let protected = Protected::for_daemon(&data, &named.join("config.toml"));
+        std::fs::remove_dir_all(&root)?;
+
+        let paths = protected.map(|protected| protected.paths).unwrap_or_default();
+        assert!(expected.iter().all(|dir| paths.contains(dir)), "{paths:?}");
+
+        Ok(())
     }
 }
