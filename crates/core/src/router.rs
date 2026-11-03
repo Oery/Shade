@@ -5,6 +5,7 @@
 //! its turn to the end. A pump outlives its client, so a turn's outcome is
 //! always settled. Work interrupted by a restart re-enters the same path.
 
+mod hooks;
 mod schedules;
 pub mod turn;
 
@@ -26,6 +27,7 @@ use shade_schedule::jobfiles::JobFiles;
 use shade_store::conversation::Conversations;
 use shade_store::db::Db;
 use shade_store::grants::Grants;
+use shade_store::hooks::HookEvents;
 use shade_store::inbox::{Inbox, Input};
 use shade_store::operations::Operations;
 use shade_store::roots::{Adapter, Conversation, Roots, Target};
@@ -71,6 +73,8 @@ pub enum Inbound {
     Usage { reply: mpsc::Sender<Response> },
     /// Owner management of scheduled jobs.
     Schedule { action: Manage, reply: mpsc::Sender<Response> },
+    /// A background run may start now: a webhook event was just accepted.
+    StartBackground,
 }
 
 /// Where a turn's output goes. The turn runs to its end either way.
@@ -84,6 +88,8 @@ pub enum Outbound {
     Detached(Option<Notifier>),
     /// A scheduled run. Its outcome is recorded, and a failure is sent to the owner.
     Run { run: Run, schedules: Schedules, notifier: Option<Notifier> },
+    /// A run started by a webhook event. Its outcome is recorded, and a failure is sent to the owner.
+    Hook { event: String, hook: String, events: HookEvents, notifier: Option<Notifier> },
 }
 
 impl Outbound {
@@ -104,6 +110,7 @@ impl Outbound {
                 }
             }
             Self::Run { run, schedules, notifier } => schedules::report(run, schedules, notifier.as_ref(), thread, step).await,
+            Self::Hook { event, hook, events, notifier } => hooks::report(event, hook, events, notifier.as_ref(), thread, step).await,
         }
     }
 }
@@ -116,6 +123,7 @@ pub struct Router {
     operations: Operations,
     usages: Usages,
     schedules: Schedules,
+    hooks: HookEvents,
     system: System,
     /// For replies to resumed work in Discord conversations.
     discord: Option<Arc<Http>>,
@@ -144,8 +152,9 @@ impl Router {
         let operations = Operations::new(db.clone());
         let usages = Usages::new(db.clone());
         let schedules = Schedules::new(db.clone());
+        let hooks = HookEvents::new(db.clone());
 
-        Self { db, policy, inbox, roots, operations, usages, schedules, system, discord, notifier, job_files }
+        Self { db, policy, inbox, roots, operations, usages, schedules, hooks, system, discord, notifier, job_files }
     }
 
     /// Handles input and runs due jobs until the channel closes. Must run
@@ -174,6 +183,7 @@ impl Router {
             Inbound::NewConversation { adapter, key, reply } => self.new_conversation(adapter, key, reply).await,
             Inbound::Usage { reply } => self.usage(reply).await,
             Inbound::Schedule { action, reply } => self.manage(action, reply).await,
+            Inbound::StartBackground => self.start_background(Utc::now()).await,
         }
     }
 
@@ -198,6 +208,7 @@ impl Router {
             self.dispatch(input, outbound).await;
         }
 
+        self.interrupt_hook_events(resumed.to_owned()).await?;
         self.interrupt_runs(resumed).await?;
 
         Ok(())
@@ -246,12 +257,10 @@ impl Router {
         tokio::task::spawn_local(pump(handle, turn, outbound, Some((self.inbox.clone(), id))));
     }
 
-    /// Where resumed work in `thread` reports: its Discord channel, if it is one.
+    /// Where resumed work in `thread` reports: its run's record, or its Discord channel, if it is one.
     async fn outbound_for(&self, thread: &ThreadId<str>) -> Outbound {
-        match self.schedules.run_of(thread).await {
-            Ok(Some(run)) => return self.run_outbound(run),
-            Ok(None) => {}
-            Err(error) => tracing::warn!(%error, %thread, "cannot tell whether resumed work is a scheduled run"),
+        if let Some(outbound) = self.background_outbound(thread).await {
+            return outbound;
         }
 
         let detached = Outbound::Detached(self.notifier.clone());
@@ -272,6 +281,23 @@ impl Router {
         match Reply::to_channel(Arc::clone(http), &key) {
             Some(reply) => Outbound::Discord(reply),
             None => detached,
+        }
+    }
+
+    /// The outbound of a scheduled or webhook run, when `thread` belongs to one.
+    async fn background_outbound(&self, thread: &ThreadId<str>) -> Option<Outbound> {
+        match self.schedules.run_of(thread).await {
+            Ok(Some(run)) => return Some(self.run_outbound(run)),
+            Ok(None) => {}
+            Err(error) => tracing::warn!(%error, %thread, "cannot tell whether resumed work is a scheduled run"),
+        }
+
+        match self.hooks.event_of(thread).await {
+            Ok(event) => event.map(|(event, hook)| self.hook_outbound(event, hook)),
+            Err(error) => {
+                tracing::warn!(%error, %thread, "cannot tell whether resumed work is a webhook run");
+                None
+            }
         }
     }
 

@@ -2386,15 +2386,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "shade-condition"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "shade-core"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "bytes",
  "chrono",
  "chrono-tz",
  "dotenvy",
  "futures-util",
  "http",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
  "infinity-agent-core",
  "infinity-provider-protocol",
  "infinity-provider-rig",
@@ -2404,12 +2416,14 @@ dependencies = [
  "serde",
  "serde_json",
  "serenity",
+ "shade-condition",
  "shade-mcp",
  "shade-policy",
  "shade-proto",
  "shade-sandbox",
  "shade-schedule",
  "shade-store",
+ "subtle",
  "thiserror 2.0.21",
  "tokio",
  "toml",

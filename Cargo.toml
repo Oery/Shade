@@ -9,6 +9,7 @@ rust-version = "1.98.1"
 publish = false
 
 [workspace.dependencies]
+shade-condition = { path = "crates/condition" }
 shade-core = { path = "crates/core" }
 shade-mcp = { path = "crates/mcp" }
 shade-policy = { path = "crates/policy" }
@@ -17,6 +18,7 @@ shade-schedule = { path = "crates/schedule" }
 shade-sandbox = { path = "crates/sandbox" }
 shade-store = { path = "crates/store" }
 async-trait = "0.1"
+bytes = "1.12.1"
 chrono = { version = "0.4.45", default-features = false, features = ["clock", "std"] }
 chrono-tz = "0.10.4"
 croner = "=4.0.2"
@@ -26,6 +28,9 @@ futures-util = { version = "0.3.34", default-features = false }
 infinity-agent-core = "=0.2.0"
 infinity-provider-protocol = "=0.2.0"
 http = "1.5.0"
+http-body-util = "0.1.5"
+hyper = { version = "1.12.0", features = ["server", "http1"] }
+hyper-util = { version = "0.1.21", features = ["tokio"] }
 infinity-provider-rig = "=0.2.0"
 rig-core = "=0.31.0"
 rmcp = { version = "=3.8.0", default-features = false, features = ["client", "transport-child-process"] }
@@ -33,6 +38,7 @@ rap-protocol = "=0.2.0"
 rusqlite = { version = "0.41.1", features = ["bundled"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
+subtle = "2.6.1"
 serenity = { version = "0.12.5", default-features = false, features = ["client", "gateway", "model", "rustls_backend"] }
 thiserror = "2.0.21"
 toml = "0.9"

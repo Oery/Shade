@@ -76,6 +76,12 @@ pub enum Error {
     #[error("{0}")]
     McpServer(String),
 
+    #[error("{name} ([hooks.{hook}] token_env) is not set, or empty, in the environment or the .env file next to the config")]
+    HookToken { hook: String, name: String },
+
+    #[error("cannot serve webhooks on {listen} ([http] listen): {source}")]
+    Webhooks { listen: String, source: std::io::Error },
+
     #[error("cannot start the async runtime: {0}")]
     Runtime(std::io::Error),
 

@@ -44,7 +44,7 @@ const CHAT_PROMPT: &str = "You are chatting with your owner, on Discord or in a 
                            shown to them, and you will be told their decision.";
 
 /// Background runs have no reader: only `notify` reaches the owner.
-const JOBS_PROMPT: &str = "You are running a background job for your owner, started by a schedule. Nobody reads your \
+const JOBS_PROMPT: &str = "You are running a background job for your owner, started by a schedule or a webhook. Nobody reads your \
                            replies. If the result needs the owner's attention, send it with the notify tool; otherwise \
                            finish without notifying.";
 
@@ -165,8 +165,7 @@ impl ThreadConfigSource<ChannelSender, NoRapHttp> for ThreadTools {
                     None => Some(format!("{CHAT_PROMPT} {place}")),
                 }
             }
-            Origin::Schedule | Origin::Watch => Some(policy.jobs_prompt.as_deref().unwrap_or(JOBS_PROMPT).to_owned()),
-            Origin::Webhook => None,
+            Origin::Schedule | Origin::Watch | Origin::Webhook => Some(policy.jobs_prompt.as_deref().unwrap_or(JOBS_PROMPT).to_owned()),
         };
 
         Ok(config)

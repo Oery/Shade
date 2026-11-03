@@ -6,6 +6,7 @@
 pub mod conversation;
 pub mod db;
 pub mod grants;
+pub mod hooks;
 pub mod inbox;
 pub mod operations;
 pub mod roots;

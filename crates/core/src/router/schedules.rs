@@ -18,22 +18,34 @@ use crate::router::turn::Step;
 const ARCHIVE_AFTER: i64 = 24 * 3600;
 
 impl Router {
-    /// Claims every due occurrence, then starts queued runs while capacity
-    /// allows, then archives one-shot jobs that are long done.
-    #[allow(clippy::cognitive_complexity, reason = "the score comes from the expansion of three tracing macros")]
+    /// Claims every due occurrence, starts background runs while capacity
+    /// allows, then tidies up: archives one-shot jobs that are long done and
+    /// forgets old webhook events.
+    #[allow(clippy::cognitive_complexity, reason = "the score comes from the expansion of tracing macros")]
     pub async fn schedule(&self, now: DateTime<Utc>) {
         if let Err(error) = self.claim_due(now).await {
             tracing::error!(%error, "cannot claim due jobs");
         }
 
-        if let Err(error) = self.start_queued(now).await {
-            tracing::error!(%error, "cannot start queued runs");
-        }
+        self.start_background(now).await;
 
         match self.schedules.archive_done(ARCHIVE_AFTER).await {
             Ok(0) => {}
             Ok(count) => tracing::info!(count, "archived one-shot jobs that ran"),
             Err(error) => tracing::warn!(%error, "cannot archive finished jobs"),
+        }
+
+        self.prune_hook_events().await;
+    }
+
+    /// Starts queued scheduled runs, then accepted webhook events, while the shared capacity allows.
+    pub(super) async fn start_background(&self, now: DateTime<Utc>) {
+        if let Err(error) = self.start_queued(now).await {
+            tracing::error!(%error, "cannot start queued runs");
+        }
+
+        if let Err(error) = self.start_hook_events().await {
+            tracing::error!(%error, "cannot start webhook runs");
         }
     }
 

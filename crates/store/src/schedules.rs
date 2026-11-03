@@ -437,7 +437,7 @@ fn claim_occurrence(connection: &Connection, job: &str, scheduled_for: i64, next
 }
 
 fn startable_runs(connection: &mut Connection, capacity: u32) -> Result<Vec<Queued>, DbError> {
-    let running: u32 = connection.query_row("SELECT COUNT(*) FROM runs WHERE status = 'running'", [], |row| row.get(0))?;
+    let running = crate::hooks::running_background(connection)?;
 
     let sql = "SELECT r.id, s.id, s.title, s.prompt, s.timezone, r.scheduled_for
                FROM runs r JOIN schedules s ON s.id = r.schedule_id

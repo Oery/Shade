@@ -38,7 +38,9 @@ use shade_store::grants::Grants;
 
 use crate::adapters::discord::Discord;
 use crate::adapters::socket::ControlSocket;
+use crate::adapters::webhook::{Hook, Webhooks};
 use crate::config::Config;
+use crate::config::{HookConfig, HttpConfig};
 use crate::memory::Memory;
 use crate::model::Model;
 use crate::notify::Notifier;
@@ -46,6 +48,8 @@ use crate::router::{Inbound, Router};
 use crate::secrets::Secrets;
 use crate::thread_config::Services;
 use shade_mcp::{Server, Servers};
+use shade_store::hooks::{Admission, HookEvents};
+use tokio::net::TcpListener;
 
 /// Pending input between the control socket and the router.
 const INBOUND_QUEUE: usize = 16;
@@ -63,11 +67,13 @@ pub fn run(config: Option<PathBuf>) -> Result<(), Error> {
 
 async fn serve(config_path: Option<PathBuf>) -> Result<(), Error> {
     let config_path = config::path(config_path)?;
-    let Config { model, timezone, chat, jobs, hooks, limits, sandbox, mut discord, mcp, memory } = config::load(&config_path)?;
+    let Config { model, timezone, chat, jobs, hooks, http: http_config, limits, sandbox, mut discord, mcp, memory } =
+        config::load(&config_path)?;
+    let hook_caps = hooks.iter().map(|(name, hook)| (name.to_owned(), hook.caps.clone())).collect();
     let channels = discord.as_mut().map(|discord| std::mem::take(&mut discord.channels)).unwrap_or_default();
     let servers = mcp.iter().map(|(name, server)| (name.to_owned(), server.description.to_owned())).collect();
     let memory = start_memory(memory, &mcp, &config_path)?;
-    let sections = config::Sections { chat, jobs, hooks, limits, timezone, channels, servers };
+    let sections = config::Sections { chat, jobs, hooks: hook_caps, limits, timezone, channels, servers };
     let policy = config::policy(&config_path, sections)?;
     let mut secrets = Secrets::load(secrets::path_for(&config_path))?;
 
@@ -93,6 +99,7 @@ async fn serve(config_path: Option<PathBuf>) -> Result<(), Error> {
         None => None,
     };
 
+    let webhooks = start_webhooks(hooks, http_config, &mut secrets, &db, inbound.clone(), &config_path).await?;
     let socket = ControlSocket::bind(shade_proto::socket_path(&data_dir), inbound)?;
     tracing::info!(path = %socket.path().display(), model = %model.id(), "listening");
 
@@ -113,7 +120,7 @@ async fn serve(config_path: Option<PathBuf>) -> Result<(), Error> {
         return Err(Error::Recovery(source));
     }
 
-    let result = listen(&socket, &router, inbound_queue, discord).await;
+    let result = listen(&socket, &router, inbound_queue, discord, webhooks).await;
     router.shutdown().await;
 
     result
@@ -137,6 +144,52 @@ async fn start_sandbox(
     let sandbox = shade_sandbox::start(config, data_dir, config_path).await?;
 
     Ok(Some(sandbox))
+}
+
+/// The webhook server and its bound listener.
+type Served = (Arc<Webhooks>, TcpListener);
+
+/// Prepares every hook and binds the listener, or `None` with no hooks. A
+/// missing token, an invalid condition, or a taken address stops startup.
+async fn start_webhooks(
+    hooks: BTreeMap<String, HookConfig>, http: HttpConfig, secrets: &mut Secrets, db: &Db, inbound: mpsc::Sender<Inbound>, path: &Path,
+) -> Result<Option<Served>, Error> {
+    if hooks.is_empty() {
+        return Ok(None);
+    }
+
+    let mut served = BTreeMap::new();
+
+    for (name, hook) in hooks {
+        let token = match secrets.take(&hook.token_env) {
+            Some(token) if !token.is_empty() => token,
+            _ => return Err(Error::HookToken { hook: name, name: hook.token_env }),
+        };
+
+        if let Some(Err(message)) = hook.condition.as_ref().map(shade_condition::Condition::validate) {
+            return Err(Error::ConfigInvalid { path: path.to_owned(), message: format!("[hooks.{name}] condition: {message}") });
+        }
+
+        let admission = Admission { queued: hook.max_queued, per_minute: hook.max_per_minute };
+        let hook = Hook { token, template: hook.template, condition: hook.condition, delivery_header: hook.delivery_header, admission };
+        served.insert(name, hook);
+    }
+
+    let listener = match TcpListener::bind(&http.listen).await {
+        Ok(listener) => listener,
+        Err(source) => return Err(Error::Webhooks { listen: http.listen, source }),
+    };
+
+    tracing::info!(listen = %http.listen, hooks = served.len(), "serving webhooks");
+
+    Ok(Some((Arc::new(Webhooks::new(served, HookEvents::new(db.clone()), inbound)), listener)))
+}
+
+async fn serve_webhooks(webhooks: Option<Served>) {
+    match webhooks {
+        Some((webhooks, listener)) => webhooks.serve(listener).await,
+        None => std::future::pending().await,
+    }
 }
 
 /// Checks `[memory]` against the configured servers. A bad section stops startup.
@@ -196,7 +249,9 @@ fn notifications(discord: &Discord, db: &Db) -> Notifier {
 
 /// Serves new input until a shutdown signal. The Discord gateway starts
 /// here, after resumed work, so a new message cannot overtake it.
-async fn listen(socket: &ControlSocket, router: &Router, inbound: mpsc::Receiver<Inbound>, discord: Option<Discord>) -> Result<(), Error> {
+async fn listen(
+    socket: &ControlSocket, router: &Router, inbound: mpsc::Receiver<Inbound>, discord: Option<Discord>, webhooks: Option<Served>,
+) -> Result<(), Error> {
     let shards = discord.as_ref().map(Discord::shards);
 
     if let Some(discord) = discord {
@@ -206,6 +261,7 @@ async fn listen(socket: &ControlSocket, router: &Router, inbound: mpsc::Receiver
     let result = tokio::select! {
         () = socket.serve() => Ok(()),
         () = router.serve(inbound) => Ok(()),
+        () = serve_webhooks(webhooks) => Ok(()),
         result = shutdown_signal() => result,
     };
 
