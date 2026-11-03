@@ -8,6 +8,7 @@ mod lock;
 mod model;
 mod policy;
 mod router;
+mod sandbox;
 mod secrets;
 mod store;
 #[cfg(test)]
@@ -47,7 +48,7 @@ pub fn run(config: Option<PathBuf>) -> Result<(), Error> {
 
 async fn serve(config_path: Option<PathBuf>) -> Result<(), Error> {
     let config_path = config::path(config_path)?;
-    let Config { model, timezone, chat, hooks, limits } = config::load(&config_path)?;
+    let Config { model, timezone, chat, hooks, limits, sandbox } = config::load(&config_path)?;
     let policy = config::policy(&config_path, chat, hooks, limits, timezone)?;
     let mut secrets = Secrets::load(secrets::path_for(&config_path))?;
 
@@ -59,6 +60,9 @@ async fn serve(config_path: Option<PathBuf>) -> Result<(), Error> {
 
     // Declared before the socket so the socket file is removed while the lock is still held.
     let _lock = lock::acquire(&data_dir)?;
+
+    // Probed now so a broken sandbox stops the daemon; the shell tool will run commands through it.
+    let _sandbox = sandbox::start(sandbox, &policy, &data_dir, &config_path).await?;
     let model = Model::new(model, &mut secrets)?;
     let db = Db::open(&data_dir.join(db::DB_FILE))?;
 

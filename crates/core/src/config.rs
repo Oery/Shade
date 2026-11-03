@@ -23,6 +23,8 @@ pub struct Config {
     pub hooks: BTreeMap<String, HookConfig>,
     #[serde(default)]
     pub limits: Limits,
+    /// Where `shell` runs. Required when any origin holds `shell`.
+    pub sandbox: Option<SandboxConfig>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -38,6 +40,29 @@ pub struct ChatConfig {
 #[serde(deny_unknown_fields)]
 pub struct HookConfig {
     pub caps: Caps,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SandboxConfig {
+    /// Host directory mounted read-write at `/workspace`, the shell's working directory.
+    pub workspace: PathBuf,
+    /// Host directory mounted read-write at `/vault`, only for roots granted `vault`.
+    pub vault: Option<PathBuf>,
+    /// Variables copied from the daemon's environment. Everything else is cleared.
+    #[serde(default)]
+    pub env: Vec<String>,
+    #[serde(default)]
+    pub isolation: Isolation,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Isolation {
+    #[default]
+    Bubblewrap,
+    /// Development only: shell commands run on the host with the owner's full authority.
+    Off,
 }
 
 #[derive(Debug, Deserialize)]

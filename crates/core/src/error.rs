@@ -2,6 +2,8 @@ use std::path::PathBuf;
 
 use thiserror::Error;
 
+use crate::sandbox::SandboxError;
+
 pub type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
 #[derive(Debug, Error)]
@@ -56,6 +58,9 @@ pub enum Error {
 
     #[error("cannot set up the model: {0}")]
     Model(BoxError),
+
+    #[error(transparent)]
+    Sandbox(#[from] SandboxError),
 
     #[error("cannot start the async runtime: {0}")]
     Runtime(std::io::Error),

@@ -33,6 +33,21 @@ max_output_tokens = 128000
 caps = ["now"]
 # prompt = "You are chatting with your owner."
 
+# Where `shell` runs. Required when any origin holds `shell`; the daemon
+# checks it at startup by running a command in it, and refuses to start if
+# that fails. Commands see the system read-only, the workspace at /workspace,
+# a private /tmp, and nothing else from your home or Shade's directories.
+# Neither path may overlap Shade's config, data, or executable directories,
+# or contain your home directory.
+# [sandbox]
+# workspace = "/home/me/shade-workspace"
+# Mounted at /vault only for conversations that hold the `vault` capability.
+# vault = "/home/me/notes"
+# Variables copied from the daemon's environment; everything else is cleared.
+# env = ["LANG"]
+# Development only: run commands on the host with your full authority.
+# isolation = "off"
+
 # Webhook sources. Hooks can never hold `schedules` or `watches`.
 # [hooks.github]
 # caps = ["now", "notify"]

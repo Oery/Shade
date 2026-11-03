@@ -28,7 +28,6 @@ uuid.workspace = true
 
 [dev-dependencies]
 infinity-provider-protocol = { workspace = true, features = ["mock"] }
-tokio = { workspace = true, features = ["time"] }
 
 [lints]
 workspace = true

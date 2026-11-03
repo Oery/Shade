@@ -163,6 +163,11 @@ impl Policy {
         Ok(())
     }
 
+    /// Whether any root can hold `cap`. Jobs never exceed owner chat.
+    pub fn grants_anywhere(&self, cap: Cap) -> bool {
+        self.chat.contains(&cap) || self.hooks.values().any(|caps| caps.contains(&cap))
+    }
+
     /// The capabilities `grant` holds under this policy. `None` means its
     /// source is gone (a deleted hook) and the root must not run.
     pub fn effective(&self, grant: &Grant) -> Option<Caps> {

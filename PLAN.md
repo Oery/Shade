@@ -129,7 +129,8 @@ crates/
         watch.rs
         notify.rs
         now.rs
-      sandbox.rs            bubblewrap policy and process cleanup
+      sandbox.rs            bubblewrap mounts, environment, bounded runs, startup probe
+      sandbox/paths.rs      protected-path validation
       adapters/
         socket.rs           control socket server
         discord.rs
@@ -592,6 +593,8 @@ Each milestone is one reviewable PR. `Check` is a manual demonstration; `Tests` 
 - **Scope:** bubblewrap policy, protected-path validation, clean environment, grant-dependent vault mount, network isolation, bounded child lifecycle, Arch/NixOS path support, and explicit development opt-out.
 - **Check:** run a fixed test command that writes the workspace.
 - **Tests:** real bubblewrap integration tests for hidden Shade/secret paths, shell-without-vault, private process visibility, absent control sockets (including `shade.sock`), no network without `shell_network`, path overlap rejection, and descendants that try to detach. Missing/broken sandbox fails closed.
+- **Done:** `[sandbox]` holds `workspace`, optional `vault`, an `env` pass-through list, and `isolation = "off"` as the development opt-out (logged as a warning). It is required and checked only when some origin holds `shell`. Paths are canonicalized (symlinks cannot point into protected paths) and may not overlap the data directory, the config directory, or the directory holding `shaded`, nor contain `$HOME`; the vault and workspace may not overlap each other. `bwrap` is found on `PATH` once and run with a cleared environment: `--unshare-all` (network added back with `--share-net`), `--die-with-parent`, `--new-session`, `--clearenv`, fixed `PATH`/`HOME=/workspace`/`TMPDIR`. System paths (`/usr`, `/bin`, `/lib*`, `/nix/store`, `/run/current-system`) are mounted read-only with top-level symlinks recreated, so merged-`/usr` and NixOS layouts both resolve; a short list of `/etc` entries is bound read-only following symlinks. The startup probe writes `/workspace/.shade-probe` and reads it back on the host, so a `bwrap` that exits 0 without running anything is refused. `Sandbox::run` keeps the first 16 KiB of each stream while draining the rest, and on timeout kills `bwrap`, which takes the PID namespace with it; head/tail capture and truncation counts are M7. The `vault` capability does not exist until MCP caps (M13), so callers pass `Access::vault` explicitly. Only Arch was exercised; the NixOS layout follows the same rules but is untested.
+- **Finding for M7:** `--die-with-parent` uses `PR_SET_PDEATHSIG`, which fires when the spawning *thread* exits. Spawn shell commands from the core thread, never from a short-lived blocking thread. Abrupt daemon death cleanup still needs its subprocess test.
 
 ### M7 — Shell tool and initial operation recovery
 
