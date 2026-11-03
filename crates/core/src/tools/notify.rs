@@ -33,9 +33,6 @@ use crate::tools;
 /// Longest message, in UTF-16 units, so the notice fits in one Discord message.
 const MAX_MESSAGE: usize = 1800;
 
-/// Marks a notice in the owner's DMs, which are also a chat conversation.
-const PREFIX: &str = "🔔 ";
-
 pub struct Notify {
     work: Arc<Work>,
     description: String,
@@ -162,7 +159,7 @@ impl Work {
             return answer;
         }
 
-        let text = match notifier.send(destination, format!("{PREFIX}{message}")).await {
+        let text = match notifier.send(destination, message).await {
             Ok(()) => "Sent to the owner.".to_owned(),
             Err(error) => format!("Error: {error}"),
         };
@@ -295,7 +292,7 @@ mod tests {
         };
 
         // A terminal conversation's notice goes to the owner's DMs.
-        assert_eq!((text.as_str(), destination), ("🔔 done", Destination::Owner));
+        assert_eq!((text.as_str(), destination), ("done", Destination::Owner));
 
         if !confirmed {
             return Ok((queue, Some(ack)));
