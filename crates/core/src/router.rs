@@ -35,8 +35,9 @@ use crate::store::inbox::{Inbox, Input};
 use crate::store::operations::Operations;
 use crate::store::roots::{Adapter, Roots, Target};
 use crate::store::state::States;
+use crate::store::usage::Usages;
 use crate::thread_config::ThreadTools;
-use crate::tools;
+use crate::{tools, usage};
 
 /// Capacity of each reply stream between the router and a socket connection.
 pub const REPLY_QUEUE: usize = 64;
@@ -56,6 +57,8 @@ pub enum Inbound {
     },
     /// Points a conversation name at a fresh root.
     NewConversation { adapter: Adapter, key: String, reply: mpsc::Sender<Response> },
+    /// Token usage by conversation.
+    Usage { reply: mpsc::Sender<Response> },
 }
 
 /// Where a turn's output goes. The turn runs to its end either way.
@@ -87,6 +90,7 @@ pub struct Router {
     inbox: Inbox,
     roots: Roots,
     operations: Operations,
+    usages: Usages,
     system: System,
     /// For replies to resumed work in Discord conversations.
     discord: Option<Arc<Http>>,
@@ -98,7 +102,7 @@ impl Router {
         let authority = Authority::new(Grants::new(db.clone()), policy);
         let conversations = Conversations::new(db.clone());
         let tools = ThreadTools::new(conversations.clone(), authority.clone(), Operations::new(db.clone()), sandbox);
-        let model = Metered::new(model, authority);
+        let model = Metered::new(model, authority, Usages::new(db.clone()));
         let builder = AgentSystemBuilder::new_local(conversations, States::new(db.clone()), model);
         let system = builder.without_builtin_tools().thread_config(tools).start();
 
@@ -109,8 +113,9 @@ impl Router {
         let inbox = Inbox::new(db.clone());
         let roots = Roots::new(db.clone());
         let operations = Operations::new(db.clone());
+        let usages = Usages::new(db.clone());
 
-        Self { db, inbox, roots, operations, system, discord }
+        Self { db, inbox, roots, operations, usages, system, discord }
     }
 
     /// Handles input until the channel closes. Must run inside a `LocalSet`.
@@ -121,6 +126,7 @@ impl Router {
                     self.prompt(adapter, target, text, source_key, outbound).await;
                 }
                 Inbound::NewConversation { adapter, key, reply } => self.new_conversation(adapter, key, reply).await,
+                Inbound::Usage { reply } => self.usage(reply).await,
             }
         }
     }
@@ -215,6 +221,20 @@ impl Router {
             Ok(Some(handle)) => Ok(handle),
             Ok(None) => Err(format!("conversation {root} is missing")),
             Err(error) => Err(format!("cannot attach to conversation {root}: {error}")),
+        }
+    }
+
+    async fn usage(&self, reply: mpsc::Sender<Response>) {
+        let text = match self.usages.by_conversation(usage::SHOWN).await {
+            Ok(conversations) => usage::render(&conversations),
+            Err(error) => {
+                let _ = reply.send(Response::Error { message: format!("cannot read usage: {error}") }).await;
+                return;
+            }
+        };
+
+        if reply.send(Response::Text { text }).await.is_ok() {
+            let _ = reply.send(Response::Done).await;
         }
     }
 

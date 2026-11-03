@@ -96,6 +96,10 @@ pub struct ModelConfig {
     pub session_header: Option<String>,
     pub context_window: usize,
     pub max_output_tokens: u64,
+    /// History size, in tokens, past which a conversation is summarized.
+    /// Every turn resends the whole history, so this bounds what a turn
+    /// costs. 100k (or 75% of the window, if smaller) when absent.
+    pub compact_at_tokens: Option<usize>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize)]

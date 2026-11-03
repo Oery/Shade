@@ -16,6 +16,7 @@ mod store;
 mod testing;
 mod thread_config;
 mod tools;
+mod usage;
 
 use std::path::PathBuf;
 use std::sync::Arc;

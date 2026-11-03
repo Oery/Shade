@@ -11,6 +11,10 @@ id = "claude-opus-5-5"
 api_key_env = "ANTHROPIC_API_KEY"
 context_window = 1000000
 max_output_tokens = 128000
+# Every message resends the whole conversation, so its size is what a turn
+# costs. Past this many tokens the conversation is summarized. Defaults to
+# 100k, or 75% of context_window if that is smaller.
+# compact_at_tokens = 100000
 
 # OpenCode Go subscription instead (https://opencode.ai/docs/en/go/).
 # Use the API format the model page lists: `openai_compatible` with

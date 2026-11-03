@@ -25,6 +25,7 @@ use crate::store::db::Db;
 use crate::store::grants::Grants;
 use crate::store::operations::Operations;
 use crate::store::state::States;
+use crate::store::usage::Usages;
 use crate::thread_config::ThreadTools;
 
 pub type System = LaunchingSystem<Conversations, States, NoRapHttp>;
@@ -76,7 +77,7 @@ pub async fn start_sandboxed(db: &Db, policy: Arc<Policy>, sandbox: Option<Arc<S
     let authority = Authority::new(Grants::new(db.clone()), policy);
     let conversations = Conversations::new(db.clone());
     let tools = ThreadTools::new(conversations.clone(), authority.clone(), Operations::new(db.clone()), sandbox);
-    let metered = Metered::new(static_model, authority.clone());
+    let metered = Metered::new(static_model, authority.clone(), Usages::new(db.clone()));
     let builder = AgentSystemBuilder::new_local(conversations.clone(), States::new(db.clone()), metered);
     let system = builder.without_builtin_tools().thread_config(tools).start();
 

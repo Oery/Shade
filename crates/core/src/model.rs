@@ -26,11 +26,17 @@ use crate::secrets::Secrets;
 /// Gateways ask clients to identify themselves rather than as a generic HTTP library.
 const AGENT: &str = concat!("shade/", env!("CARGO_PKG_VERSION"));
 
+/// Where conversations are summarized unless the config says otherwise.
+const DEFAULT_COMPACT_AT: usize = 100_000;
+
 pub struct Model {
     config: ModelConfig,
     api_key: String,
     session_header: Option<HeaderName>,
     http: ReqwestClient,
+    /// The window Infinity is told about. It is used only to trigger
+    /// compaction, at 75% of it, so it encodes the compaction budget.
+    compaction_window: usize,
 }
 
 impl Model {
@@ -48,7 +54,9 @@ impl Model {
             None => None,
         };
 
-        Ok(Self { config, api_key, session_header, http: ReqwestClient::new() })
+        let compaction_window = compaction_window(config.context_window, config.compact_at_tokens)?;
+
+        Ok(Self { config, api_key, session_header, http: ReqwestClient::new(), compaction_window })
     }
 
     pub fn id(&self) -> &str {
@@ -121,10 +129,23 @@ impl ModelSource for Model {
         Ok(ResolvedModel {
             provider,
             model_id: self.config.id.to_owned(),
-            context_window: self.config.context_window,
+            context_window: self.compaction_window,
             supports_image_input: true,
         })
     }
+}
+
+/// The window to report to Infinity so that it compacts at `compact_at`
+/// tokens: it compacts once a request passes 75% of the window.
+fn compaction_window(context_window: usize, compact_at: Option<usize>) -> Result<usize, Error> {
+    let limit = context_window / 4 * 3;
+    let compact_at = compact_at.unwrap_or(DEFAULT_COMPACT_AT.min(limit));
+
+    if compact_at == 0 || compact_at > limit {
+        return Err(Error::CompactionBudget { compact_at, limit });
+    }
+
+    Ok(compact_at / 3 * 4)
 }
 
 /// Sets `max_tokens` on every request.
@@ -143,5 +164,28 @@ impl<M: CompletionModel> CompletionModel for MaxTokens<M> {
         request.max_tokens = Some(self.max_tokens);
 
         self.inner.stream(request).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::compaction_window;
+
+    /// Infinity compacts past 75% of the window it is given.
+    #[test]
+    fn compaction_budget_stays_inside_the_model_window() {
+        let cases = [
+            (1_000_000, None, Some(133_332)),
+            // A small model compacts at 75% of its own window, as before.
+            (100_000, None, Some(100_000)),
+            (1_000_000, Some(30_000), Some(40_000)),
+            (1_000_000, Some(750_000), Some(1_000_000)),
+            (1_000_000, Some(750_001), None),
+            (1_000_000, Some(0), None),
+        ];
+
+        for (window, compact_at, expected) in cases {
+            assert_eq!(compaction_window(window, compact_at).ok(), expected, "window {window}, compact_at {compact_at:?}");
+        }
     }
 }

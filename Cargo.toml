@@ -16,6 +16,7 @@ chrono = { version = "0.4.45", default-features = false, features = ["clock", "s
 chrono-tz = "0.10.4"
 clap = { version = "4.6.7", features = ["derive"] }
 dotenvy = "0.15.7"
+futures-util = { version = "0.3.34", default-features = false }
 infinity-agent-core = "=0.2.0"
 infinity-provider-protocol = "=0.2.0"
 http = "1.5.0"

@@ -57,6 +57,9 @@ pub enum Error {
     #[error("cannot start the database worker: {0}")]
     DatabaseWorker(std::io::Error),
 
+    #[error("model.compact_at_tokens is {compact_at}; it must be between 1 and {limit} (75% of context_window)")]
+    CompactionBudget { compact_at: usize, limit: usize },
+
     #[error("cannot set up the model: {0}")]
     Model(BoxError),
 

@@ -175,6 +175,7 @@ async fn handle(stream: UnixStream, owner_uid: u32, inbound: mpsc::Sender<Inboun
             let new = |reply| Inbound::NewConversation { adapter: Adapter::Terminal, key: conversation, reply };
             forward(new, &inbound, &mut write).await
         }
+        Request::Usage => forward(|reply| Inbound::Usage { reply }, &inbound, &mut write).await,
         other => write_message(&mut write, &not_implemented(other)).await,
     }
 }

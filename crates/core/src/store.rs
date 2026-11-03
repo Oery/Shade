@@ -7,6 +7,7 @@ pub mod inbox;
 pub mod operations;
 pub mod roots;
 pub mod state;
+pub mod usage;
 
 #[cfg(test)]
 mod tests;

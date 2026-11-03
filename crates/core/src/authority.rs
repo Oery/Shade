@@ -9,15 +9,19 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use futures_util::StreamExt;
 use infinity_agent_core::ThreadId;
 use infinity_agent_core::system::{ModelSource, ResolvedModel};
-use infinity_provider_protocol::{CompletionError, CompletionRequest, ErrorClass, ModelEntry, ModelProvider, ModelStream};
+use infinity_provider_protocol::{
+    CompletionError, CompletionRequest, ErrorClass, FinalResponse, ModelEntry, ModelProvider, ModelStream, StreamChunk, Usage,
+};
 use thiserror::Error;
 
 use crate::error::BoxError;
 use crate::policy::{Cap, Caps, Charge, Origin, Policy};
 use crate::store::db::DbError;
 use crate::store::grants::{Grants, Refusal};
+use crate::store::usage::Usages;
 
 #[derive(Debug, Error)]
 pub enum Denied {
@@ -104,15 +108,17 @@ impl Authority {
     }
 }
 
-/// A model source whose every provider request is admitted first.
+/// A model source whose every provider request is admitted first, and
+/// whose reported token usage is recorded.
 pub struct Metered<S> {
     inner: S,
     authority: Authority,
+    usages: Usages,
 }
 
 impl<S> Metered<S> {
-    pub fn new(inner: S, authority: Authority) -> Self {
-        Self { inner, authority }
+    pub fn new(inner: S, authority: Authority, usages: Usages) -> Self {
+        Self { inner, authority, usages }
     }
 }
 
@@ -121,7 +127,12 @@ impl<S: ModelSource> ModelSource for Metered<S> {
     async fn resolve(&self, thread_id: &ThreadId<str>) -> Result<ResolvedModel, BoxError> {
         let mut model = self.inner.resolve(thread_id).await?;
 
-        let provider = MeteredProvider { inner: model.provider, thread: thread_id.to_owned(), authority: self.authority.clone() };
+        let provider = MeteredProvider {
+            inner: model.provider,
+            thread: thread_id.to_owned(),
+            authority: self.authority.clone(),
+            usages: self.usages.clone(),
+        };
         model.provider = Arc::new(provider);
 
         Ok(model)
@@ -132,6 +143,7 @@ struct MeteredProvider {
     inner: Arc<dyn ModelProvider>,
     thread: ThreadId,
     authority: Authority,
+    usages: Usages,
 }
 
 #[async_trait]
@@ -146,8 +158,27 @@ impl ModelProvider for MeteredProvider {
             return Err(CompletionError::provider(ErrorClass::Fatal, denied.to_string()));
         }
 
-        self.inner.invoke_model(model_id, request).await
+        let stream = self.inner.invoke_model(model_id, request).await?;
+        let (usages, thread, model) = (self.usages.clone(), self.thread.as_str().to_owned(), model_id.to_owned());
+
+        let recorded = stream.inspect(move |chunk| {
+            if let Ok(StreamChunk::Final(FinalResponse { usage: Some(usage) })) = chunk {
+                record(usages.clone(), thread.to_owned(), model.to_owned(), *usage);
+            }
+        });
+
+        Ok(Box::pin(recorded))
     }
+}
+
+/// Usage is a record for the owner, not a gate: writing it must not hold up
+/// the stream, and losing it to a storage error only costs the record.
+fn record(usages: Usages, thread: String, model: String, usage: Usage) {
+    tokio::spawn(async move {
+        if let Err(error) = usages.record(thread, model, usage).await {
+            tracing::warn!(%error, "cannot record token usage");
+        }
+    });
 }
 
 #[cfg(test)]
@@ -156,6 +187,8 @@ mod tests {
     use infinity_agent_core::message::InputMessage;
     use infinity_agent_core::system::AgentEvent;
     use infinity_agent_core::traits::InputSender;
+    use infinity_provider_protocol::Usage;
+    use rusqlite::OptionalExtension;
 
     use super::Denied;
     use crate::error::BoxError;
@@ -229,6 +262,43 @@ mod tests {
                 |event| matches!(event, AgentEvent::Info { text } if text.contains("max_completion_rounds limit")),
             )
             .await;
+
+            Ok(())
+        })
+        .await
+    }
+
+    /// Every provider request's usage is recorded, and a turn past 75% of the
+    /// window Infinity is given compacts: the budget Shade sets there holds.
+    #[tokio::test(flavor = "current_thread")]
+    async fn usage_is_recorded_and_large_turns_compact() -> Result<(), BoxError> {
+        within(async {
+            let db = Db::in_memory()?;
+            let mut harness = testing::start(&db).await?;
+            harness.conversations.register_root(&root()).await?;
+            let handle = attach(&mut harness, &root()).await?;
+
+            handle.send(InputMessage::user_text(root(), "hi"), "input-1").await?;
+            harness.model.next_request().await;
+            harness.model.send_text("hello");
+
+            // The harness window is 100k tokens.
+            let usage = Usage { input_tokens: 76_000, output_tokens: 10, total_tokens: 76_010, ..Usage::default() };
+            harness.model.finish_with_usage(Some(usage));
+
+            let request = harness.model.next_request().await;
+            assert!(
+                request.tools.iter().any(|tool| tool.name == "close_thread"),
+                "a turn past the budget did not compact"
+            );
+
+            let sql = "SELECT input_tokens FROM usage";
+
+            while db.call(move |connection| Ok(connection.query_row(sql, [], |row| row.get::<_, i64>(0)).optional()?)).await?
+                != Some(76_000)
+            {
+                tokio::task::yield_now().await;
+            }
 
             Ok(())
         })
