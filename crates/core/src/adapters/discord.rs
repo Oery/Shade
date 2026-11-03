@@ -8,6 +8,9 @@
 //! Notifications go to the first owner's DMs, which are also that owner's
 //! DM conversation with the bot.
 //!
+//! `/new` is a slash command, and a change waiting for approval carries
+//! Approve and Reject buttons (see `interactions`).
+//!
 //! Discord gives a bot a role with its own name, and "@Shade" in autocomplete
 //! may pick that role instead of the bot. A mention of the bot's role counts
 //! as a mention of the bot. Discord withholds the text of such messages
@@ -16,21 +19,24 @@
 use std::num::NonZeroU64;
 use std::sync::{Arc, OnceLock};
 
+mod interactions;
+
 use serenity::all::{
-    ChannelId, Client, Context, CreateAllowedMentions, CreateMessage, EventHandler, GatewayIntents, Http, HttpError, Message, MessageId,
-    Ready, ShardManager, Typing, UserId,
+    ChannelId, Client, Context, CreateAllowedMentions, CreateMessage, EventHandler, GatewayIntents, Http, HttpError, Interaction, Message,
+    MessageId, Ready, ShardManager, Typing, UserId,
 };
 use serenity::async_trait;
-use shade_proto::{Manage, Response};
+
 use thiserror::Error;
 use tokio::sync::mpsc;
 
 use crate::config::DiscordConfig;
 use crate::notify::{Destination, Failure, Notice};
 use crate::router::turn::Step;
-use crate::router::{Inbound, Outbound, REPLY_QUEUE};
+use crate::router::{Inbound, Outbound};
 use crate::secrets::Secrets;
 use crate::store::roots::{Adapter, Target};
+use crate::tools::Shown;
 
 /// Discord's message limit is 2000 characters; counting UTF-16 units stays
 /// under it however Discord counts.
@@ -38,13 +44,6 @@ const MESSAGE_LIMIT: usize = 2000;
 
 /// Most reply text kept between posts. The rest of a runaway reply is dropped.
 const MAX_BUFFER: usize = 16 * 1024;
-
-/// Typed in Discord to start a fresh conversation in the channel.
-const NEW_CONVERSATION: &str = "/new";
-
-/// Typed in Discord, with a code, to apply a change owner chat proposed.
-/// Handled here, so the model can never approve its own change.
-const APPROVE: &str = "/approve ";
 
 #[derive(Debug, Error)]
 pub enum DiscordError {
@@ -122,9 +121,17 @@ struct Handler {
 
 #[async_trait]
 impl EventHandler for Handler {
-    async fn ready(&self, _context: Context, ready: Ready) {
-        let _ = self.bot.set(ready.user.id.get());
+    /// Slash commands are registered on the first connection only, not on each reconnect.
+    async fn ready(&self, context: Context, ready: Ready) {
         tracing::info!(user = %ready.user.name, "connected to Discord");
+
+        if self.bot.set(ready.user.id.get()).is_ok() {
+            interactions::register(&context.http).await;
+        }
+    }
+
+    async fn interaction_create(&self, context: Context, interaction: Interaction) {
+        self.interaction(context, interaction).await;
     }
 
     async fn message(&self, context: Context, message: Message) {
@@ -148,20 +155,6 @@ impl EventHandler for Handler {
             ignored(&message, incoming.mentions_bot);
             return;
         };
-
-        if text == NEW_CONVERSATION {
-            let (reply, replies) = mpsc::channel(REPLY_QUEUE);
-            let input = Inbound::NewConversation { adapter: Adapter::Discord, key: message.channel_id.to_string(), reply };
-            self.command(&context.http, message.channel_id, input, replies).await;
-            return;
-        }
-
-        if let Some(code) = text.strip_prefix(APPROVE) {
-            let (reply, replies) = mpsc::channel(REPLY_QUEUE);
-            let input = Inbound::Schedule { action: Manage::Approve { code: code.trim().to_owned() }, reply };
-            self.command(&context.http, message.channel_id, input, replies).await;
-            return;
-        }
 
         let answering = incoming.in_guild.then_some(message.id);
         let reply = Reply::new(Arc::clone(&context.http), message.channel_id, answering);
@@ -195,23 +188,6 @@ impl Handler {
         let role = roles.values().find(|role| role.tags.bot_id.is_some_and(|id| id.get() == bot))?;
 
         message.mention_roles.contains(&role.id).then(|| role.id.get())
-    }
-
-    /// Runs a command the adapter handles itself and posts its answer.
-    async fn command(&self, http: &Arc<Http>, channel: ChannelId, input: Inbound, mut replies: mpsc::Receiver<Response>) {
-        if self.inbound.send(input).await.is_err() {
-            return;
-        }
-
-        while let Some(response) = replies.recv().await {
-            let text = match response {
-                Response::Text { text } => text,
-                Response::Error { message } => format!("⚠️ {message}"),
-                Response::Done => return,
-            };
-
-            post(http, channel, &text, None).await;
-        }
     }
 }
 
@@ -311,12 +287,9 @@ impl Reply {
                 self.flush().await;
                 post(&self.http, self.channel, &format!("⚠️ {message}"), self.answering.take()).await;
             }
-            Step::Receipt(text) => {
+            Step::Shown(shown) => {
                 self.flush().await;
-
-                for chunk in chunks(&text, MESSAGE_LIMIT) {
-                    post(&self.http, self.channel, &chunk, self.answering.take()).await;
-                }
+                self.show(shown).await;
             }
             Step::Superseded => self.buffer.clear(),
         }
@@ -331,6 +304,33 @@ impl Reply {
         let kept = &text[..text.floor_char_boundary(room)];
         self.buffer.push_str(kept);
         self.truncated |= kept.len() < text.len();
+    }
+
+    /// Posts Shade's own text; a change waiting for approval gets its buttons under the last part.
+    async fn show(&mut self, shown: Shown) {
+        let (text, code) = match shown {
+            Shown::Receipt(text) => (text, None),
+            Shown::Approval { text, code } => (text, Some(code)),
+        };
+
+        let mut parts = chunks(&text, MESSAGE_LIMIT);
+        let last = parts.pop();
+
+        for part in parts {
+            post(&self.http, self.channel, &part, self.answering.take()).await;
+        }
+
+        let Some(last) = last else {
+            return;
+        };
+
+        let mut message = message(&last, self.channel, self.answering.take());
+
+        if let Some(code) = code {
+            message = message.components(interactions::approval_buttons(&code));
+        }
+
+        send(&self.http, self.channel, message).await;
     }
 
     async fn flush(&mut self) {
@@ -370,12 +370,20 @@ async fn post_notices(http: Arc<Http>, owner: UserId, mut queue: mpsc::Receiver<
 }
 
 async fn post(http: &Http, channel: ChannelId, text: &str, answering: Option<MessageId>) {
-    let mut message = CreateMessage::new().content(text).allowed_mentions(CreateAllowedMentions::new().replied_user(false));
+    send(http, channel, message(text, channel, answering)).await;
+}
 
-    if let Some(id) = answering {
-        message = message.reference_message((channel, id));
+/// A message that pings nobody, under the one it answers if any.
+fn message(text: &str, channel: ChannelId, answering: Option<MessageId>) -> CreateMessage {
+    let message = CreateMessage::new().content(text).allowed_mentions(CreateAllowedMentions::new().replied_user(false));
+
+    match answering {
+        Some(id) => message.reference_message((channel, id)),
+        None => message,
     }
+}
 
+async fn send(http: &Http, channel: ChannelId, message: CreateMessage) {
     if let Err(error) = channel.send_message(http, message).await {
         tracing::warn!(%error, %channel, "cannot post to Discord");
     }

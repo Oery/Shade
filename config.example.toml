@@ -55,7 +55,8 @@ caps = ["now"]
 # isolation = "off"
 
 # Owner chat over Discord: DMs, and messages that mention the bot in server
-# channels. Each channel is its own conversation; `/new` starts a fresh one.
+# channels. Each channel is its own conversation; the `/new` slash command
+# starts a fresh one.
 # Replies in a server channel are visible to everyone in it, so keep private
 # work in DMs. Enable the Message Content intent for the bot in the Developer
 # Portal: Discord hides the text of messages that mention the bot's role.
@@ -94,8 +95,8 @@ caps = ["now"]
 # reads its replies and to use `notify` when the owner should know.
 # prompt = "You are running a background job."
 # Owner chat creates and changes jobs alone while they hold only these caps.
-# A job holding more waits for `/approve <code>` in Discord or
-# `shade schedule approve <code>`. Default:
+# A job holding more waits for the owner: Approve and Reject buttons in
+# Discord, or `shade schedule approve <code>` / `reject <code>`. Default:
 # agent_caps = ["now", "notify"]
 
 # Webhook sources. Hooks can never hold `schedules` or `watches`.

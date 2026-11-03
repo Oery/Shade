@@ -57,6 +57,8 @@ enum Manage {
     Rm { id: String },
     /// Apply a change owner chat proposed, by the code in its receipt.
     Approve { code: String },
+    /// Drop a change owner chat proposed.
+    Reject { code: String },
 }
 
 #[derive(Subcommand)]
@@ -73,6 +75,7 @@ impl From<Manage> for shade_proto::Manage {
             Manage::Resume { id } => Self::Resume { id },
             Manage::Rm { id } => Self::Rm { id },
             Manage::Approve { code } => Self::Approve { code },
+            Manage::Reject { code } => Self::Reject { code },
         }
     }
 }

@@ -219,7 +219,7 @@ pub fn list(jobs: &[Job], waiting: &[Waiting]) -> String {
     }
 
     if !waiting.is_empty() {
-        text.push_str("Waiting for the owner's approval (`/approve <code>` or `shade schedule approve <code>`):\n");
+        text.push_str("Waiting for the owner's approval (the buttons in Discord, or `shade schedule approve <code>`):\n");
     }
 
     for change in waiting {

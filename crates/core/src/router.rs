@@ -43,6 +43,7 @@ use crate::store::schedules::{Run, Schedules};
 use crate::store::state::States;
 use crate::store::usage::Usages;
 use crate::thread_config::{Services, ThreadTools};
+use crate::tools::Shown;
 use crate::{tools, usage};
 
 /// Capacity of each reply stream between the router and a socket connection.
@@ -359,7 +360,10 @@ fn response_for(step: Step) -> Option<Response> {
         Step::Paused => None,
         Step::Done => Some(Response::Done),
         Step::Failed(message) => Some(Response::Error { message }),
-        Step::Receipt(text) => Some(Response::Text { text: format!("\n{text}\n") }),
+        Step::Shown(Shown::Receipt(text)) => Some(Response::Text { text: format!("\n{text}\n") }),
+        Step::Shown(Shown::Approval { text, code }) => Some(Response::Text {
+            text: format!("\n{text}\nApprove with `shade schedule approve {code}`, or drop it with `shade schedule reject {code}`.\n"),
+        }),
         Step::Superseded => Some(Response::Error { message: SUPERSEDED.to_owned() }),
     }
 }

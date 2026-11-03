@@ -298,6 +298,13 @@ impl Schedules {
         self.db.call(move |connection| pending_change(connection, &code)).await
     }
 
+    /// Drops a proposed change. `false` when none waits under `code`.
+    pub async fn reject(&self, code: &str) -> Result<bool, DbError> {
+        let code = code.to_owned();
+
+        self.db.call(move |connection| Ok(connection.execute("DELETE FROM pending_changes WHERE code = ?1", [&code])? == 1)).await
+    }
+
     /// Applies an approved change and forgets it, in one transaction.
     /// `Some` says why it no longer applies.
     pub async fn approve(&self, code: &str, change: Change) -> Result<Option<String>, DbError> {

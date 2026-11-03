@@ -133,6 +133,14 @@ impl Router {
         }
     }
 
+    async fn reject(&self, code: String) -> Result<String, String> {
+        match self.schedules.reject(&code).await {
+            Ok(true) => Ok(format!("Dropped change {code}; nothing was changed.")),
+            Ok(false) => Err(format!("no change waits under code {code}")),
+            Err(error) => Err(format!("cannot drop change {code}: {error}")),
+        }
+    }
+
     /// Refuses a change drafted against a job that has changed since, or a new job whose name was taken.
     async fn still_current(&self, id: &str, base_version: Option<i64>) -> Result<(), String> {
         let current = match self.schedules.get(id).await {
@@ -181,6 +189,7 @@ impl Router {
             Manage::Resume { id } => self.resume_job(id, Utc::now()).await,
             Manage::Rm { id } => self.delete_job(id).await,
             Manage::Approve { code } => self.approve(code, Utc::now()).await,
+            Manage::Reject { code } => self.reject(code).await,
         };
 
         let text = match result {
@@ -267,7 +276,7 @@ pub(super) async fn report(run: &Run, schedules: &Schedules, notifier: Option<&N
         Step::Done => None,
         Step::Failed(message) => Some(message.as_str()),
         Step::Superseded => Some(SUPERSEDED),
-        Step::Text(_) | Step::Paused | Step::Receipt(_) => return,
+        Step::Text(_) | Step::Paused | Step::Shown(_) => return,
     };
 
     tracing::info!(run = %run.id, error, "a scheduled run ended");

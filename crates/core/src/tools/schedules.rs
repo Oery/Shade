@@ -29,7 +29,7 @@ use crate::store::db::Db;
 use crate::store::operations::Operations;
 use crate::store::roots::{Adapter, Roots};
 use crate::store::schedules::{Applied, Change, Definition, MAX_JOBS, Receipt, Schedules};
-use crate::tools;
+use crate::tools::{self, Shown};
 
 const MAX_TITLE: usize = 100;
 const MAX_PROMPT: usize = 4000;
@@ -75,7 +75,7 @@ pub struct Work {
 /// A call's result, and Shade's receipt for the owner when it changed something.
 struct Answer {
     text: String,
-    shown: Option<String>,
+    shown: Option<Shown>,
 }
 
 /// Where a result goes.
@@ -209,6 +209,11 @@ impl Work {
         let (change, text) = self.change(action, args, &authorized.caps, &call.thread).await?;
         self.write_file(&change)?;
 
+        let code = match &change {
+            Change::Propose { code, .. } => Some(code.to_owned()),
+            _ => None,
+        };
+
         let receipt = Receipt { thread: thread.to_owned(), call: call.id.to_owned(), tool: action.name(), text };
 
         let applied = match self.schedules.apply(change, receipt).await {
@@ -217,7 +222,14 @@ impl Work {
         };
 
         let answer = match applied {
-            Applied::Done(receipt) => Answer { text: receipt.to_owned(), shown: Some(receipt) },
+            Applied::Done(receipt) => {
+                let shown = match code {
+                    Some(code) => Shown::Approval { text: receipt.to_owned(), code },
+                    None => Shown::Receipt(receipt.to_owned()),
+                };
+
+                Answer { text: receipt, shown: Some(shown) }
+            }
             Applied::Refused(text) | Applied::Replayed(text) => Answer { text, shown: None },
         };
 
@@ -332,8 +344,7 @@ impl Work {
         code.truncate(6);
 
         let text = format!(
-            "⏳ This change needs the owner's approval because the job would hold {} (beyond [jobs] agent_caps). \
-             Approve with `/approve {code}` in Discord or `shade schedule approve {code}` within 24 hours.\n{receipt}",
+            "⏳ Waiting for the owner's approval for 24 hours (code {code}): the job would hold {}, beyond [jobs] agent_caps.\n{receipt}",
             beyond.join(", ")
         );
 
@@ -632,6 +643,7 @@ mod tests {
     use crate::store::grants::Grants;
     use crate::store::schedules::Schedules;
     use crate::testing::{self, Dirs};
+    use crate::tools::Shown;
 
     struct Setup {
         work: Arc<Work>,
@@ -757,17 +769,17 @@ mod tests {
         let file_job = |caps: &[&str], name: &str| json!({ "title": "Brief", "prompt": "Summarize.", "trigger": { "kind": "cron", "expression": "0 8 * * *" }, "caps": caps, "file": name });
 
         let within = call(&work, "chat", Action::Create, "call-1", file_job(&["now", "notify"], "light")).await?;
-        assert!(within.shown.is_some_and(|text| text.starts_with("📅")));
+        assert!(matches!(within.shown, Some(Shown::Receipt(text)) if text.starts_with("📅")));
         assert!(job_files.path("light").exists(), "the job file was not written");
 
         let beyond = call(&work, "chat", Action::Create, "call-2", file_job(&["now", "shell"], "heavy")).await?;
-        assert!(beyond.text.contains("needs the owner's approval"), "{}", beyond.text);
+        assert!(matches!(beyond.shown, Some(Shown::Approval { .. })), "{}", beyond.text);
         assert!(schedules.get("heavy").await?.is_none(), "a job beyond agent_caps was created without approval");
         assert!(!job_files.path("heavy").exists(), "a waiting change wrote its file");
 
         // Widening a job past agent_caps waits too, and leaves it as it was.
         let widen = call(&work, "chat", Action::Update, "call-3", json!({ "id": "light", "caps": ["shell"] })).await?;
-        assert!(widen.text.contains("needs the owner's approval"));
+        assert!(matches!(widen.shown, Some(Shown::Approval { .. })), "{}", widen.text);
         let caps = schedules.get("light").await?.map(|job| job.definition.caps);
         assert_eq!(caps, Some(vec!["now".to_owned(), "notify".to_owned()]));
 

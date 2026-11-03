@@ -1,7 +1,8 @@
 //! Follows one turn's events and decides what its sender sees.
 
 use infinity_agent_core::system::AgentEvent;
-use rap_protocol::DisplaySegment;
+
+use crate::tools::{self, Shown};
 
 /// What a turn's sender is told.
 #[derive(Debug, PartialEq)]
@@ -12,8 +13,8 @@ pub enum Step {
     Paused,
     Done,
     Failed(String),
-    /// A tool result Shade wrote for the owner to see, such as a job receipt.
-    Receipt(String),
+    /// What Shade wrote for the owner to see with a tool result, such as a job receipt.
+    Shown(Shown),
     /// Newer input to the same conversation interrupted this turn.
     Superseded,
 }
@@ -76,7 +77,7 @@ impl Turn {
             }
             AgentEvent::ToolResult { segments } => {
                 self.pending_tools = self.pending_tools.saturating_sub(1);
-                shown(segments)
+                tools::shown(segments).map(Step::Shown)
             }
             AgentEvent::CompletionFinished { .. } if self.pending_tools > 0 && self.failure.is_none() => {
                 self.started = false;
@@ -106,19 +107,6 @@ impl Turn {
             Some(message) => Step::Failed(message),
             None => Step::Done,
         }
-    }
-}
-
-/// The owner's copy of a tool result: Shade's tools put it before the result
-/// the model reads. Results with nothing to show have a single segment.
-fn shown(segments: Vec<DisplaySegment>) -> Option<Step> {
-    if segments.len() < 2 {
-        return None;
-    }
-
-    match segments.into_iter().next() {
-        Some(DisplaySegment::Text(text)) => Some(Step::Receipt(text)),
-        _ => None,
     }
 }
 
@@ -170,7 +158,7 @@ mod tests {
                 Step::Paused => "paused".to_owned(),
                 Step::Done => "done".to_owned(),
                 Step::Failed(message) => format!("error: {message}"),
-                Step::Receipt(text) => format!("receipt: {text}"),
+                Step::Shown(shown) => format!("shown: {shown:?}"),
                 Step::Superseded => "superseded".to_owned(),
             });
 
@@ -224,7 +212,7 @@ mod tests {
                     started(),
                     finished(),
                 ],
-                vec!["paused", "receipt: created", "done"],
+                vec!["paused", "shown: Receipt(\"created\")", "done"],
             ),
             // A synchronous tool answers inside the completion.
             (

@@ -78,6 +78,10 @@ pub enum Manage {
     Approve {
         code: String,
     },
+    /// Drops a change owner chat proposed.
+    Reject {
+        code: String,
+    },
 }
 
 #[derive(Debug, Serialize, Deserialize)]
