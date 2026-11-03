@@ -21,6 +21,20 @@ cd packaging/arch && makepkg -si
 
 It installs `shaded` and `shade` in `/usr/bin`, the systemd user units, and `config.example.toml` and this README in `/usr/share/doc/shade`. If the sandbox tests cannot run where you build (no user namespaces), add `--nocheck`.
 
+On NixOS, use the flake's module (it builds with the toolchain pinned in `rust-toolchain.toml`):
+
+```nix
+# flake.nix
+inputs.shade.url = "github:Oery/Shade";
+
+# in your NixOS configuration
+imports = [ inputs.shade.nixosModules.default ];
+services.shade.enable = true;          # shaded as a user service, bubblewrap on its PATH
+users.users.<you>.linger = true;       # start it at boot
+```
+
+The daily backup timer is on by default (`services.shade.backups`). Each user keeps their own `~/.config/shade`. `nix build github:Oery/Shade` builds just the package.
+
 Elsewhere, build with the toolchain from `rust-toolchain.toml`:
 
 ```sh
