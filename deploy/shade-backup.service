@@ -1,0 +1,14 @@
+# One backup of Shade's database, while the daemon keeps serving. Started
+# daily by shade-backup.timer. Keeps 14 days of backups in
+# ~/.local/state/shade/backups. A backup holds the database only: copy the
+# config, its .env, job files, and the vault separately.
+
+[Unit]
+Description=Back up Shade's database
+Requisite=shaded.service
+After=shaded.service
+
+[Service]
+Type=oneshot
+UMask=0077
+ExecStart=/bin/sh -c 'dir="$${XDG_STATE_HOME:-$$HOME/.local/state}/shade/backups" && mkdir -p "$$dir" && /usr/bin/shade backup "$$dir/shade-$$(date +%%Y%%m%%d-%%H%%M%%S).db" && find "$$dir" -name "shade-*.db" -mtime +14 -delete'

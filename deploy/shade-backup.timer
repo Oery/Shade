@@ -1,0 +1,14 @@
+# Daily backup of Shade's database, installed by the shade package. Enable with:
+#   systemctl --user enable --now shade-backup.timer
+
+[Unit]
+Description=Daily backup of Shade's database
+
+[Timer]
+OnCalendar=daily
+RandomizedDelaySec=15min
+# A backup missed while the machine was off runs at the next start.
+Persistent=true
+
+[Install]
+WantedBy=timers.target

@@ -14,3 +14,7 @@
 !rust-toolchain.toml
 !check.sh
 !config.example.toml
+!deploy/*.service
+!deploy/*.timer
+!packaging/arch/PKGBUILD
+!packaging/arch/*.install

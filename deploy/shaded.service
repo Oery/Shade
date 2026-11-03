@@ -1,0 +1,26 @@
+# Shade daemon as a systemd user service, installed by the shade package.
+# Enable with:
+#   systemctl --user enable --now shaded
+#   loginctl enable-linger "$USER"   # start at boot, without logging in
+# Config and secrets stay in ~/.config/shade (config.toml and its .env).
+# Built with `cargo install` instead? Point ExecStart at that binary with
+# `systemctl --user edit shaded`.
+
+[Unit]
+Description=Shade, a personal agent daemon
+
+[Service]
+Type=exec
+ExecStart=/usr/bin/shaded
+# SIGTERM stops accepting work and shuts down gracefully; after this long
+# everything left (MCP servers, sandboxed commands) is killed.
+KillMode=mixed
+TimeoutStopSec=30
+Restart=on-failure
+RestartSec=10
+# Files Shade creates (database, sockets, job files) are private.
+UMask=0077
+Environment=RUST_LOG=info
+
+[Install]
+WantedBy=default.target

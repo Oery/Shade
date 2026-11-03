@@ -1,0 +1,50 @@
+# Builds Shade from this repository's committed HEAD (uncommitted changes
+# are not packaged):
+#   cd packaging/arch && makepkg -si
+
+pkgname=shade
+pkgver=r0.0000000
+pkgrel=1
+pkgdesc='Personal agent daemon (shaded) and its client (shade)'
+arch=('x86_64')
+url='https://github.com/Oery/Shade'
+license=('LicenseRef-unspecified')
+depends=('gcc-libs' 'glibc')
+makedepends=('cargo' 'git')
+checkdepends=('bubblewrap')
+optdepends=('bubblewrap: the sandboxed shell tool'
+            'tailscale: webhooks from your other devices')
+install=shade.install
+source=("$pkgname::git+file://$(realpath "$startdir/../..")")
+sha256sums=('SKIP')
+
+pkgver() {
+  cd "$pkgname"
+  printf 'r%s.%s' "$(git rev-list --count HEAD)" "$(git rev-parse --short=7 HEAD)"
+}
+
+prepare() {
+  cd "$pkgname"
+  cargo fetch --locked --target "$(rustc -vV | sed -n 's/host: //p')"
+}
+
+build() {
+  cd "$pkgname"
+  export CARGO_TARGET_DIR=target
+  cargo build --frozen --release --bin shaded --bin shade
+}
+
+check() {
+  cd "$pkgname"
+  # The sandbox tests run real bubblewrap; a build chroot without user
+  # namespaces needs `makepkg --nocheck`.
+  cargo test --frozen --workspace
+}
+
+package() {
+  cd "$pkgname"
+  install -Dm755 target/release/shaded target/release/shade -t "$pkgdir/usr/bin/"
+  install -Dm644 deploy/shaded.service deploy/shade-backup.service deploy/shade-backup.timer \
+    -t "$pkgdir/usr/lib/systemd/user/"
+  install -Dm644 README.md config.example.toml -t "$pkgdir/usr/share/doc/$pkgname/"
+}

@@ -11,14 +11,31 @@ A personal agent that runs on your own machine. You talk to it in the terminal o
 
 ## Install
 
-Linux only. Needs the Rust toolchain from `rust-toolchain.toml`, and `bwrap` (bubblewrap) if anything is granted `shell`.
+Linux only. Needs `bwrap` (bubblewrap) if anything is granted `shell`.
+
+On Arch Linux, build and install the package from this repository (it packages the committed HEAD):
+
+```sh
+cd packaging/arch && makepkg -si
+```
+
+It installs `shaded` and `shade` in `/usr/bin`, the systemd user units, and `config.example.toml` and this README in `/usr/share/doc/shade`. If the sandbox tests cannot run where you build (no user namespaces), add `--nocheck`.
+
+Elsewhere, build with the toolchain from `rust-toolchain.toml`:
 
 ```sh
 cargo install --locked --path crates/daemon   # shaded
 cargo install --locked --path crates/cli      # shade
+mkdir -p ~/.config/systemd/user && cp deploy/*.service deploy/*.timer ~/.config/systemd/user/
 ```
 
-Both land in `~/.cargo/bin`, which the systemd unit below expects.
+The units expect `/usr/bin`; point them at `~/.cargo/bin` with `systemctl --user edit shaded` (and `shade-backup`):
+
+```ini
+[Service]
+ExecStart=
+ExecStart=%h/.cargo/bin/shaded
+```
 
 ## Configure
 
@@ -56,9 +73,6 @@ shade usage               # tokens per conversation
 ### As a systemd user service
 
 ```sh
-mkdir -p ~/.config/systemd/user
-cp deploy/shaded.service ~/.config/systemd/user/
-systemctl --user daemon-reload
 systemctl --user enable --now shaded
 loginctl enable-linger "$USER"     # start at boot, without logging in
 journalctl --user -u shaded -f     # logs
@@ -87,8 +101,6 @@ shade backup ~/shade-backup.db      # refuses an existing file; creates it 0600
 Daily backups, kept 14 days in `~/.local/state/shade/backups`:
 
 ```sh
-cp deploy/shade-backup.service deploy/shade-backup.timer ~/.config/systemd/user/
-systemctl --user daemon-reload
 systemctl --user enable --now shade-backup.timer
 ```
 

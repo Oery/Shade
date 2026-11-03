@@ -1,0 +1,17 @@
+post_install() {
+  cat <<'MESSAGE'
+Shade is installed. Set it up as your user, not root:
+
+  mkdir -p ~/.config/shade
+  cp /usr/share/doc/shade/config.example.toml ~/.config/shade/config.toml
+  install -m 600 /dev/null ~/.config/shade/.env    # API keys and tokens go here
+  systemctl --user enable --now shaded shade-backup.timer
+  loginctl enable-linger "$USER"                   # start at boot
+
+See /usr/share/doc/shade/README.md.
+MESSAGE
+}
+
+post_upgrade() {
+  echo 'Restart Shade to run the new version: systemctl --user restart shaded'
+}
