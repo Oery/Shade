@@ -22,6 +22,7 @@ use shade_store::usage::Usages;
 use thiserror::Error;
 
 use crate::error::BoxError;
+use crate::prompt;
 
 #[derive(Debug, Error)]
 pub enum Denied {
@@ -172,9 +173,16 @@ impl ModelProvider for MeteredProvider {
     }
 
     /// A refusal is fatal, so Infinity ends the step instead of retrying.
-    async fn invoke_model(&self, model_id: &str, request: CompletionRequest) -> Result<ModelStream, CompletionError> {
+    /// Also replaces Infinity's coding-agent prompt with Shade's (see `prompt`).
+    async fn invoke_model(&self, model_id: &str, mut request: CompletionRequest) -> Result<ModelStream, CompletionError> {
         if let Err(denied) = self.authority.admit_completion(&self.thread).await {
             return Err(CompletionError::provider(ErrorClass::Fatal, denied.to_string()));
+        }
+
+        match request.preamble.as_deref().map(prompt::preamble) {
+            Some(Some(preamble)) => request.preamble = Some(preamble),
+            Some(None) => tracing::warn!("Infinity's system prompt has an unknown layout; sending it unchanged"),
+            None => {}
         }
 
         let stream = self.inner.invoke_model(model_id, request).await?;

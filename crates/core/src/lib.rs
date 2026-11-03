@@ -7,6 +7,7 @@ mod error;
 mod lock;
 mod model;
 mod notify;
+mod prompt;
 mod recovery;
 #[cfg(test)]
 mod replay;
