@@ -19,7 +19,7 @@ use rap_protocol::{ProviderCallId, ToolCallId};
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
 use shade_policy::channels;
-use shade_policy::{Cap, Caps};
+use shade_policy::{Cap, Caps, Policy};
 use shade_schedule::TriggerArgs;
 use shade_schedule::jobfiles::{self, JobFiles};
 use shade_schedule::receipt::{Card, Proposal, Verb};
@@ -145,7 +145,9 @@ impl ScheduleTool {
         let delegable = shade_policy::delegable(caps);
         let timezone = work.authority.policy().timezone.name();
 
-        Self { action, description: describe(action), parameters: parameters(action, &delegable, timezone), work: Arc::clone(work) }
+        let parameters = parameters(action, &delegable, work.authority.policy(), timezone);
+
+        Self { action, description: describe(action), parameters, work: Arc::clone(work) }
     }
 }
 
@@ -193,7 +195,7 @@ impl Work {
     }
 
     async fn run<M>(&self, action: Action, args: serde_json::Value, call: &Call<M>) -> Result<Answer, String> {
-        let authorized = match self.authority.admit_management(&call.thread, Cap::Schedules).await {
+        let authorized = match self.authority.admit_management(&call.thread, &Cap::Schedules).await {
             Ok(authorized) => authorized,
             Err(denied) => return Err(denied.to_string()),
         };
@@ -560,7 +562,7 @@ fn describe(action: Action) -> String {
     text.to_owned()
 }
 
-fn parameters(action: Action, delegable: &Caps, timezone: &str) -> serde_json::Value {
+fn parameters(action: Action, delegable: &Caps, policy: &Policy, timezone: &str) -> serde_json::Value {
     let id = serde_json::json!({ "type": "string", "description": "The job's ID, from its receipt or schedule_list." });
 
     match action {
@@ -570,7 +572,7 @@ fn parameters(action: Action, delegable: &Caps, timezone: &str) -> serde_json::V
                 "title": { "type": "string", "maxLength": MAX_TITLE },
                 "prompt": { "type": "string", "maxLength": MAX_PROMPT, "description": "What each run should do, self-contained." },
                 "trigger": trigger(timezone),
-                "caps": caps(delegable),
+                "caps": caps(delegable, policy),
                 "channels": channels(),
                 "file": {
                     "type": "string",
@@ -589,7 +591,7 @@ fn parameters(action: Action, delegable: &Caps, timezone: &str) -> serde_json::V
                 "title": { "type": "string", "maxLength": MAX_TITLE },
                 "prompt": { "type": "string", "maxLength": MAX_PROMPT },
                 "trigger": trigger(timezone),
-                "caps": caps(delegable),
+                "caps": caps(delegable, policy),
                 "channels": channels(),
                 "paused": { "type": "boolean" },
             },
@@ -649,9 +651,9 @@ fn channels() -> serde_json::Value {
     })
 }
 
-fn caps(delegable: &Caps) -> serde_json::Value {
+fn caps(delegable: &Caps, policy: &Policy) -> serde_json::Value {
     let names: Vec<&str> = delegable.iter().map(|cap| cap.name()).collect();
-    let described: Vec<String> = delegable.iter().map(|cap| format!("{}: {}", cap.name(), cap.description())).collect();
+    let described: Vec<String> = delegable.iter().map(|cap| format!("{}: {}", cap.name(), policy.describe(cap))).collect();
 
     let description = if described.is_empty() {
         "This conversation has no caps to give; use an empty list.".to_owned()

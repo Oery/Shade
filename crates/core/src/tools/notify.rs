@@ -130,7 +130,7 @@ impl Work {
     }
 
     async fn run<M>(&self, args: serde_json::Value, call: &Call<M>) -> String {
-        let origin = match self.authority.admit_tool(&call.thread, Cap::Notify).await {
+        let origin = match self.authority.admit_tool(&call.thread, &Cap::Notify).await {
             Ok(authorized) => authorized.origin,
             Err(denied) => return format!("Error: {denied}"),
         };

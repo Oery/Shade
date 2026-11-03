@@ -70,6 +70,12 @@ pub enum Error {
     #[error("invalid job file {0}")]
     JobFiles(String),
 
+    #[error("{name} ([mcp.{server}] env) is not set in the environment or the .env file next to the config")]
+    McpEnv { server: String, name: String },
+
+    #[error("{0}")]
+    McpServer(String),
+
     #[error("cannot start the async runtime: {0}")]
     Runtime(std::io::Error),
 

@@ -119,7 +119,7 @@ impl Work {
     }
 
     async fn run<M>(&self, args: serde_json::Value, call: &Call<M>) -> String {
-        let access = match self.authority.admit_tool(&call.thread, Cap::Shell).await {
+        let access = match self.authority.admit_tool(&call.thread, &Cap::Shell).await {
             Ok(authorized) => Access { network: authorized.caps.contains(&Cap::ShellNetwork), vault: false },
             Err(denied) => return format!("Error: {denied}"),
         };

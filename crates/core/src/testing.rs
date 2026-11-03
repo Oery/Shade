@@ -39,11 +39,22 @@ pub struct Harness {
 
 /// Chat may use `caps`, under `limits`.
 pub fn policy(caps: &[Cap], limits: Limits) -> Arc<Policy> {
-    let chat = caps.iter().copied().collect();
+    let chat = caps.iter().cloned().collect();
 
     let channels = [("alerts".to_owned(), 42)].into_iter().collect();
 
-    Arc::new(Policy { chat, chat_prompt: None, jobs_prompt: None, channels, hooks: Default::default(), limits, timezone: chrono_tz::UTC })
+    let servers = [("echo".to_owned(), "Echoes and counts its calls.".to_owned())].into_iter().collect();
+
+    Arc::new(Policy {
+        chat,
+        chat_prompt: None,
+        jobs_prompt: None,
+        channels,
+        servers,
+        hooks: Default::default(),
+        limits,
+        timezone: chrono_tz::UTC,
+    })
 }
 
 /// Runs `test` on a `LocalSet`, failing it after ten seconds instead of hanging.
@@ -69,7 +80,7 @@ pub async fn start_with(db: &Db, policy: Arc<Policy>) -> Result<Harness, BoxErro
 pub fn services(sandbox: Option<Arc<Sandbox>>, notifier: Option<Notifier>) -> Services {
     let job_files = Arc::new(JobFiles::new(std::env::temp_dir().join(format!("shade-test-jobs-{}", uuid::Uuid::new_v4()))));
 
-    Services { sandbox, notifier, job_files }
+    Services { sandbox, notifier, job_files, mcp: Default::default() }
 }
 
 /// A system whose tools reach `services`.

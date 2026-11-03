@@ -32,7 +32,8 @@ max_output_tokens = 128000
 # max_output_tokens = 131072
 
 # Owner chat (terminal and Discord). Without this section chat has no tools.
-# Known caps: now, notify, shell, shell_network, schedules, watches.
+# Known caps: now, notify, shell, shell_network, schedules, watches, and the
+# name of each server under [mcp].
 [chat]
 caps = ["now"]
 # prompt = "You are chatting with your owner."
@@ -97,6 +98,20 @@ caps = ["now"]
 # Replaces Shade's default instructions, which tell the model that nobody
 # reads its replies and to use `notify` when the owner should know.
 # prompt = "You are running a background job."
+
+# MCP servers. Each name is a capability: a conversation or job holding it
+# gets the server's tools, as `<name>_<tool>`. Servers start with the daemon
+# (one that cannot start is retried every minute and never holds up startup)
+# and run as your user, outside the sandbox, with a cleared environment:
+# PATH, HOME and XDG_* only, plus the variables listed in `env`, read from
+# the environment or the `.env` next to this config. A call that gets no
+# answer in time is reported as possibly done, and never sent again.
+# [mcp.nightbot]
+# command = ["/path/to/mcp-nightbot"]
+# env = ["NIGHTBOT_CLIENT_ID", "NIGHTBOT_CLIENT_SECRET"]
+# description = "Read and edit the custom chat commands of the Nightbot channel."
+# startup_timeout_seconds = 20
+# call_timeout_seconds = 60
 
 # Webhook sources. Hooks can never hold `schedules` or `watches`.
 # [hooks.github]

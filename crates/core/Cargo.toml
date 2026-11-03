@@ -6,6 +6,7 @@ rust-version.workspace = true
 publish.workspace = true
 
 [dependencies]
+shade-mcp.workspace = true
 shade-policy.workspace = true
 shade-proto.workspace = true
 shade-sandbox.workspace = true
@@ -33,6 +34,8 @@ uuid.workspace = true
 
 [dev-dependencies]
 infinity-provider-protocol = { workspace = true, features = ["mock"] }
+rmcp = { workspace = true, features = ["server", "macros"] }
+shade-mcp = { workspace = true, features = ["testing"] }
 shade-schedule = { workspace = true, features = ["testing"] }
 shade-store = { workspace = true, features = ["testing"] }
 

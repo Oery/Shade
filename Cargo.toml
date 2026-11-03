@@ -10,6 +10,7 @@ publish = false
 
 [workspace.dependencies]
 shade-core = { path = "crates/core" }
+shade-mcp = { path = "crates/mcp" }
 shade-policy = { path = "crates/policy" }
 shade-proto = { path = "crates/proto" }
 shade-schedule = { path = "crates/schedule" }
@@ -27,6 +28,7 @@ infinity-provider-protocol = "=0.2.0"
 http = "1.5.0"
 infinity-provider-rig = "=0.2.0"
 rig-core = "=0.31.0"
+rmcp = { version = "=3.8.0", default-features = false, features = ["client", "transport-child-process"] }
 rap-protocol = "=0.2.0"
 rusqlite = { version = "0.41.1", features = ["bundled"] }
 serde = { version = "1.0.229", features = ["derive"] }

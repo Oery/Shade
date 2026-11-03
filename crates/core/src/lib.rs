@@ -19,6 +19,7 @@ mod thread_config;
 mod tools;
 mod usage;
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -42,6 +43,7 @@ use crate::notify::Notifier;
 use crate::router::{Inbound, Router};
 use crate::secrets::Secrets;
 use crate::thread_config::Services;
+use shade_mcp::{Server, Servers};
 
 /// Pending input between the control socket and the router.
 const INBOUND_QUEUE: usize = 16;
@@ -59,9 +61,10 @@ pub fn run(config: Option<PathBuf>) -> Result<(), Error> {
 
 async fn serve(config_path: Option<PathBuf>) -> Result<(), Error> {
     let config_path = config::path(config_path)?;
-    let Config { model, timezone, chat, jobs, hooks, limits, sandbox, mut discord } = config::load(&config_path)?;
+    let Config { model, timezone, chat, jobs, hooks, limits, sandbox, mut discord, mcp } = config::load(&config_path)?;
     let channels = discord.as_mut().map(|discord| std::mem::take(&mut discord.channels)).unwrap_or_default();
-    let sections = config::Sections { chat, jobs, hooks, limits, timezone, channels };
+    let servers = mcp.iter().map(|(name, server)| (name.to_owned(), server.description.to_owned())).collect();
+    let sections = config::Sections { chat, jobs, hooks, limits, timezone, channels, servers };
     let policy = config::policy(&config_path, sections)?;
     let mut secrets = Secrets::load(secrets::path_for(&config_path))?;
 
@@ -77,6 +80,7 @@ async fn serve(config_path: Option<PathBuf>) -> Result<(), Error> {
     // Probed now, so a broken sandbox stops the daemon before it accepts work.
     let sandbox = start_sandbox(sandbox, &policy, &data_dir, &config_path).await?;
     let model = Model::new(model, &mut secrets)?;
+    let mcp = start_mcp(mcp, &mut secrets).await?;
     let db = Db::open(&data_dir.join(db::DB_FILE))?;
 
     let (inbound, inbound_queue) = mpsc::channel(INBOUND_QUEUE);
@@ -92,7 +96,7 @@ async fn serve(config_path: Option<PathBuf>) -> Result<(), Error> {
     let http = discord.as_ref().map(Discord::http);
     let notifier = discord.as_ref().map(|discord| notifications(discord, &db));
     let job_files = Arc::new(JobFiles::new(jobfiles::dir_for(&config_path)));
-    let services = Services { sandbox: sandbox.map(Arc::new), notifier, job_files };
+    let services = Services { sandbox: sandbox.map(Arc::new), notifier, job_files, mcp };
     let router = Router::start(model, db, Arc::new(policy), services, http);
 
     // Job files are config: a bad one stops the daemon before it runs anything.
@@ -130,6 +134,36 @@ async fn start_sandbox(
     let sandbox = shade_sandbox::start(config, data_dir, config_path).await?;
 
     Ok(Some(sandbox))
+}
+
+/// Starts every MCP server, each within its startup timeout, so a server
+/// that is down never holds up the daemon. Those that fail are retried in
+/// the background. A variable a server lists but nobody set stops startup.
+async fn start_mcp(configs: BTreeMap<String, shade_mcp::Config>, secrets: &mut Secrets) -> Result<Arc<Servers>, Error> {
+    let mut servers = Vec::new();
+
+    for (name, config) in configs {
+        let mut env = Vec::new();
+
+        for key in &config.env {
+            let Some(value) = secrets.take(key) else {
+                return Err(Error::McpEnv { server: name, name: key.to_owned() });
+            };
+
+            env.push((key.to_owned(), value));
+        }
+
+        match Server::new(name, &config, env) {
+            Ok(server) => servers.push(server),
+            Err(message) => return Err(Error::McpServer(message)),
+        }
+    }
+
+    let servers = Arc::new(Servers::new(servers));
+    servers.connect_all().await;
+    tokio::spawn(Arc::clone(&servers).keep_connected());
+
+    Ok(servers)
 }
 
 /// Notifications go to Discord, the one adapter that can reach the owner

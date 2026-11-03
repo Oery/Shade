@@ -11,8 +11,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use chrono_tz::Tz;
 use serde::Deserialize;
 
-/// A named piece of authority. MCP server names join these in M13.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Deserialize)]
+/// A named piece of authority: one of Shade's own, or an MCP server.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Deserialize)]
 #[serde(try_from = "String")]
 pub enum Cap {
     Now,
@@ -21,14 +21,16 @@ pub enum Cap {
     ShellNetwork,
     Schedules,
     Watches,
+    /// The tools of the MCP server configured as `[mcp.<name>]`.
+    Server(String),
 }
 
 pub type Caps = BTreeSet<Cap>;
 
 impl Cap {
-    const ALL: [Self; 6] = [Self::Now, Self::Notify, Self::Shell, Self::ShellNetwork, Self::Schedules, Self::Watches];
+    const BUILTIN: [Self; 6] = [Self::Now, Self::Notify, Self::Shell, Self::ShellNetwork, Self::Schedules, Self::Watches];
 
-    pub fn name(self) -> &'static str {
+    pub fn name(&self) -> &str {
         match self {
             Self::Now => "now",
             Self::Notify => "notify",
@@ -36,11 +38,13 @@ impl Cap {
             Self::ShellNetwork => "shell_network",
             Self::Schedules => "schedules",
             Self::Watches => "watches",
+            Self::Server(name) => name,
         }
     }
 
     /// What the capability lets a scheduled run do, for the model choosing caps.
-    pub fn description(self) -> &'static str {
+    /// A server's own description is in the policy.
+    pub fn description(&self) -> &str {
         match self {
             Self::Now => "read the current time",
             Self::Notify => "send the owner a message (the usual way a job reports)",
@@ -48,15 +52,22 @@ impl Cap {
             Self::ShellNetwork => "give shell commands network access (needs shell)",
             Self::Schedules => "manage scheduled jobs (owner chat only)",
             Self::Watches => "manage watches (owner chat only)",
+            Self::Server(_) => "use this MCP server's tools",
         }
     }
 
+    /// One of Shade's own capabilities, or a name an MCP server may have.
+    /// Whether that server is configured is the policy's to check.
     fn parse(name: &str) -> Option<Self> {
-        Self::ALL.into_iter().find(|cap| cap.name() == name)
+        if let Some(cap) = Self::BUILTIN.into_iter().find(|cap| cap.name() == name) {
+            return Some(cap);
+        }
+
+        is_server_name(name).then(|| Self::Server(name.to_owned()))
     }
 
     /// Managing schedules and watches stays with owner chat.
-    fn is_management(self) -> bool {
+    fn is_management(&self) -> bool {
         matches!(self, Self::Schedules | Self::Watches)
     }
 }
@@ -70,6 +81,14 @@ impl TryFrom<String> for Cap {
             None => Err(format!("unknown capability `{name}`")),
         }
     }
+}
+
+/// MCP server names prefix their tools' names, so they are short words:
+/// lowercase letters, digits and `_`, starting with a letter.
+pub fn is_server_name(name: &str) -> bool {
+    let word = name.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_');
+
+    word && name.starts_with(|c: char| c.is_ascii_lowercase()) && name.len() <= 24
 }
 
 /// What started a root.
@@ -173,6 +192,8 @@ pub struct Policy {
     pub jobs_prompt: Option<String>,
     /// Named Discord channels, for notifications.
     pub channels: BTreeMap<String, u64>,
+    /// Configured MCP servers by name, with what each is for.
+    pub servers: BTreeMap<String, String>,
     pub hooks: BTreeMap<String, Caps>,
     pub limits: Limits,
     pub timezone: Tz,
@@ -181,7 +202,11 @@ pub struct Policy {
 impl Policy {
     /// Checks the rules config parsing cannot express.
     pub fn validate(&self) -> Result<(), String> {
-        check_caps("[chat]", &self.chat)?;
+        for name in self.servers.keys() {
+            check_server(name)?;
+        }
+
+        self.check_caps("[chat]", &self.chat)?;
 
         for (name, id) in &self.channels {
             check_channel(name, *id)?;
@@ -189,7 +214,7 @@ impl Policy {
 
         for (name, caps) in &self.hooks {
             let section = format!("[hooks.{name}]");
-            check_caps(&section, caps)?;
+            self.check_caps(&section, caps)?;
 
             if let Some(cap) = caps.iter().find(|cap| cap.is_management()) {
                 return Err(format!("{section}: `{}` belongs to owner chat and cannot be given to a hook", cap.name()));
@@ -197,6 +222,14 @@ impl Policy {
         }
 
         Ok(())
+    }
+
+    /// What a capability is for: a server's configured description, or Shade's own.
+    pub fn describe<'a>(&'a self, cap: &'a Cap) -> &'a str {
+        match cap {
+            Cap::Server(name) => self.servers.get(name).map_or(cap.description(), String::as_str),
+            builtin => builtin.description(),
+        }
     }
 
     /// Whether any root can hold `cap`. Jobs never exceed owner chat.
@@ -231,7 +264,7 @@ impl Policy {
     fn ceiling(&self, origin: Origin, source: &str) -> Option<Caps> {
         match origin {
             Origin::Chat => Some(self.chat.clone()),
-            Origin::Schedule | Origin::Watch => Some(self.chat.iter().copied().filter(|cap| !cap.is_management()).collect()),
+            Origin::Schedule | Origin::Watch => Some(delegable(&self.chat)),
             Origin::Webhook => self.hooks.get(source).cloned(),
         }
     }
@@ -239,7 +272,7 @@ impl Policy {
 
 /// The caps a holder of `caps` may give a job: its own, minus management.
 pub fn delegable(caps: &Caps) -> Caps {
-    caps.iter().copied().filter(|cap| !cap.is_management()).collect()
+    caps.iter().filter(|cap| !cap.is_management()).cloned().collect()
 }
 
 /// Channel names are short words that cannot be mistaken for `dm` or an ID.
@@ -259,9 +292,33 @@ fn check_channel(name: &str, id: u64) -> Result<(), String> {
     Ok(())
 }
 
-fn check_caps(section: &str, caps: &Caps) -> Result<(), String> {
-    if caps.contains(&Cap::ShellNetwork) && !caps.contains(&Cap::Shell) {
-        return Err(format!("{section}: `shell_network` requires `shell`"));
+impl Policy {
+    fn check_caps(&self, section: &str, caps: &Caps) -> Result<(), String> {
+        if caps.contains(&Cap::ShellNetwork) && !caps.contains(&Cap::Shell) {
+            return Err(format!("{section}: `shell_network` requires `shell`"));
+        }
+
+        for cap in caps {
+            if let Cap::Server(name) = cap
+                && !self.servers.contains_key(name)
+            {
+                return Err(format!("{section}: `{name}` is neither a Shade capability nor a server under [mcp]"));
+            }
+        }
+
+        Ok(())
+    }
+}
+
+/// A server name must fit in tool names and must not pass for one of Shade's own capabilities.
+fn check_server(name: &str) -> Result<(), String> {
+    if !is_server_name(name) {
+        return Err(format!("[mcp.{name}]: use up to 24 lowercase letters, digits and _, starting with a letter"));
+    }
+
+    // `schedule` would collide with the `schedule_*` tools.
+    if Cap::BUILTIN.iter().any(|cap| cap.name() == name) || name == "schedule" {
+        return Err(format!("[mcp.{name}]: `{name}` is taken by Shade's own capabilities or tools; choose another name"));
     }
 
     Ok(())
@@ -276,7 +333,7 @@ mod tests {
     type Hooks<'a> = &'a [(&'a str, &'a [Cap])];
 
     fn caps(list: &[Cap]) -> Caps {
-        list.iter().copied().collect()
+        list.iter().cloned().collect()
     }
 
     fn policy(chat: &[Cap], hooks: Hooks<'_>) -> Policy {
@@ -287,6 +344,7 @@ mod tests {
             chat_prompt: None,
             jobs_prompt: None,
             channels: BTreeMap::new(),
+            servers: [("vault".to_owned(), "Notes".to_owned())].into_iter().collect(),
             hooks,
             limits: Limits::default(),
             timezone: chrono_tz::UTC,
@@ -373,5 +431,25 @@ mod tests {
         for (usage, charge, expected) in cases {
             assert_eq!(limits.check(&usage, charge), expected, "{charge:?}");
         }
+    }
+
+    /// A server is a capability like Shade's own: named only if configured,
+    /// never under a name Shade uses, and delegable to jobs when chat holds it.
+    #[test]
+    fn servers_are_capabilities_by_name() {
+        let vault = || Cap::Server("vault".to_owned());
+        let unknown = Cap::Server("mail".to_owned());
+
+        assert!(policy(&[vault()], &[]).validate().is_ok());
+        assert!(policy(&[unknown], &[]).validate().is_err(), "an unconfigured server was accepted");
+
+        for taken in ["notify", "schedule", "Vault", "9lives"] {
+            let mut clash = policy(&[], &[]);
+            clash.servers.insert(taken.to_owned(), "x".to_owned());
+            assert!(clash.validate().is_err(), "server `{taken}` was accepted");
+        }
+
+        let job = grant(Origin::Schedule, "job", Some(&["vault", "mail"]));
+        assert_eq!(policy(&[vault()], &[]).effective(&job), Some(caps(&[vault()])));
     }
 }

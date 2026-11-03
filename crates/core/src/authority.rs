@@ -33,10 +33,10 @@ pub enum Denied {
     SourceRemoved(&'static str),
 
     #[error("`{0}` is not granted to this conversation")]
-    NotGranted(&'static str),
+    NotGranted(String),
 
     #[error("`{0}` can only be used in owner chat")]
-    NotChat(&'static str),
+    NotChat(String),
 
     #[error("thread {0} has no work budget")]
     NoBudget(String),
@@ -84,11 +84,11 @@ impl Authority {
     }
 
     /// Admits one call of a tool that needs `cap`, returning the caller's authority.
-    pub async fn admit_tool(&self, thread: &ThreadId<str>, cap: Cap) -> Result<Authorized, Denied> {
+    pub async fn admit_tool(&self, thread: &ThreadId<str>, cap: &Cap) -> Result<Authorized, Denied> {
         let authorized = self.authorize(thread).await?;
 
-        if !authorized.caps.contains(&cap) {
-            return Err(Denied::NotGranted(cap.name()));
+        if !authorized.caps.contains(cap) {
+            return Err(Denied::NotGranted(cap.name().to_owned()));
         }
 
         self.charge(thread, Charge::ToolCall).await?;
@@ -97,11 +97,11 @@ impl Authority {
     }
 
     /// Admits one call of a management tool: owner chat only, whatever the grant says.
-    pub async fn admit_management(&self, thread: &ThreadId<str>, cap: Cap) -> Result<Authorized, Denied> {
+    pub async fn admit_management(&self, thread: &ThreadId<str>, cap: &Cap) -> Result<Authorized, Denied> {
         let authorized = self.admit_tool(thread, cap).await?;
 
         if authorized.origin != Origin::Chat {
-            return Err(Denied::NotChat(cap.name()));
+            return Err(Denied::NotChat(cap.name().to_owned()));
         }
 
         Ok(authorized)
@@ -258,8 +258,8 @@ mod tests {
             handle.send(InputMessage::user_text(root(), "what time is it?"), "input-1").await?;
             assert!(harness.model.next_request().await.tools.is_empty(), "`now` was offered without its cap");
 
-            let direct = harness.authority.admit_tool(&root(), Cap::Now).await;
-            assert!(matches!(direct, Err(Denied::NotGranted("now"))), "{direct:?}");
+            let direct = harness.authority.admit_tool(&root(), &Cap::Now).await;
+            assert!(matches!(&direct, Err(Denied::NotGranted(cap)) if cap == "now"), "{direct:?}");
 
             Ok(())
         })

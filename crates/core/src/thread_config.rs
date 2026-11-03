@@ -17,7 +17,8 @@ use infinity_agent_core::system::local::ChannelSender;
 use infinity_agent_core::system::{NoRapHttp, ThreadConfig, ThreadConfigSource};
 use infinity_agent_core::tools::thread::CloseThreadTool;
 use infinity_agent_core::traits::ConversationStore;
-use shade_policy::{Cap, Origin};
+use shade_mcp::Servers;
+use shade_policy::{Cap, Caps, Origin};
 use shade_sandbox::Sandbox;
 use shade_schedule::jobfiles::JobFiles;
 use shade_store::conversation::Conversations;
@@ -28,6 +29,7 @@ use shade_store::roots::{Adapter, Conversation, Roots};
 use crate::authority::Authority;
 use crate::error::BoxError;
 use crate::notify::Notifier;
+use crate::tools::mcp::McpTool;
 use crate::tools::notify::Notify;
 use crate::tools::now::Now;
 use crate::tools::schedules::{self, Action, ScheduleTool};
@@ -52,6 +54,8 @@ pub struct Services {
     /// Present when an adapter can reach the owner. `notify` is offered without one and says so.
     pub notifier: Option<Notifier>,
     pub job_files: Arc<JobFiles>,
+    /// Configured MCP servers, running or not.
+    pub mcp: Arc<Servers>,
 }
 
 pub struct ThreadTools {
@@ -69,6 +73,26 @@ impl ThreadTools {
 }
 
 impl ThreadTools {
+    /// The tools of every granted MCP server that has started. A server that
+    /// is down offers nothing until it starts.
+    async fn add_mcp_tools(&self, caps: &Caps, config: &mut ThreadConfig<ChannelSender, NoRapHttp>) {
+        for cap in caps {
+            let Cap::Server(name) = cap else {
+                continue;
+            };
+
+            let Some(server) = self.services.mcp.get(name) else {
+                continue;
+            };
+
+            for tool in server.tools().await {
+                if let Some(tool) = McpTool::new(self.authority.clone(), self.operations.clone(), server, tool) {
+                    config.tools.push(Rc::new(tool));
+                }
+            }
+        }
+    }
+
     /// Where a chat conversation takes place, so the model knows who can read it.
     async fn place(&self, thread: &ThreadId<str>) -> Result<&'static str, BoxError> {
         let place = match Roots::new(self.db.clone()).conversation_of(thread).await? {
@@ -117,6 +141,8 @@ impl ThreadConfigSource<ChannelSender, NoRapHttp> for ThreadTools {
                 config.tools.push(Rc::new(ScheduleTool::new(action, &work, &authorized.caps)));
             }
         }
+
+        self.add_mcp_tools(&authorized.caps, &mut config).await;
 
         if authorized.caps.contains(&Cap::Shell)
             && let Some(sandbox) = &self.services.sandbox

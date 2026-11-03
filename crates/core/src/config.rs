@@ -30,6 +30,9 @@ pub struct Config {
     pub sandbox: Option<shade_sandbox::Config>,
     /// Owner chat over Discord. Off without this section.
     pub discord: Option<DiscordConfig>,
+    /// MCP servers by name. Each name is a capability that grants its tools.
+    #[serde(default)]
+    pub mcp: BTreeMap<String, shade_mcp::Config>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -122,11 +125,13 @@ pub struct Sections {
     pub limits: Limits,
     pub timezone: Option<String>,
     pub channels: BTreeMap<String, u64>,
+    /// MCP server names, with what each is for.
+    pub servers: BTreeMap<String, String>,
 }
 
 /// Builds and checks the policy, so a bad config fails at startup rather than at dispatch.
 pub fn policy(path: &Path, config: Sections) -> Result<Policy, Error> {
-    let Sections { chat, jobs, hooks, limits, timezone, channels } = config;
+    let Sections { chat, jobs, hooks, limits, timezone, channels, servers } = config;
 
     let timezone = match timezone {
         Some(name) => match name.parse::<Tz>() {
@@ -137,7 +142,7 @@ pub fn policy(path: &Path, config: Sections) -> Result<Policy, Error> {
     };
 
     let hooks = hooks.into_iter().map(|(name, hook)| (name, hook.caps)).collect();
-    let policy = Policy { chat: chat.caps, chat_prompt: chat.prompt, jobs_prompt: jobs.prompt, channels, hooks, limits, timezone };
+    let policy = Policy { chat: chat.caps, chat_prompt: chat.prompt, jobs_prompt: jobs.prompt, channels, servers, hooks, limits, timezone };
 
     if let Err(message) = policy.validate() {
         return Err(invalid(path, message));

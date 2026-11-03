@@ -51,7 +51,7 @@ impl<M: InputSender> Tool<M> for Now {
     async fn execute_synchronous(
         &self, _args: &serde_json::Value, id: &ToolCallId<str>, call_id: Option<&ProviderCallId<str>>, context: &ToolContext<M>,
     ) -> Option<ToolResult> {
-        let text = match self.authority.admit_tool(&context.group_id, Cap::Now).await {
+        let text = match self.authority.admit_tool(&context.group_id, &Cap::Now).await {
             Ok(_) => {
                 let now = Utc::now().with_timezone(&self.timezone);
                 format!("{} ({})", now.format("%A %Y-%m-%d %H:%M:%S %:z"), self.timezone.name())
