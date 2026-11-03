@@ -132,19 +132,27 @@ caps = ["now"]
 # background run with this hook's caps (never `schedules` or `watches`). The
 # event is stored before the sender gets `202`; a body that does not match the
 # condition gets `202` with nothing run. Bodies up to 64 KiB; anything the
-# condition cannot decide is a client error. The body is untrusted data: it
-# never chooses the run's caps or destination.
-# [hooks.github]
-# caps = ["now", "notify"]
-# token_env = "SHADE_HOOK_GITHUB"        # read like model.api_key_env
-# condition = { pointer = "/workflow_run/conclusion", op = "==", value = "failure" }
-# delivery_header = "X-GitHub-Delivery"  # a repeated ID gets the earlier acceptance
-# template = "Summarize this failed run.\n<body>\n{body}\n</body>"   # {hook} and {body}
+# condition cannot decide is a client error. An unknown hook gets the same
+# `401` as a wrong token.
+#
+# The body is untrusted: it never chooses the run's caps or destination, but
+# whatever sends events can steer what the run does with the caps it has.
+# Start hooks at `notify`; give one `shell` or a server that writes only if you
+# trust everything that can reach it.
+# [hooks.backup]
+# caps = ["notify"]
+# token_env = "SHADE_HOOK_BACKUP"        # at least 32 characters: `openssl rand -hex 32`
+# condition = { pointer = "/status", op = "==", value = "failed" }
+# delivery_header = "X-Delivery-Id"      # a repeated ID gets the earlier acceptance
+# template = "The nightly backup reported:\n<body>\n{body}\n</body>"   # {hook} and {body}
 # max_per_minute = 10                    # more get 429
 # max_queued = 20                        # more get 429
 #
-# Where webhooks are served. Localhost by default: put a reverse proxy or
-# tunnel of your choice in front to receive events from the internet.
+# Where webhooks are served: loopback or this machine's Tailscale address
+# only; anything else stops startup. To reach them from your other devices
+# over HTTPS, keep the default and run
+#   tailscale serve --bg --https=443 http://127.0.0.1:8787
+# then POST to https://<machine>.<tailnet>.ts.net/hook/<name>.
 # [http]
 # listen = "127.0.0.1:8787"
 

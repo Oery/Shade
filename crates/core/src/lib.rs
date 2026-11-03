@@ -38,7 +38,7 @@ use shade_store::grants::Grants;
 
 use crate::adapters::discord::Discord;
 use crate::adapters::socket::ControlSocket;
-use crate::adapters::webhook::{Hook, Webhooks};
+use crate::adapters::webhook::{Hook, MIN_TOKEN, Webhooks, listen_address};
 use crate::config::Config;
 use crate::config::{HookConfig, HttpConfig};
 use crate::memory::Memory;
@@ -162,7 +162,7 @@ async fn start_webhooks(
 
     for (name, hook) in hooks {
         let token = match secrets.take(&hook.token_env) {
-            Some(token) if !token.is_empty() => token,
+            Some(token) if token.len() >= MIN_TOKEN => token,
             _ => return Err(Error::HookToken { hook: name, name: hook.token_env }),
         };
 
@@ -175,7 +175,12 @@ async fn start_webhooks(
         served.insert(name, hook);
     }
 
-    let listener = match TcpListener::bind(&http.listen).await {
+    let address = match listen_address(&http.listen) {
+        Ok(address) => address,
+        Err(message) => return Err(Error::ConfigInvalid { path: path.to_owned(), message }),
+    };
+
+    let listener = match TcpListener::bind(address).await {
         Ok(listener) => listener,
         Err(source) => return Err(Error::Webhooks { listen: http.listen, source }),
     };

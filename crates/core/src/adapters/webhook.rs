@@ -8,12 +8,18 @@
 //! retries rather than losing the event. The body never chooses the run's
 //! grant, origin, or destination: those come from the hook's config.
 //!
-//! The listener binds to localhost by default; exposing it is for a reverse
-//! proxy or tunnel the owner chooses.
+//! Webhooks are for this machine and the owner's tailnet: the listener only
+//! binds loopback or Tailscale addresses (`tailscale serve` in front of
+//! localhost adds HTTPS). An unknown hook and a wrong token get the same
+//! answer after the same comparison, so hook names cannot be probed.
+//! Connections are capped, and a client that does not send its request in
+//! time is dropped.
 
 use std::collections::BTreeMap;
 use std::convert::Infallible;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
+use std::time::Duration;
 
 use bytes::Bytes;
 use http::{Method, Request, Response, StatusCode, header};
@@ -21,17 +27,30 @@ use http_body_util::{BodyExt, Full, Limited};
 use hyper::body::Incoming;
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
-use hyper_util::rt::TokioIo;
+use hyper_util::rt::{TokioIo, TokioTimer};
 use shade_condition::Condition;
 use shade_store::hooks::{Accepted, Admission, HookEvents};
 use subtle::ConstantTimeEq;
 use tokio::net::TcpListener;
-use tokio::sync::mpsc;
+use tokio::sync::{Semaphore, mpsc};
 
 use crate::router::Inbound;
 
 /// Largest body accepted.
 const MAX_BODY: usize = 64 * 1024;
+
+/// Shortest hook token accepted at startup.
+pub const MIN_TOKEN: usize = 32;
+
+/// Connections served at once; more wait to be accepted.
+const MAX_CONNECTIONS: usize = 32;
+
+/// How long a client has to send a request's headers, and then its body.
+const HEADER_TIMEOUT: Duration = Duration::from_secs(10);
+const BODY_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Compared against for an unknown hook, so it costs what a wrong token does.
+const UNKNOWN_HOOK: &str = "no hook has this name; this token is only ever compared, never accepted";
 
 /// One configured hook, ready to serve.
 pub struct Hook {
@@ -47,6 +66,8 @@ pub struct Webhooks {
     events: HookEvents,
     /// Tells the router a new event can start.
     inbound: mpsc::Sender<Inbound>,
+    header_timeout: Duration,
+    body_timeout: Duration,
 }
 
 /// An answer: a status and a small JSON body.
@@ -54,12 +75,18 @@ type Answer = Response<Full<Bytes>>;
 
 impl Webhooks {
     pub fn new(hooks: BTreeMap<String, Hook>, events: HookEvents, inbound: mpsc::Sender<Inbound>) -> Self {
-        Self { hooks, events, inbound }
+        Self { hooks, events, inbound, header_timeout: HEADER_TIMEOUT, body_timeout: BODY_TIMEOUT }
     }
 
-    /// Serves requests until the task is dropped.
+    /// Serves requests until the task is dropped, at most `MAX_CONNECTIONS` at a time.
     pub async fn serve(self: Arc<Self>, listener: TcpListener) {
+        let permits = Arc::new(Semaphore::new(MAX_CONNECTIONS));
+
         loop {
+            let Ok(permit) = Arc::clone(&permits).acquire_owned().await else {
+                return; // The semaphore is never closed.
+            };
+
             let stream = match listener.accept().await {
                 Ok((stream, _)) => stream,
                 Err(error) => {
@@ -74,19 +101,37 @@ impl Webhooks {
                 async move { Ok::<_, Infallible>(webhooks.handle(request).await) }
             });
 
+            // The header timeout also covers a kept-alive connection waiting for its next request.
+            let mut connection = http1::Builder::new();
+            connection.timer(TokioTimer::new()).header_read_timeout(self.header_timeout);
+
             tokio::spawn(async move {
-                if let Err(error) = http1::Builder::new().serve_connection(TokioIo::new(stream), service).await {
+                if let Err(error) = connection.serve_connection(TokioIo::new(stream), service).await {
                     tracing::debug!(%error, "webhook connection ended");
                 }
+
+                drop(permit);
             });
         }
     }
 
     async fn handle(&self, request: Request<Incoming>) -> Answer {
-        let name = request.uri().path().strip_prefix("/hook/").unwrap_or_default().to_owned();
+        let Some(name) = request.uri().path().strip_prefix("/hook/").filter(|_| request.method() == Method::POST) else {
+            return answer(StatusCode::NOT_FOUND, serde_json::json!({ "error": "only POST /hook/<name> is served" }));
+        };
 
-        let Some(hook) = self.hooks.get(&name).filter(|_| request.method() == Method::POST) else {
-            return answer(StatusCode::NOT_FOUND, serde_json::json!({ "error": "no such hook" }));
+        let name = name.to_owned();
+        let hook = self.hooks.get(&name);
+
+        // An unknown hook is refused like a wrong token, after the same comparison.
+        let valid = authorized(&request, hook.map_or(UNKNOWN_HOOK, |hook| hook.token.as_str()));
+
+        let (Some(hook), true) = (hook, valid) else {
+            tracing::info!(
+                hook = if hook.is_some() { name.as_str() } else { "(unknown)" },
+                "webhook request refused: no valid token"
+            );
+            return answer(StatusCode::UNAUTHORIZED, serde_json::json!({ "error": "missing or wrong bearer token" }));
         };
 
         let response = self.receive(&name, hook, request).await;
@@ -95,16 +140,14 @@ impl Webhooks {
         response
     }
 
+    /// An authenticated request: read, filter, and accept.
     async fn receive(&self, name: &str, hook: &Hook, request: Request<Incoming>) -> Answer {
-        if !authorized(&request, &hook.token) {
-            return answer(StatusCode::UNAUTHORIZED, serde_json::json!({ "error": "missing or wrong bearer token" }));
-        }
-
         let delivery = hook.delivery_header.as_deref().and_then(|header| request.headers().get(header)?.to_str().ok().map(str::to_owned));
 
-        let body = match read(request).await {
-            Ok(body) => body,
-            Err(status) => return answer(status, serde_json::json!({ "error": "the body is too large or unreadable" })),
+        let body = match tokio::time::timeout(self.body_timeout, read(request)).await {
+            Ok(Ok(body)) => body,
+            Ok(Err(status)) => return answer(status, serde_json::json!({ "error": "the body is too large or unreadable" })),
+            Err(_) => return answer(StatusCode::REQUEST_TIMEOUT, serde_json::json!({ "error": "the body did not arrive in time" })),
         };
 
         if let Some(refusal) = filter(hook.condition.as_ref(), &body) {
@@ -132,6 +175,32 @@ impl Webhooks {
                 retry(StatusCode::SERVICE_UNAVAILABLE, "the event could not be recorded; retry later", 30)
             }
         }
+    }
+}
+
+/// The address webhooks are served on, if it reaches only this machine or
+/// the owner's tailnet: loopback, or a Tailscale address (`100.64.0.0/10`,
+/// `fd7a:115c:a1e0::/48`). Anything else would expose Shade on whatever
+/// network the machine joins.
+pub fn listen_address(listen: &str) -> Result<SocketAddr, String> {
+    let Ok(address) = listen.parse::<SocketAddr>() else {
+        return Err(format!("[http] listen `{listen}` must be an IP address and a port, such as 127.0.0.1:8787"));
+    };
+
+    if !loopback_or_tailnet(address.ip()) {
+        return Err(format!(
+            "[http] listen `{listen}` would serve webhooks beyond this machine and your tailnet; \
+             use 127.0.0.1 (with `tailscale serve` in front) or this machine's Tailscale address"
+        ));
+    }
+
+    Ok(address)
+}
+
+fn loopback_or_tailnet(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(ip) => ip.is_loopback() || (ip.octets()[0] == 100 && ip.octets()[1] & 0b1100_0000 == 0b0100_0000),
+        IpAddr::V6(ip) => ip.is_loopback() || ip.segments()[..3] == [0xfd7a, 0x115c, 0xa1e0],
     }
 }
 
@@ -211,6 +280,7 @@ mod tests {
     use std::collections::BTreeMap;
     use std::net::SocketAddr;
     use std::sync::Arc;
+    use std::time::Duration;
 
     use shade_store::db::Db;
     use shade_store::hooks::{Admission, HookEvents};
@@ -218,8 +288,55 @@ mod tests {
     use tokio::net::{TcpListener, TcpStream};
     use tokio::sync::mpsc;
 
-    use super::{Hook, MAX_BODY, Webhooks};
+    use super::{Hook, MAX_BODY, Webhooks, listen_address};
     use crate::error::BoxError;
+
+    async fn serve(webhooks: Webhooks) -> Result<SocketAddr, BoxError> {
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let address = listener.local_addr()?;
+        tokio::spawn(Arc::new(webhooks).serve(listener));
+
+        Ok(address)
+    }
+
+    /// A client that connects and never sends its request is dropped.
+    #[tokio::test]
+    async fn silent_clients_are_dropped() -> Result<(), BoxError> {
+        let (inbound, _queue) = mpsc::channel(4);
+        let mut webhooks = Webhooks::new(BTreeMap::new(), HookEvents::new(Db::in_memory()?), inbound);
+        webhooks.header_timeout = Duration::from_millis(200);
+        let address = serve(webhooks).await?;
+
+        let mut stream = TcpStream::connect(address).await?;
+        let mut rest = Vec::new();
+        let closed = tokio::time::timeout(Duration::from_secs(5), stream.read_to_end(&mut rest)).await;
+
+        assert!(closed.is_ok(), "a silent connection was kept open");
+
+        Ok(())
+    }
+
+    /// Only loopback and Tailscale addresses are served.
+    #[test]
+    fn webhooks_stay_on_this_machine_and_the_tailnet() {
+        let cases = [
+            ("127.0.0.1:8787", true),
+            ("[::1]:8787", true),
+            ("100.64.0.1:8787", true),
+            ("100.127.255.254:8787", true),
+            ("[fd7a:115c:a1e0::1]:8787", true),
+            ("100.63.255.255:8787", false),
+            ("100.128.0.1:8787", false),
+            ("0.0.0.0:8787", false),
+            ("[::]:8787", false),
+            ("192.168.1.10:8787", false),
+            ("localhost:8787", false),
+        ];
+
+        for (listen, served) in cases {
+            assert_eq!(listen_address(listen).is_ok(), served, "{listen}");
+        }
+    }
 
     /// Path, token, delivery ID, body, and the expected status.
     type Case<'a> = (&'a str, Option<&'a str>, Option<&'a str>, &'a str, u16);
@@ -266,16 +383,16 @@ mod tests {
         };
 
         let (inbound, _queue) = mpsc::channel(4);
-        let webhooks = Arc::new(Webhooks::new(BTreeMap::from([("ci".to_owned(), hook)]), events.clone(), inbound));
-        let listener = TcpListener::bind("127.0.0.1:0").await?;
-        let address = listener.local_addr()?;
-        tokio::spawn(webhooks.serve(listener));
+        let webhooks = Webhooks::new(BTreeMap::from([("ci".to_owned(), hook)]), events.clone(), inbound);
+        let address = serve(webhooks).await?;
 
         let failure = r#"{"conclusion": "failure"}"#;
         let too_large = "x".repeat(MAX_BODY + 1);
 
-        let cases: [Case<'_>; 9] = [
-            ("/hook/other", Some("secret"), None, failure, 404),
+        let cases: [Case<'_>; 10] = [
+            ("/other", Some("secret"), None, failure, 404),
+            // An unknown hook looks exactly like a wrong token.
+            ("/hook/other", Some("secret"), None, failure, 401),
             ("/hook/ci", None, None, failure, 401),
             ("/hook/ci", Some("secreT"), None, failure, 401),
             ("/hook/ci", Some("secret"), None, &too_large, 413),

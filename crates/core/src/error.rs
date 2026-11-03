@@ -76,7 +76,10 @@ pub enum Error {
     #[error("{0}")]
     McpServer(String),
 
-    #[error("{name} ([hooks.{hook}] token_env) is not set, or empty, in the environment or the .env file next to the config")]
+    #[error(
+        "{name} ([hooks.{hook}] token_env) is not set in the environment or the .env file next to the config, or is shorter \
+         than 32 characters; generate one with `openssl rand -hex 32`"
+    )]
     HookToken { hook: String, name: String },
 
     #[error("cannot serve webhooks on {listen} ([http] listen): {source}")]
