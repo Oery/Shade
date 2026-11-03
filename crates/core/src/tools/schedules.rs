@@ -351,8 +351,7 @@ impl Work {
         let card = Card { verb: Verb::Proposed { new: base_version.is_none() }, ..card };
 
         let said = format!(
-            "Job {id} is not {} yet: it would hold {}, beyond the owner's agent_caps, so the owner was asked to approve \
-             it and sees its details. Don't repeat them or explain the approval.",
+            "Job {id} is not {} yet: it would hold {}, beyond the owner's agent_caps, so the owner was asked to approve it. {SHOWN}",
             if base_version.is_none() { "created" } else { "changed" },
             beyond.join(", ")
         );
@@ -465,12 +464,16 @@ fn said(card: &Card, id: &str) -> String {
     let done = match card.verb {
         Verb::Created => "Created",
         Verb::Updated => "Updated",
-        Verb::Deleted => return format!("Deleted job {id}. The owner sees this; just acknowledge it briefly if at all."),
+        Verb::Deleted => "Deleted",
         Verb::Proposed { .. } => "Proposed",
     };
 
-    format!("{done} job {id}; next run: {}. The owner sees its details, so don't repeat them.", card.next_run())
+    format!("{done} job {id} (next run: {}). {SHOWN}", card.next_run())
 }
+
+/// The card is the answer; anything the model adds would repeat it.
+const SHOWN: &str = "Shade has shown the owner a card with every detail, and it answers them. End your turn now without \
+                     writing anything, unless the owner also asked for something else.";
 
 fn parse<T: DeserializeOwned>(args: serde_json::Value) -> Result<T, String> {
     match serde_json::from_value(args) {

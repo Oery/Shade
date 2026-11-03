@@ -35,8 +35,8 @@ use crate::tools::shell::Shell;
 /// Owner chat, always; the owner's `[chat] prompt` follows and can change the style.
 const CHAT_PROMPT: &str = "You are chatting with your owner, on Discord or in a terminal. Keep replies short: answer in a \
                            sentence or two, and offer details, options or caveats only when asked. When a tool result \
-                           says the owner sees its details, Shade has already shown them: acknowledge in a few words at \
-                           most and never restate them.";
+                           says Shade has shown the owner a card, the card is the answer: write nothing after it, \
+                           unless the owner asked for something else too.";
 
 /// Background runs have no reader: only `notify` reaches the owner.
 const JOBS_PROMPT: &str = "You are running a background job for your owner, started by a schedule. Nobody reads your \
