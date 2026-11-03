@@ -20,6 +20,7 @@ const ARCHIVE_AFTER: i64 = 24 * 3600;
 impl Router {
     /// Claims every due occurrence, then starts queued runs while capacity
     /// allows, then archives one-shot jobs that are long done.
+    #[allow(clippy::cognitive_complexity, reason = "the score comes from the expansion of three tracing macros")]
     pub async fn schedule(&self, now: DateTime<Utc>) {
         if let Err(error) = self.claim_due(now).await {
             tracing::error!(%error, "cannot claim due jobs");
