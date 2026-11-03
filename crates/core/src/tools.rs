@@ -3,12 +3,14 @@
 
 pub mod notify;
 pub mod now;
+pub mod schedules;
 pub mod shell;
 
 use infinity_agent_core::ThreadId;
 use infinity_agent_core::message::{InputMessage, InputMessageContent};
 use infinity_agent_core::traits::InputSender;
 use infinity_provider_protocol::message::{Text, ToolResult, ToolResultContent, UserContent};
+use rap_protocol::DisplaySegment;
 
 use crate::recovery::UNKNOWN_OUTCOME;
 use crate::store::operations::{Operations, Started};
@@ -18,6 +20,14 @@ use crate::store::operations::{Operations, Started};
 pub async fn deliver<M: InputSender>(
     sender: &M, thread: ThreadId, id: String, call_id: Option<String>, text: String,
 ) -> Result<(), M::Error> {
+    deliver_shown(sender, thread, id, call_id, text, None).await
+}
+
+/// Like [`deliver`], with `shown` displayed to the owner as written by
+/// Shade, not by the model: chat adapters post it as it is.
+pub async fn deliver_shown<M: InputSender>(
+    sender: &M, thread: ThreadId, id: String, call_id: Option<String>, text: String, shown: Option<String>,
+) -> Result<(), M::Error> {
     let dedup_id = id.clone();
     let result = ToolResult { id, call_id, content: vec![ToolResultContent::Text(Text { text })] };
 
@@ -26,7 +36,7 @@ pub async fn deliver<M: InputSender>(
         group_id: thread,
         metadata: None,
         synthetic: None,
-        display_as: None,
+        display_as: shown.map(|text| vec![DisplaySegment::Text(text)]),
         subscription: false,
     };
 

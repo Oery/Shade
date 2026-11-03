@@ -37,6 +37,18 @@ impl Cap {
         }
     }
 
+    /// What the capability lets a scheduled run do, for the model choosing caps.
+    pub fn description(self) -> &'static str {
+        match self {
+            Self::Now => "read the current time",
+            Self::Notify => "send the owner a message (the usual way a job reports)",
+            Self::Shell => "run commands in the sandboxed workspace",
+            Self::ShellNetwork => "give shell commands network access (needs shell)",
+            Self::Schedules => "manage scheduled jobs (owner chat only)",
+            Self::Watches => "manage watches (owner chat only)",
+        }
+    }
+
     fn parse(name: &str) -> Option<Self> {
         Self::ALL.into_iter().find(|cap| cap.name() == name)
     }
@@ -215,6 +227,11 @@ impl Policy {
             Origin::Webhook => self.hooks.get(source).cloned(),
         }
     }
+}
+
+/// The caps a holder of `caps` may give a job: its own, minus management.
+pub fn delegable(caps: &Caps) -> Caps {
+    caps.iter().copied().filter(|cap| !cap.is_management()).collect()
 }
 
 fn check_caps(section: &str, caps: &Caps) -> Result<(), String> {

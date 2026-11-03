@@ -12,7 +12,7 @@ use crate::notify::Notifier;
 use crate::router::turn::Step;
 use crate::schedule::{self, Trigger};
 use crate::store::db::DbError;
-use crate::store::schedules::{Due, Listed, Run, Schedules};
+use crate::store::schedules::{Due, Run, Schedules};
 
 impl Router {
     /// Claims every due occurrence, then starts queued runs while capacity allows.
@@ -112,7 +112,7 @@ impl Router {
 
     async fn list_jobs(&self) -> Result<String, String> {
         match self.schedules.list().await {
-            Ok(jobs) => Ok(render(&jobs)),
+            Ok(jobs) => Ok(schedule::list(&jobs)),
             Err(error) => Err(format!("cannot read jobs: {error}")),
         }
     }
@@ -136,31 +136,19 @@ impl Router {
     /// A resumed cron job runs from its next occurrence after `now`: time
     /// spent paused is not caught up. A one-shot job that never ran keeps its instant.
     async fn resume_job(&self, id: String, now: DateTime<Utc>) -> Result<String, String> {
-        let job = match self.schedules.list().await {
-            Ok(jobs) => jobs.into_iter().find(|job| job.id == id),
+        let job = match self.schedules.get(&id).await {
+            Ok(Some(job)) => job.definition,
+            Ok(None) => return Err(format!("no job {id}")),
             Err(error) => return Err(format!("cannot read jobs: {error}")),
         };
 
-        let Some(job) = job else {
-            return Err(format!("no job {id}"));
-        };
-
-        let trigger = Trigger::parse(&job.kind, &job.spec, &job.timezone)?;
-
-        let next = match trigger {
-            Trigger::Once => job.next_at,
-            Trigger::Cron { .. } => trigger.next_after(now).map(|next| next.timestamp()),
-        };
-
-        let Some(next) = next else {
-            return Err(format!("{id} has no occurrence left to run"));
-        };
+        let next = schedule::resumed_next(&job, now)?;
 
         if let Err(error) = self.schedules.resume(id.to_owned(), next).await {
             return Err(format!("cannot resume {id}: {error}"));
         }
 
-        Ok(format!("Resumed {id}. Next run: {}", when(Some(next), &job.timezone)))
+        Ok(format!("Resumed {id}. Next run: {}", schedule::when(Some(next), &job.timezone)))
     }
 }
 
@@ -181,7 +169,7 @@ pub(super) async fn report(run: &Run, schedules: &Schedules, notifier: Option<&N
         Step::Done => None,
         Step::Failed(message) => Some(message.as_str()),
         Step::Superseded => Some(SUPERSEDED),
-        Step::Text(_) | Step::Paused => return,
+        Step::Text(_) | Step::Paused | Step::Receipt(_) => return,
     };
 
     tracing::info!(run = %run.id, error, "a scheduled run ended");
@@ -194,40 +182,4 @@ pub(super) async fn report(run: &Run, schedules: &Schedules, notifier: Option<&N
         let text = format!("⚠️ Scheduled job \"{}\" failed (run {}): {message}", run.title, run.id);
         notifier.failure(&ThreadId::from(thread.to_owned()), text).await;
     }
-}
-
-fn render(jobs: &[Listed]) -> String {
-    if jobs.is_empty() {
-        return "No scheduled jobs.".to_owned();
-    }
-
-    let mut text = String::new();
-
-    for job in jobs {
-        let state = match (job.enabled, job.next_at) {
-            (true, _) => "enabled",
-            (false, Some(_)) => "paused",
-            (false, None) => "done",
-        };
-        let last = match &job.last_run {
-            Some((status, at)) => format!("{status} (due {})", when(Some(*at), &job.timezone)),
-            None => "none".to_owned(),
-        };
-
-        text.push_str(&format!("{}  {}  [{state}]\n", job.id, job.title));
-        text.push_str(&format!("    {} `{}` in {}\n", job.kind, job.spec, job.timezone));
-        text.push_str(&format!("    next: {}  last run: {last}\n", when(job.next_at, &job.timezone)));
-    }
-
-    text.pop();
-
-    text
-}
-
-fn when(at: Option<i64>, timezone: &str) -> String {
-    let Some(instant) = at.and_then(|at| DateTime::from_timestamp(at, 0)) else {
-        return "none".to_owned();
-    };
-
-    schedule::local(instant, timezone.parse().unwrap_or(chrono_tz::UTC))
 }

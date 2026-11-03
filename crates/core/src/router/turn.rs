@@ -1,6 +1,7 @@
 //! Follows one turn's events and decides what its sender sees.
 
 use infinity_agent_core::system::AgentEvent;
+use rap_protocol::DisplaySegment;
 
 /// What a turn's sender is told.
 #[derive(Debug, PartialEq)]
@@ -11,6 +12,8 @@ pub enum Step {
     Paused,
     Done,
     Failed(String),
+    /// A tool result Shade wrote for the owner to see, such as a job receipt.
+    Receipt(String),
     /// Newer input to the same conversation interrupted this turn.
     Superseded,
 }
@@ -71,9 +74,9 @@ impl Turn {
                 self.pending_tools += 1;
                 None
             }
-            AgentEvent::ToolResult { .. } => {
+            AgentEvent::ToolResult { segments } => {
                 self.pending_tools = self.pending_tools.saturating_sub(1);
-                None
+                shown(segments)
             }
             AgentEvent::CompletionFinished { .. } if self.pending_tools > 0 && self.failure.is_none() => {
                 self.started = false;
@@ -86,7 +89,8 @@ impl Turn {
 
     /// Before a completion starts, an error means none will run, so it ends the turn.
     fn on_info(&mut self, text: String) -> Option<Step> {
-        let message = text.strip_prefix("Error: ")?.to_owned();
+        let message = text.strip_prefix("Error: ")?;
+        let message = message.strip_prefix("ProviderError: ").unwrap_or(message).to_owned();
 
         if !self.started {
             return Some(Step::Failed(message));
@@ -105,9 +109,23 @@ impl Turn {
     }
 }
 
+/// The owner's copy of a tool result: Shade's tools put it before the result
+/// the model reads. Results with nothing to show have a single segment.
+fn shown(segments: Vec<DisplaySegment>) -> Option<Step> {
+    if segments.len() < 2 {
+        return None;
+    }
+
+    match segments.into_iter().next() {
+        Some(DisplaySegment::Text(text)) => Some(Step::Receipt(text)),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use infinity_agent_core::system::AgentEvent;
+    use rap_protocol::DisplaySegment;
 
     use super::{Step, Turn};
 
@@ -152,6 +170,7 @@ mod tests {
                 Step::Paused => "paused".to_owned(),
                 Step::Done => "done".to_owned(),
                 Step::Failed(message) => format!("error: {message}"),
+                Step::Receipt(text) => format!("receipt: {text}"),
                 Step::Superseded => "superseded".to_owned(),
             });
 
@@ -191,6 +210,21 @@ mod tests {
             (
                 vec![input("hi"), started(), tool_call(), finished(), tool_result(), started(), text("answer"), finished()],
                 vec!["paused", "answer", "done"],
+            ),
+            // A receipt Shade wrote is shown; the model's copy of the result is not.
+            (
+                vec![
+                    input("hi"),
+                    started(),
+                    tool_call(),
+                    finished(),
+                    AgentEvent::ToolResult {
+                        segments: vec![DisplaySegment::Text("created".to_owned()), DisplaySegment::Text("created".to_owned())],
+                    },
+                    started(),
+                    finished(),
+                ],
+                vec!["paused", "receipt: created", "done"],
             ),
             // A synchronous tool answers inside the completion.
             (

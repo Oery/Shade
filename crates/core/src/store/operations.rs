@@ -67,6 +67,13 @@ impl Operations {
             .await
     }
 
+    /// The captured result of a call, if it has one.
+    pub async fn captured(&self, thread: &str, call: &str) -> Result<Option<String>, DbError> {
+        let (thread, call) = (thread.to_owned(), call.to_owned());
+
+        self.db.call(move |connection| captured(connection, &thread, &call)).await
+    }
+
     /// For startup recovery: the captured result of an unanswered call, or
     /// `None` after marking its outcome unknown. Calls recorded by no row
     /// (the daemon died before dispatch finished) get one.
@@ -163,7 +170,16 @@ fn unanswered(trailing: Vec<InfinityMessage>) -> Vec<ToolCall> {
     calls
 }
 
-fn captured(connection: &Connection, thread: &str, call: &str) -> Result<Option<String>, DbError> {
+/// Records a call answered inside the caller's transaction, with the change it made.
+pub fn insert_done(connection: &Connection, thread: &str, call: &str, tool: &str, result: &str) -> Result<(), DbError> {
+    let sql =
+        "INSERT INTO tool_operations (thread_id, call_id, tool, state, result, finished_at) VALUES (?1, ?2, ?3, 'done', ?4, unixepoch())";
+    connection.execute(sql, params![thread, call, tool, result])?;
+
+    Ok(())
+}
+
+pub fn captured(connection: &Connection, thread: &str, call: &str) -> Result<Option<String>, DbError> {
     let sql = "SELECT result FROM tool_operations WHERE thread_id = ?1 AND call_id = ?2 AND state = 'done'";
     let result = connection.query_row(sql, params![thread, call], |row| row.get(0)).optional()?;
 

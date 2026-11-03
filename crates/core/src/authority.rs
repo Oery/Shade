@@ -34,6 +34,9 @@ pub enum Denied {
     #[error("`{0}` is not granted to this conversation")]
     NotGranted(&'static str),
 
+    #[error("`{0}` can only be used in owner chat")]
+    NotChat(&'static str),
+
     #[error("thread {0} has no work budget")]
     NoBudget(String),
 
@@ -88,6 +91,17 @@ impl Authority {
         }
 
         self.charge(thread, Charge::ToolCall).await?;
+
+        Ok(authorized)
+    }
+
+    /// Admits one call of a management tool: owner chat only, whatever the grant says.
+    pub async fn admit_management(&self, thread: &ThreadId<str>, cap: Cap) -> Result<Authorized, Denied> {
+        let authorized = self.admit_tool(thread, cap).await?;
+
+        if authorized.origin != Origin::Chat {
+            return Err(Denied::NotChat(cap.name()));
+        }
 
         Ok(authorized)
     }

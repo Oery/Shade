@@ -7,10 +7,13 @@
 //! that no longer matches the pattern is skipped, and so is the second pass
 //! of a repeated local time.
 
-use chrono::{DateTime, LocalResult, TimeZone, Utc};
+use chrono::{DateTime, LocalResult, NaiveDateTime, TimeZone, Utc};
 use chrono_tz::Tz;
 use croner::Cron;
 use croner::parser::{CronParser, Seconds, Year};
+use serde::Deserialize;
+
+use crate::store::schedules::{Definition, Job};
 
 /// Candidates examined before deciding a pattern never runs (it only
 /// matches inside DST gaps, or on a date that does not exist).
@@ -51,6 +54,170 @@ impl Trigger {
             Self::Once => None,
         }
     }
+}
+
+/// A trigger as the model gives it. Cron versus one-shot is explicit, never guessed from text.
+#[derive(Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum TriggerArgs {
+    Cron { expression: String, timezone: Option<String> },
+    Once { at: String, timezone: Option<String> },
+}
+
+/// A validated trigger, ready to store.
+pub struct Timing {
+    pub kind: &'static str,
+    pub spec: String,
+    pub timezone: Tz,
+    pub next_at: DateTime<Utc>,
+}
+
+/// Validates `trigger` at `now`. Cron expressions are read in their time
+/// zone (`default` when absent); a one-shot time must be in the future and unambiguous.
+pub fn timing(trigger: TriggerArgs, default: Tz, now: DateTime<Utc>) -> Result<Timing, String> {
+    match trigger {
+        TriggerArgs::Cron { expression, timezone } => {
+            let timezone = zone(timezone.as_deref(), default)?;
+
+            let cron = match parse_cron(&expression) {
+                Ok(cron) => cron,
+                Err(error) => return Err(format!("invalid cron expression `{expression}` (five fields, minute resolution): {error}")),
+            };
+
+            let Some(next_at) = next_cron(&cron, timezone, now) else {
+                return Err(format!("`{expression}` never matches a time that exists in {timezone}"));
+            };
+
+            Ok(Timing { kind: "cron", spec: expression, timezone, next_at })
+        }
+        TriggerArgs::Once { at, timezone } => {
+            let zone_given = match &timezone {
+                Some(name) => Some(zone(Some(name), default)?),
+                None => None,
+            };
+
+            let next_at = once_at(&at, zone_given)?;
+
+            if next_at <= now {
+                return Err(format!("`{at}` is in the past"));
+            }
+
+            Ok(Timing { kind: "once", spec: at, timezone: zone_given.unwrap_or(default), next_at })
+        }
+    }
+}
+
+fn zone(name: Option<&str>, default: Tz) -> Result<Tz, String> {
+    let Some(name) = name else {
+        return Ok(default);
+    };
+
+    match name.parse::<Tz>() {
+        Ok(timezone) => Ok(timezone),
+        Err(_) => Err(format!("unknown time zone `{name}`; use an IANA name such as Europe/Paris")),
+    }
+}
+
+/// A one-shot instant: an RFC 3339 time with its offset, or a local time
+/// read in an explicitly given zone. A local time that happens twice or
+/// never in that zone is refused rather than guessed.
+fn once_at(at: &str, timezone: Option<Tz>) -> Result<DateTime<Utc>, String> {
+    if let Ok(instant) = DateTime::parse_from_rfc3339(at) {
+        return Ok(instant.with_timezone(&Utc));
+    }
+
+    let Some(timezone) = timezone else {
+        return Err(format!("`{at}` has no UTC offset; add one (like 2026-11-06T09:00:00+01:00) or give `timezone`"));
+    };
+
+    let Some(local) = ["%Y-%m-%dT%H:%M:%S", "%Y-%m-%dT%H:%M"].iter().find_map(|format| NaiveDateTime::parse_from_str(at, format).ok())
+    else {
+        return Err(format!("`{at}` is not a time like 2026-11-06T09:00"));
+    };
+
+    match timezone.from_local_datetime(&local) {
+        LocalResult::Single(instant) => Ok(instant.with_timezone(&Utc)),
+        LocalResult::Ambiguous(first, second) => Err(format!(
+            "`{at}` happens twice in {timezone} (clocks go back); give the offset: {} or {}",
+            first.format("%:z"),
+            second.format("%:z")
+        )),
+        LocalResult::None => Err(format!("`{at}` does not exist in {timezone} (clocks go forward); choose another time")),
+    }
+}
+
+/// What a job is, in one paragraph, for receipts and listings.
+pub fn describe(id: &str, definition: &Definition) -> String {
+    let timezone = definition.timezone.parse::<Tz>().unwrap_or(chrono_tz::UTC);
+
+    let trigger = match definition.kind.as_str() {
+        "cron" => format!("cron `{}` in {}", definition.spec, definition.timezone),
+        _ => format!("once, `{}`", definition.spec),
+    };
+
+    let next = match (definition.enabled, definition.next_at.and_then(|at| DateTime::from_timestamp(at, 0))) {
+        (false, Some(_)) => "paused".to_owned(),
+        (_, Some(next)) => local(next, timezone),
+        (_, None) => "none (done)".to_owned(),
+    };
+
+    let caps = if definition.caps.is_empty() {
+        "none".to_owned()
+    } else {
+        definition.caps.join(", ")
+    };
+
+    format!(
+        "\"{}\" ({id})\n  trigger: {trigger}\n  next run: {next}\n  caps: {caps}\n  prompt: {}",
+        definition.title, definition.prompt
+    )
+}
+
+/// When a job resumed at `now` runs next: a cron job from its next
+/// occurrence (time spent paused is not caught up), a one-shot job at its
+/// instant if it has not run yet.
+pub fn resumed_next(definition: &Definition, now: DateTime<Utc>) -> Result<i64, String> {
+    let trigger = Trigger::parse(&definition.kind, &definition.spec, &definition.timezone)?;
+
+    let next = match trigger {
+        Trigger::Once => definition.next_at,
+        Trigger::Cron { .. } => trigger.next_after(now).map(|next| next.timestamp()),
+    };
+
+    match next {
+        Some(next) => Ok(next),
+        None => Err("the job has no occurrence left to run; give it a new trigger".to_owned()),
+    }
+}
+
+/// Every job, for the owner's CLI and the model's `schedule_list`.
+pub fn list(jobs: &[Job]) -> String {
+    if jobs.is_empty() {
+        return "No scheduled jobs.".to_owned();
+    }
+
+    let mut text = String::new();
+
+    for job in jobs {
+        let last = match &job.last_run {
+            Some((status, at)) => format!("{status} (due {})", when(Some(*at), &job.definition.timezone)),
+            None => "none".to_owned(),
+        };
+
+        text.push_str(&format!("{}\n  last run: {last}\n\n", describe(&job.id, &job.definition)));
+    }
+
+    text.truncate(text.trim_end().len());
+
+    text
+}
+
+pub fn when(at: Option<i64>, timezone: &str) -> String {
+    let Some(instant) = at.and_then(|at| DateTime::from_timestamp(at, 0)) else {
+        return "none".to_owned();
+    };
+
+    local(instant, timezone.parse().unwrap_or(chrono_tz::UTC))
 }
 
 /// Five fields, minute resolution: no seconds and no year.
@@ -106,7 +273,7 @@ pub fn local(instant: DateTime<Utc>, timezone: Tz) -> String {
 mod tests {
     use chrono::{DateTime, Utc};
 
-    use super::Trigger;
+    use super::{Trigger, TriggerArgs, timing};
 
     fn utc(text: &str) -> DateTime<Utc> {
         text.parse().unwrap_or_default()
@@ -145,5 +312,35 @@ mod tests {
     fn impossible_patterns_never_run() {
         // February 30th never comes; the search gives up instead of looping.
         assert_eq!(paris("0 0 30 2 *").next_after(utc("2026-01-01T00:00:00Z")), None);
+    }
+
+    /// One-shot times must be unambiguous instants in the future. Paris
+    /// falls back on 2027-10-31 (02:30 happens twice) and springs forward
+    /// on 2027-03-28 (02:30 never happens).
+    #[test]
+    fn one_shot_times_are_never_guessed() {
+        let now: DateTime<Utc> = "2026-11-03T12:00:00Z".parse().unwrap_or_default();
+        let paris = Some("Europe/Paris");
+
+        let cases = [
+            ("2027-10-31T02:30", paris, Err("happens twice")),
+            ("2027-03-28T02:30", paris, Err("does not exist")),
+            ("2026-11-06T09:00", None, Err("no UTC offset")),
+            ("2026-11-02T09:00:00+01:00", None, Err("in the past")),
+            ("2026-11-06T09:00", paris, Ok("2026-11-06T08:00:00Z")),
+            // An offset wins over the zone, which is kept for display.
+            ("2027-10-31T02:30:00+01:00", paris, Ok("2027-10-31T01:30:00Z")),
+        ];
+
+        for (at, timezone, expected) in cases {
+            let trigger = TriggerArgs::Once { at: at.to_owned(), timezone: timezone.map(str::to_owned) };
+
+            match (timing(trigger, chrono_tz::UTC, now), expected) {
+                (Ok(timing), Ok(instant)) => assert_eq!(timing.next_at.to_rfc3339(), instant.replace('Z', "+00:00"), "{at}"),
+                (Err(error), Err(reason)) => assert!(error.contains(reason), "{at}: {error}"),
+                (Ok(timing), Err(reason)) => panic!("{at} was accepted as {} instead of `{reason}`", timing.next_at),
+                (Err(error), Ok(_)) => panic!("{at} was refused: {error}"),
+            }
+        }
     }
 }

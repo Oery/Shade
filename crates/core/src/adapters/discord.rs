@@ -300,6 +300,13 @@ impl Reply {
                 self.flush().await;
                 post(&self.http, self.channel, &format!("⚠️ {message}"), self.answering.take()).await;
             }
+            Step::Receipt(text) => {
+                self.flush().await;
+
+                for chunk in chunks(&text, MESSAGE_LIMIT) {
+                    post(&self.http, self.channel, &chunk, self.answering.take()).await;
+                }
+            }
             Step::Superseded => self.buffer.clear(),
         }
 

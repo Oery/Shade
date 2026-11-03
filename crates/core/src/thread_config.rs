@@ -24,9 +24,12 @@ use crate::notify::Notifier;
 use crate::policy::{Cap, Origin};
 use crate::sandbox::Sandbox;
 use crate::store::conversation::Conversations;
+use crate::store::db::Db;
 use crate::store::operations::Operations;
+use crate::store::schedules::Schedules;
 use crate::tools::notify::Notify;
 use crate::tools::now::Now;
+use crate::tools::schedules::{self, Action, ScheduleTool};
 use crate::tools::shell::Shell;
 
 /// Background runs have no reader: only `notify` reaches the owner.
@@ -42,14 +45,16 @@ pub struct ThreadTools {
     sandbox: Option<Arc<Sandbox>>,
     /// Present when an adapter can reach the owner. `notify` is offered without one and says so.
     notifier: Option<Notifier>,
+    schedules: Schedules,
 }
 
 impl ThreadTools {
     pub fn new(
-        conversations: Conversations, authority: Authority, operations: Operations, sandbox: Option<Arc<Sandbox>>,
-        notifier: Option<Notifier>,
+        conversations: Conversations, authority: Authority, db: Db, sandbox: Option<Arc<Sandbox>>, notifier: Option<Notifier>,
     ) -> Self {
-        Self { conversations, authority, operations, sandbox, notifier }
+        let (operations, schedules) = (Operations::new(db.clone()), Schedules::new(db));
+
+        Self { conversations, authority, operations, sandbox, notifier, schedules }
     }
 }
 
@@ -75,6 +80,15 @@ impl ThreadConfigSource<ChannelSender, NoRapHttp> for ThreadTools {
         if authorized.caps.contains(&Cap::Notify) {
             let notify = Notify::new(self.authority.clone(), self.operations.clone(), self.notifier.clone());
             config.tools.push(Rc::new(notify));
+        }
+
+        // Management stays with owner chat even if a grant somehow held it.
+        if authorized.caps.contains(&Cap::Schedules) && authorized.origin == Origin::Chat {
+            let work = schedules::Work::new(self.authority.clone(), self.schedules.clone(), self.operations.clone());
+
+            for action in Action::ALL {
+                config.tools.push(Rc::new(ScheduleTool::new(action, &work, &authorized.caps)));
+            }
         }
 
         if authorized.caps.contains(&Cap::Shell)

@@ -14,6 +14,7 @@ use crate::policy::{Grant, Origin};
 use crate::store::db::{Db, DbError};
 use crate::store::grants::start_budget;
 use crate::store::inbox::{self, Input};
+use crate::store::operations;
 use crate::store::roots::{insert_root, new_id};
 
 /// A job whose next occurrence has come.
@@ -52,17 +53,64 @@ pub struct Run {
     pub title: String,
 }
 
-/// A job for `shade schedule list`.
-pub struct Listed {
-    pub id: String,
+/// Most jobs that may exist at once, paused ones included.
+pub const MAX_JOBS: i64 = 100;
+
+/// What a job does and when.
+pub struct Definition {
     pub title: String,
+    /// `cron` or `once`.
     pub kind: String,
     pub spec: String,
     pub timezone: String,
+    pub prompt: String,
+    /// Delegated to each run.
+    pub caps: Vec<String>,
     pub enabled: bool,
     pub next_at: Option<i64>,
+}
+
+/// A stored job.
+pub struct Job {
+    pub id: String,
+    pub version: i64,
+    pub definition: Definition,
     /// The latest run's status and occurrence.
     pub last_run: Option<(String, i64)>,
+}
+
+/// A change made by a schedule tool.
+pub enum Change {
+    Create {
+        id: String,
+        definition: Definition,
+    },
+    /// Applies only if the job is still at `version`.
+    Update {
+        id: String,
+        version: i64,
+        definition: Definition,
+    },
+    Delete {
+        id: String,
+    },
+}
+
+/// The tool call a change answers, and the receipt it answers with.
+pub struct Receipt {
+    pub thread: String,
+    pub call: String,
+    pub tool: &'static str,
+    pub text: String,
+}
+
+/// What applying a change did. Each outcome is the call's recorded result.
+pub enum Applied {
+    Done(String),
+    /// Refused without changing anything: the error to show.
+    Refused(String),
+    /// The call was answered before; its recorded result.
+    Replayed(String),
 }
 
 #[derive(Clone)]
@@ -174,8 +222,43 @@ impl Schedules {
         self.db.call(move |connection| interrupt_runs(connection, &resumed)).await
     }
 
-    pub async fn list(&self) -> Result<Vec<Listed>, DbError> {
+    pub async fn list(&self) -> Result<Vec<Job>, DbError> {
         self.db.call(list_jobs).await
+    }
+
+    /// A job that is not deleted.
+    pub async fn get(&self, id: &str) -> Result<Option<Job>, DbError> {
+        let jobs = self.list().await?;
+
+        Ok(jobs.into_iter().find(|job| job.id == id))
+    }
+
+    /// Applies `change` and records its result as the call's, in one
+    /// transaction: a call answered before replays its result instead.
+    pub async fn apply(&self, change: Change, receipt: Receipt) -> Result<Applied, DbError> {
+        self.db
+            .call(move |connection| {
+                let transaction = connection.transaction()?;
+
+                if let Some(result) = operations::captured(&transaction, &receipt.thread, &receipt.call)? {
+                    return Ok(Applied::Replayed(result));
+                }
+
+                let applied = match apply_change(&transaction, change, &receipt.thread)? {
+                    Some(refusal) => Applied::Refused(format!("Error: {refusal}")),
+                    None => Applied::Done(receipt.text),
+                };
+
+                let result = match &applied {
+                    Applied::Done(text) | Applied::Refused(text) | Applied::Replayed(text) => text,
+                };
+
+                operations::insert_done(&transaction, &receipt.thread, &receipt.call, receipt.tool, result)?;
+                transaction.commit()?;
+
+                Ok(applied)
+            })
+            .await
     }
 
     /// Stops new runs of a job. `false` when there is no such job.
@@ -250,10 +333,11 @@ fn startable_runs(connection: &mut Connection, capacity: u32) -> Result<Vec<Queu
 }
 
 fn start_run(connection: &Connection, run: &str, text: String) -> Result<Option<Input>, DbError> {
-    let sql = "SELECT s.id, s.caps FROM runs r JOIN schedules s ON s.id = r.schedule_id WHERE r.id = ?1 AND r.status = 'queued'";
-    let row: Option<(String, String)> = connection.query_row(sql, [run], |row| Ok((row.get(0)?, row.get(1)?))).optional()?;
+    let sql = "SELECT s.id, s.caps, s.version FROM runs r JOIN schedules s ON s.id = r.schedule_id WHERE r.id = ?1 AND r.status = 'queued'";
+    let row: Option<(String, String, i64)> =
+        connection.query_row(sql, [run], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?))).optional()?;
 
-    let Some((job, caps)) = row else {
+    let Some((job, caps, version)) = row else {
         return Ok(None);
     };
 
@@ -265,8 +349,9 @@ fn start_run(connection: &Connection, run: &str, text: String) -> Result<Option<
     let id = new_id();
     inbox::insert(connection, &id, &root, &text, Some(&format!("run:{run}")))?;
 
-    let sql = "UPDATE runs SET status = 'running', root_id = ?2, started_at = unixepoch() WHERE id = ?1";
-    connection.execute(sql, params![run, &root])?;
+    // A run starts with the definition current now, and records which one that is.
+    let sql = "UPDATE runs SET status = 'running', root_id = ?2, version = ?3, started_at = unixepoch() WHERE id = ?1";
+    connection.execute(sql, params![run, &root, version])?;
 
     Ok(Some(Input { root: ThreadId::from(root), id, text }))
 }
@@ -299,32 +384,85 @@ fn interrupt_runs(connection: &mut Connection, resumed: &[String]) -> Result<Vec
     Ok(interrupted)
 }
 
-fn list_jobs(connection: &mut Connection) -> Result<Vec<Listed>, DbError> {
-    let sql = "SELECT s.id, s.title, s.kind, s.spec, s.timezone, s.enabled, s.next_at, r.status, r.scheduled_for
+fn list_jobs(connection: &mut Connection) -> Result<Vec<Job>, DbError> {
+    let sql =
+        "SELECT s.id, s.version, s.title, s.kind, s.spec, s.timezone, s.prompt, s.caps, s.enabled, s.next_at, r.status, r.scheduled_for
                FROM schedules s LEFT JOIN runs r ON r.id =
                    (SELECT id FROM runs WHERE schedule_id = s.id ORDER BY scheduled_for DESC LIMIT 1)
                WHERE s.deleted_at IS NULL ORDER BY s.enabled DESC, s.next_at, s.created_at";
     let mut statement = connection.prepare(sql)?;
-    let rows = statement.query_map([], |row| {
-        let status: Option<String> = row.get(7)?;
+    let mut rows = statement.query([])?;
+    let mut jobs = Vec::new();
+
+    while let Some(row) = rows.next()? {
+        let caps: String = row.get(7)?;
+        let status: Option<String> = row.get(10)?;
+
         let last_run = match status {
-            Some(status) => Some((status, row.get(8)?)),
+            Some(status) => Some((status, row.get(11)?)),
             None => None,
         };
 
-        Ok(Listed {
-            id: row.get(0)?,
-            title: row.get(1)?,
-            kind: row.get(2)?,
-            spec: row.get(3)?,
-            timezone: row.get(4)?,
-            enabled: row.get(5)?,
-            next_at: row.get(6)?,
-            last_run,
-        })
-    })?;
+        let definition = Definition {
+            title: row.get(2)?,
+            kind: row.get(3)?,
+            spec: row.get(4)?,
+            timezone: row.get(5)?,
+            prompt: row.get(6)?,
+            caps: serde_json::from_str(&caps)?,
+            enabled: row.get(8)?,
+            next_at: row.get(9)?,
+        };
 
-    Ok(rows.collect::<Result<_, _>>()?)
+        jobs.push(Job { id: row.get(0)?, version: row.get(1)?, definition, last_run });
+    }
+
+    Ok(jobs)
+}
+
+/// Makes the change, or returns why it cannot be made.
+fn apply_change(connection: &Connection, change: Change, thread: &str) -> Result<Option<String>, DbError> {
+    match change {
+        Change::Create { id, definition } => create_job(connection, &id, &definition, thread),
+        Change::Update { id, version, definition } => {
+            let sql = "UPDATE schedules SET title = ?3, kind = ?4, spec = ?5, timezone = ?6, prompt = ?7, caps = ?8, enabled = ?9,
+                       next_at = ?10, version = version + 1 WHERE id = ?1 AND version = ?2 AND deleted_at IS NULL";
+            let d = &definition;
+            let caps = serde_json::to_string(&d.caps)?;
+            let params = params![id, version, d.title, d.kind, d.spec, d.timezone, d.prompt, caps, d.enabled, d.next_at];
+
+            if connection.execute(sql, params)? == 0 {
+                return Ok(Some(format!("job {id} was changed or deleted meanwhile; list it and try again")));
+            }
+
+            Ok(None)
+        }
+        Change::Delete { id } => {
+            let sql = "UPDATE schedules SET enabled = 0, deleted_at = unixepoch() WHERE id = ?1 AND deleted_at IS NULL";
+
+            if connection.execute(sql, [&id])? == 0 {
+                return Ok(Some(format!("no job {id}")));
+            }
+
+            Ok(None)
+        }
+    }
+}
+
+fn create_job(connection: &Connection, id: &str, definition: &Definition, thread: &str) -> Result<Option<String>, DbError> {
+    let count: i64 = connection.query_row("SELECT COUNT(*) FROM schedules WHERE deleted_at IS NULL", [], |row| row.get(0))?;
+
+    if count >= MAX_JOBS {
+        return Ok(Some(format!("there are already {MAX_JOBS} jobs; delete one first")));
+    }
+
+    let sql = "INSERT INTO schedules (id, title, kind, spec, timezone, prompt, caps, enabled, next_at, creator_root)
+               VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, (SELECT root_id FROM threads WHERE id = ?10))";
+    let d = definition;
+    let caps = serde_json::to_string(&d.caps)?;
+    connection.execute(sql, params![id, d.title, d.kind, d.spec, d.timezone, d.prompt, caps, d.enabled, d.next_at, thread])?;
+
+    Ok(None)
 }
 
 #[cfg(test)]
@@ -408,7 +546,7 @@ mod tests {
         assert_eq!(schedules.claim("once".to_owned(), 0, None).await?, Claim::Stale);
 
         let jobs = schedules.list().await?;
-        assert!(jobs.iter().all(|job| !job.enabled && job.next_at.is_none()));
+        assert!(jobs.iter().all(|job| !job.definition.enabled && job.definition.next_at.is_none()));
         assert_eq!(schedules.statuses().await?, ["queued"]);
 
         Ok(())

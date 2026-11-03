@@ -24,7 +24,6 @@ use crate::sandbox::{Runner, Sandbox, SandboxError, find_on_path};
 use crate::store::conversation::Conversations;
 use crate::store::db::Db;
 use crate::store::grants::Grants;
-use crate::store::operations::Operations;
 use crate::store::state::States;
 use crate::store::usage::Usages;
 use crate::thread_config::ThreadTools;
@@ -80,7 +79,7 @@ pub async fn start_with_tools(
 
     let authority = Authority::new(Grants::new(db.clone()), policy);
     let conversations = Conversations::new(db.clone());
-    let tools = ThreadTools::new(conversations.clone(), authority.clone(), Operations::new(db.clone()), sandbox, notifier);
+    let tools = ThreadTools::new(conversations.clone(), authority.clone(), db.clone(), sandbox, notifier);
     let metered = Metered::new(static_model, authority.clone(), Usages::new(db.clone()));
     let builder = AgentSystemBuilder::new_local(conversations.clone(), States::new(db.clone()), metered);
     let system = builder.without_builtin_tools().thread_config(tools).start();

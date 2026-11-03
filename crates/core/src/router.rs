@@ -129,8 +129,7 @@ impl Router {
     ) -> Self {
         let authority = Authority::new(Grants::new(db.clone()), Arc::clone(&policy));
         let conversations = Conversations::new(db.clone());
-        let operations = Operations::new(db.clone());
-        let tools = ThreadTools::new(conversations.clone(), authority.clone(), operations, sandbox, notifier.clone());
+        let tools = ThreadTools::new(conversations.clone(), authority.clone(), db.clone(), sandbox, notifier.clone());
         let model = Metered::new(model, authority, Usages::new(db.clone()));
         let builder = AgentSystemBuilder::new_local(conversations, States::new(db.clone()), model);
         let system = builder.without_builtin_tools().thread_config(tools).start();
@@ -360,6 +359,7 @@ fn response_for(step: Step) -> Option<Response> {
         Step::Paused => None,
         Step::Done => Some(Response::Done),
         Step::Failed(message) => Some(Response::Error { message }),
+        Step::Receipt(text) => Some(Response::Text { text: format!("\n{text}\n") }),
         Step::Superseded => Some(Response::Error { message: SUPERSEDED.to_owned() }),
     }
 }

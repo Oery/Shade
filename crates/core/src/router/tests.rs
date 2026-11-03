@@ -192,7 +192,7 @@ async fn missed_occurrences_run_once_across_a_crash() -> Result<(), BoxError> {
         within(second_scheduler(&db, now)).await?;
 
         assert_eq!(schedules.statuses().await?, ["completed"], "{crash:?}");
-        let next = schedules.list().await?.into_iter().find_map(|job| job.next_at);
+        let next = schedules.list().await?.into_iter().find_map(|job| job.definition.next_at);
         assert!(next > Some(now.timestamp()), "{crash:?}: the job did not move past now");
     }
 
