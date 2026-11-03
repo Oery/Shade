@@ -23,6 +23,7 @@ use shade_schedule::jobfiles::JobFiles;
 use shade_store::conversation::Conversations;
 use shade_store::db::Db;
 use shade_store::operations::Operations;
+use shade_store::roots::{Adapter, Conversation, Roots};
 
 use crate::authority::Authority;
 use crate::error::BoxError;
@@ -64,6 +65,23 @@ pub struct ThreadTools {
 impl ThreadTools {
     pub fn new(conversations: Conversations, authority: Authority, db: Db, services: Services) -> Self {
         Self { conversations, authority, operations: Operations::new(db.clone()), services, db }
+    }
+}
+
+impl ThreadTools {
+    /// Where a chat conversation takes place, so the model knows who can read it.
+    async fn place(&self, thread: &ThreadId<str>) -> Result<&'static str, BoxError> {
+        let place = match Roots::new(self.db.clone()).conversation_of(thread).await? {
+            Some(Conversation { adapter: Adapter::Discord, direct: true, .. }) => {
+                "This conversation is the owner's Discord DMs: only they read it, and `dm` is this place."
+            }
+            Some(Conversation { adapter: Adapter::Discord, direct: false, .. }) => {
+                "This conversation is a Discord server channel: everyone in it can read your replies."
+            }
+            _ => "This conversation is in the owner's terminal; notifications reach them on Discord.",
+        };
+
+        Ok(place)
     }
 }
 
@@ -109,10 +127,14 @@ impl ThreadConfigSource<ChannelSender, NoRapHttp> for ThreadTools {
         }
 
         config.extra_system_prompt = match authorized.origin {
-            Origin::Chat => match &policy.chat_prompt {
-                Some(prompt) => Some(format!("{CHAT_PROMPT}\n\n{prompt}")),
-                None => Some(CHAT_PROMPT.to_owned()),
-            },
+            Origin::Chat => {
+                let place = self.place(thread_id).await?;
+
+                match &policy.chat_prompt {
+                    Some(prompt) => Some(format!("{CHAT_PROMPT} {place}\n\n{prompt}")),
+                    None => Some(format!("{CHAT_PROMPT} {place}")),
+                }
+            }
             Origin::Schedule | Origin::Watch => Some(policy.jobs_prompt.as_deref().unwrap_or(JOBS_PROMPT).to_owned()),
             Origin::Webhook => None,
         };

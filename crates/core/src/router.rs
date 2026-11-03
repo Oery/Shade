@@ -28,7 +28,7 @@ use shade_store::db::Db;
 use shade_store::grants::Grants;
 use shade_store::inbox::{Inbox, Input};
 use shade_store::operations::Operations;
-use shade_store::roots::{Adapter, Roots, Target};
+use shade_store::roots::{Adapter, Conversation, Roots, Target};
 use shade_store::schedules::{Run, Schedules};
 use shade_store::state::States;
 use shade_store::usage::Usages;
@@ -261,7 +261,7 @@ impl Router {
         };
 
         let key = match self.roots.conversation_of(thread).await {
-            Ok(Some((Adapter::Discord, key))) => key,
+            Ok(Some(Conversation { adapter: Adapter::Discord, key, .. })) => key,
             Ok(_) => return detached,
             Err(error) => {
                 tracing::warn!(%error, %thread, "cannot find where resumed work reports");

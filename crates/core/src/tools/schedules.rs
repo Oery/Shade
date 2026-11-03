@@ -25,7 +25,7 @@ use shade_schedule::jobfiles::{self, JobFiles};
 use shade_schedule::receipt::{Card, Proposal, Verb};
 use shade_store::db::Db;
 use shade_store::operations::Operations;
-use shade_store::roots::{Adapter, Roots};
+use shade_store::roots::{Adapter, Conversation, Roots};
 use shade_store::schedules::{Applied, Change, Definition, MAX_JOBS, Pending, Receipt, Schedules};
 
 use crate::authority::Authority;
@@ -356,10 +356,12 @@ impl Work {
         self.authority.policy().timezone
     }
 
-    /// The channel of the conversation `thread` belongs to, or the owner's DMs.
+    /// The server channel of the conversation `thread` belongs to, or the owner's DMs.
     async fn home_channel(&self, thread: &ThreadId) -> Result<String, String> {
         match self.roots.conversation_of(thread).await {
-            Ok(Some((Adapter::Discord, key))) => Ok(channels::channel(&key, &self.authority.policy().channels)?.0),
+            Ok(Some(Conversation { adapter: Adapter::Discord, key, direct: false })) => {
+                Ok(channels::channel(&key, &self.authority.policy().channels)?.0)
+            }
             Ok(_) => Ok("dm".to_owned()),
             Err(error) => Err(format!("cannot find this conversation's channel: {error}")),
         }

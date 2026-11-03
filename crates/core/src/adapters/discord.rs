@@ -160,7 +160,10 @@ impl EventHandler for Handler {
 
         let answering = incoming.in_guild.then_some(message.id);
         let reply = Reply::new(Arc::clone(&context.http), message.channel_id, answering);
-        let target = Target::Named(message.channel_id.to_string());
+        let target = match incoming.in_guild {
+            true => Target::Named(message.channel_id.to_string()),
+            false => Target::Direct(message.channel_id.to_string()),
+        };
         let source_key = Some(format!("discord:{}", message.id));
         let prompt = Inbound::Prompt { adapter: Adapter::Discord, target, text, source_key, outbound: Outbound::Discord(reply) };
 

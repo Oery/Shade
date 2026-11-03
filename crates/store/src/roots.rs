@@ -17,6 +17,16 @@ pub enum Target {
     Fresh,
     /// A named conversation, created on first use.
     Named(String),
+    /// A named conversation that is the owner's direct messages.
+    Direct(String),
+}
+
+/// A named conversation.
+pub struct Conversation {
+    pub adapter: Adapter,
+    pub key: String,
+    /// The owner's direct messages, rather than a channel others may read.
+    pub direct: bool,
 }
 
 /// Where a named conversation lives. Names are scoped per adapter.
@@ -57,23 +67,23 @@ impl Roots {
     }
 
     /// The conversation name that currently points at the root of `thread`, if any.
-    pub async fn conversation_of(&self, thread: &ThreadId<str>) -> Result<Option<(Adapter, String)>, DbError> {
+    pub async fn conversation_of(&self, thread: &ThreadId<str>) -> Result<Option<Conversation>, DbError> {
         let id = thread.as_str().to_owned();
 
-        let row: Option<(String, String)> = self
+        let row: Option<(String, String, bool)> = self
             .db
             .call(move |connection| {
-                let sql = "SELECT c.adapter, c.key FROM threads t JOIN conversations c ON c.root_id = t.root_id WHERE t.id = ?1";
+                let sql = "SELECT c.adapter, c.key, c.direct FROM threads t JOIN conversations c ON c.root_id = t.root_id WHERE t.id = ?1";
 
-                Ok(connection.query_row(sql, [&id], |row| Ok((row.get(0)?, row.get(1)?))).optional()?)
+                Ok(connection.query_row(sql, [&id], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?))).optional()?)
             })
             .await?;
 
-        let Some((adapter, key)) = row else {
+        let Some((adapter, key, direct)) = row else {
             return Ok(None);
         };
 
-        Ok(Adapter::parse(&adapter).map(|adapter| (adapter, key)))
+        Ok(Adapter::parse(&adapter).map(|adapter| Conversation { adapter, key, direct }))
     }
 
     /// Points `key` at a new root. The previous root keeps its history.
@@ -100,6 +110,12 @@ pub(crate) fn turn(connection: &Connection, adapter: Adapter, target: &Target) -
             id
         }
         Target::Named(key) => named(connection, adapter, key)?,
+        Target::Direct(key) => {
+            let id = named(connection, adapter, key)?;
+            let sql = "UPDATE conversations SET direct = 1 WHERE adapter = ?1 AND key = ?2";
+            connection.execute(sql, params![adapter.name(), key])?;
+            id
+        }
     };
 
     start_budget(connection, &id)?;
@@ -205,6 +221,33 @@ mod tests {
         assert_eq!(roots.turn(Adapter::Terminal, "default".to_owned()).await?, new);
         assert_eq!(roots.turn(Adapter::Terminal, "work".to_owned()).await?, other);
         assert_eq!(count(&db, "SELECT COUNT(*) FROM threads").await?, 3);
+
+        Ok(())
+    }
+
+    /// A DM stays known as one after `/new` points it at a fresh root.
+    #[tokio::test]
+    async fn direct_messages_stay_direct_after_new() -> Result<(), BoxError> {
+        let db = Db::in_memory()?;
+        let roots = Roots::new(db.clone());
+
+        db.call(|connection| {
+            let transaction = connection.transaction()?;
+            super::turn(&transaction, Adapter::Discord, &Target::Direct("7".to_owned()))?;
+            super::turn(&transaction, Adapter::Discord, &Target::Named("8".to_owned()))?;
+            transaction.commit()?;
+
+            Ok(())
+        })
+        .await?;
+
+        let fresh = roots.replace(Adapter::Discord, "7".to_owned()).await?;
+        let server = roots.turn(Adapter::Discord, "8".to_owned()).await?;
+
+        for (root, direct) in [(fresh, true), (server, false)] {
+            let found = roots.conversation_of(&root).await?.map(|conversation| conversation.direct);
+            assert_eq!(found, Some(direct), "{root}");
+        }
 
         Ok(())
     }

@@ -21,7 +21,7 @@ use shade_policy::channels::{self, Destination};
 use shade_policy::{Cap, Origin};
 use shade_store::db::Db;
 use shade_store::operations::Operations;
-use shade_store::roots::{Adapter, Roots};
+use shade_store::roots::{Adapter, Conversation, Roots};
 use shade_store::schedules::Schedules;
 
 use crate::authority::Authority;
@@ -196,7 +196,9 @@ impl Work {
         }
 
         match self.roots.conversation_of(thread).await {
-            Ok(Some((Adapter::Discord, key))) => Ok(channels::channel(&key, &self.authority.policy().channels)?.1),
+            Ok(Some(Conversation { adapter: Adapter::Discord, key, direct: false })) => {
+                Ok(channels::channel(&key, &self.authority.policy().channels)?.1)
+            }
             Ok(_) => Ok(Destination::Owner),
             Err(error) => Err(format!("cannot find this conversation's channel: {error}")),
         }
