@@ -185,7 +185,8 @@ fn describe(sandbox: &Sandbox, network: bool) -> String {
         "Run a shell command in an isolated Linux sandbox. /workspace is the working directory and persists between calls; \
          /tmp and processes do not. {network} Runs for at most {} seconds unless timeout_seconds allows up to {}; \
          when the command ends, every process it started is killed. Returns the exit code and the start and end of \
-         stdout and stderr.",
+         stdout and stderr. A pipeline's exit code is its last command's; start with `set -o pipefail;` to fail \
+         on any stage.",
         DEFAULT_TIMEOUT.as_secs(),
         sandbox.max_timeout().as_secs()
     )
