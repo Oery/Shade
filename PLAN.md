@@ -798,6 +798,15 @@ Each milestone is one reviewable PR. `Check` is a manual demonstration; `Tests` 
 | Shell can access host control channels or trusted code. | Minimal mounts, no host sockets, PID isolation, protected code/config/data, real sandbox tests. |
 | Vault memory becomes poisoned or inconsistent. | Authorized inclusion/writes, reference-data treatment, owner-editable notes, supported conditional updates when concurrent writing appears. |
 
+### Loose ends
+
+Known gaps left open on purpose. Each points to the milestone notes with the details.
+
+- **Shell access to the vault.** `[sandbox] vault` is mounted for no grant yet: callers pass `Access::vault` as false, so the vault is reachable only through its MCP server. Tie the mount to the vault server's capability if the shell should see notes (M6, M13).
+- **Anthropic prompt caching.** Off, and `cached` reads 0: rig 0.31 drops cached-token counts on streaming responses, and with Anthropic caching on, compaction might never trigger. Waits for an Infinity upgrade that brings a fixed rig (M9b, Known gaps).
+- **Long conversations.** Proposed, not planned: end a conversation after inactivity with a pointer to the previous one, and a chat-only `history` tool to read earlier conversations, with thresholds chosen from `shade usage` data (M9b, Next).
+- **Watches.** M16 stays unscheduled until there is a concrete resource to watch; scheduled checks cover most "tell me when" needs.
+
 ## 7. Primary references
 
 These are implementation starting points, not a substitute for checking the pinned crate sources in M1:
