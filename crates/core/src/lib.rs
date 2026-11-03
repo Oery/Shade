@@ -1,6 +1,7 @@
 //! Shade runtime. The `shaded` binary is a thin wrapper around [`run`].
 
 mod adapters;
+mod audit;
 mod authority;
 mod config;
 mod error;
@@ -10,10 +11,12 @@ mod model;
 mod notify;
 mod prompt;
 mod recovery;
+mod redact;
 #[cfg(test)]
 mod replay;
 mod router;
 mod secrets;
+mod telemetry;
 #[cfg(test)]
 mod testing;
 mod thread_config;
@@ -106,7 +109,8 @@ async fn serve(config_path: Option<PathBuf>) -> Result<(), Error> {
     let http = discord.as_ref().map(Discord::http);
     let notifier = discord.as_ref().map(|discord| notifications(discord, &db));
     let job_files = Arc::new(JobFiles::new(jobfiles::dir_for(&config_path)));
-    let services = Services { sandbox: sandbox.map(Arc::new), notifier, job_files, mcp, memory };
+    let redactor = Arc::new(secrets.into_redactor());
+    let services = Services { sandbox: sandbox.map(Arc::new), notifier, job_files, mcp, memory, redactor };
     let router = Router::start(model, db, Arc::new(policy), services, http);
 
     // Job files are config: a bad one stops the daemon before it runs anything.

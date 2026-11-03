@@ -140,6 +140,8 @@ pub struct ModelConfig {
     /// Every turn resends the whole history, so this bounds what a turn
     /// costs. 100k (or 75% of the window, if smaller) when absent.
     pub compact_at_tokens: Option<usize>,
+    /// Optional USD per million tokens, captured with each request's usage.
+    pub prices: Option<crate::usage::Prices>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize)]

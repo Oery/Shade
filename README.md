@@ -99,7 +99,29 @@ shade chat                # terminal chat; `shade chat --thread work` for anothe
 shade ask "what time is it?"
 shade schedule list       # jobs; also pause, resume, rm, approve, reject
 shade usage               # tokens per conversation
+shade audit --since 1d    # grants, tool outcomes, run status and usage
 ```
+
+`shade usage` shows the 20 most recently active roots, their origin and status,
+and all-history totals by origin/source (up to 100 groups). Compaction requests
+count toward their root. To follow one root, copy its ID into
+`shade audit --since 7d --root <id>`; audit shows up to 20 roots with their last
+50 entries in that window. Times are UTC. The grant shown is the persisted
+delegation; `effective` also applies the current config.
+
+Tool dispatches and captured outcomes come from the durable operation ledger.
+Lifecycle observations and provider-reported usage share a queue of 128 records;
+pressure or a crash can lose them, and the reports show this process's loss
+count. Arguments, result bodies, prompts and webhook payloads are omitted from
+audit summaries. Whole known secrets of at least 8 bytes are removed from shell
+and MCP results before recording and delivery, and from reported run failures.
+This does not scrub existing history, transformed secrets, or fragments cut by
+tool output limits. MCP diagnostics log only byte counts, since a server may
+print credentials to stderr.
+
+Optional `[model.prices]` rates add estimated USD, saved per request; see the
+example config. A dash means some usage had no price. These are estimates based
+on reported tokens, not bills; rig 0.31 currently omits cached streaming counts.
 
 ### As a systemd user service
 

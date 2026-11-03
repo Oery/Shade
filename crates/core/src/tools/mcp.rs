@@ -99,7 +99,7 @@ impl<M: InputSender + 'static> Tool<M> for McpTool {
 
 impl Work {
     async fn answer<M: InputSender>(&self, args: serde_json::Value, call: Call<M>) {
-        let text = self.run(args, &call).await;
+        let text = self.authority.redact(self.run(args, &call).await);
 
         if let Err(error) = tools::deliver(&call.sender, call.thread, call.id, call.call_id, text).await {
             tracing::warn!(%error, tool = %self.name, "cannot deliver an MCP result; restart recovery will");
@@ -125,6 +125,7 @@ impl Work {
             Err(error @ CallError::Unavailable(..)) => format!("Error: {error}"),
             Err(error @ CallError::Unknown(..)) => format!("Error: {error}. Check its state before retrying a change."),
         };
+        let text = self.authority.redact(text);
 
         if let Err(error) = self.operations.finish(thread, &call.id, &text).await {
             tracing::error!(%error, %thread, tool = %self.name, "cannot record an MCP result");
@@ -170,6 +171,7 @@ mod tests {
     use super::{Call, McpTool};
     use crate::authority::Authority;
     use crate::error::BoxError;
+    use crate::redact::Redactor;
     use crate::testing;
 
     /// An MCP server that counts the calls it receives.
@@ -180,6 +182,11 @@ mod tests {
 
     #[tool_router]
     impl Echo {
+        #[tool(description = "Returns a secret to test redaction.")]
+        async fn secret(&self) -> String {
+            "token=private-test-key-123456".to_owned()
+        }
+
         #[tool(description = "Counts its calls.")]
         async fn count(&self) -> String {
             format!("call {}", self.calls.fetch_add(1, Ordering::SeqCst) + 1)
@@ -212,7 +219,8 @@ mod tests {
         let db = Db::in_memory()?;
         Conversations::new(db.clone()).register_root(&ThreadId::from("chat".to_owned())).await?;
 
-        let authority = Authority::new(Grants::new(db.clone()), testing::policy(caps, Limits::default()));
+        let redactor = Arc::new(Redactor::new(["private-test-key-123456".to_owned()]));
+        let authority = Authority::new(Grants::new(db.clone()), testing::policy(caps, Limits::default())).with_redactor(redactor);
         let operations = Operations::new(db);
         let tools = server.tools().await.into_iter();
 
@@ -264,6 +272,20 @@ mod tests {
         assert_eq!(call(slow, "call-2").await, unknown);
 
         assert_eq!(calls.load(Ordering::SeqCst), 2, "a call was sent twice");
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn secrets_are_removed_before_recording_and_delivery() -> Result<(), BoxError> {
+        let (tools, _) = tools(&[Cap::Server("echo".to_owned())]).await?;
+        let tool = named(&tools, "echo_secret")?;
+        let text = call(tool, "call-secret").await;
+        let stored = tool.work.operations.captured("chat", "call-secret").await?;
+
+        assert_eq!(text, "token=[redacted: one of Shade's secrets]");
+        assert_eq!(stored.as_deref(), Some(text.as_str()));
+        assert_eq!(call(tool, "call-secret").await, text);
 
         Ok(())
     }

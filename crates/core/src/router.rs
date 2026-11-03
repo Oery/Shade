@@ -25,6 +25,7 @@ use serenity::all::Http;
 use shade_policy::Policy;
 use shade_proto::{Manage, Response};
 use shade_schedule::jobfiles::JobFiles;
+use shade_store::audit::Audit;
 use shade_store::conversation::Conversations;
 use shade_store::db::Db;
 use shade_store::grants::Grants;
@@ -45,6 +46,7 @@ use crate::model::Model;
 use crate::notify::Notifier;
 use crate::recovery;
 use crate::router::turn::{Step, Turn};
+use crate::telemetry::Telemetry;
 use crate::thread_config::{Services, ThreadTools};
 use crate::tools::Shown;
 use crate::{tools, usage};
@@ -69,15 +71,32 @@ pub enum Inbound {
         outbound: Outbound,
     },
     /// Points a conversation name at a fresh root.
-    NewConversation { adapter: Adapter, key: String, reply: mpsc::Sender<Response> },
+    NewConversation {
+        adapter: Adapter,
+        key: String,
+        reply: mpsc::Sender<Response>,
+    },
     /// Token usage by conversation.
-    Usage { reply: mpsc::Sender<Response> },
+    Usage {
+        reply: mpsc::Sender<Response>,
+    },
+    Audit {
+        since: i64,
+        root: Option<String>,
+        reply: mpsc::Sender<Response>,
+    },
     /// Owner management of scheduled jobs.
-    Schedule { action: Manage, reply: mpsc::Sender<Response> },
+    Schedule {
+        action: Manage,
+        reply: mpsc::Sender<Response>,
+    },
     /// A background run may start now: a webhook event was just accepted.
     StartBackground,
     /// A copy of the database to a new file.
-    Backup { path: PathBuf, reply: mpsc::Sender<Response> },
+    Backup {
+        path: PathBuf,
+        reply: mpsc::Sender<Response>,
+    },
 }
 
 /// Where a turn's output goes. The turn runs to its end either way.
@@ -125,6 +144,7 @@ pub struct Router {
     roots: Roots,
     operations: Operations,
     usages: Usages,
+    telemetry: Telemetry,
     schedules: Schedules,
     hooks: HookEvents,
     system: System,
@@ -138,17 +158,19 @@ pub struct Router {
 impl Router {
     /// Built-in tools stay off: spawning has no limit hook (see docs/infinity-notes.md).
     pub fn start(model: Model, db: Db, policy: Arc<Policy>, services: Services, discord: Option<Arc<Http>>) -> Self {
-        let authority = Authority::new(Grants::new(db.clone()), Arc::clone(&policy));
+        let authority = Authority::new(Grants::new(db.clone()), Arc::clone(&policy)).with_redactor(Arc::clone(&services.redactor));
+        let telemetry = Telemetry::new(db.clone(), Arc::clone(&services.redactor));
         let conversations = Conversations::new(db.clone());
         let tools = ThreadTools::new(conversations.clone(), authority.clone(), db.clone(), services.clone());
-        let model = Metered::new(model, authority, Usages::new(db.clone()), services.memory.clone());
+        let prices = model.prices();
+        let model = Metered::new(model, authority, telemetry.clone(), services.memory.clone(), prices);
         let builder = AgentSystemBuilder::new_local(conversations, States::new(db.clone()), model);
         let system = builder.without_builtin_tools().thread_config(tools).start();
 
-        Self::new(db, system, policy, discord, services)
+        Self::new(db, system, policy, discord, services, telemetry)
     }
 
-    pub fn new(db: Db, system: System, policy: Arc<Policy>, discord: Option<Arc<Http>>, services: Services) -> Self {
+    pub fn new(db: Db, system: System, policy: Arc<Policy>, discord: Option<Arc<Http>>, services: Services, telemetry: Telemetry) -> Self {
         let Services { notifier, job_files, .. } = services;
         let inbox = Inbox::new(db.clone());
         let roots = Roots::new(db.clone());
@@ -157,7 +179,7 @@ impl Router {
         let schedules = Schedules::new(db.clone());
         let hooks = HookEvents::new(db.clone());
 
-        Self { db, policy, inbox, roots, operations, usages, schedules, hooks, system, discord, notifier, job_files }
+        Self { db, policy, inbox, roots, operations, usages, telemetry, schedules, hooks, system, discord, notifier, job_files }
     }
 
     /// Handles input and runs due jobs until the channel closes. Must run
@@ -185,6 +207,7 @@ impl Router {
             }
             Inbound::NewConversation { adapter, key, reply } => self.new_conversation(adapter, key, reply).await,
             Inbound::Usage { reply } => self.usage(reply).await,
+            Inbound::Audit { since, root, reply } => self.audit(since, root, reply).await,
             Inbound::Schedule { action, reply } => self.manage(action, reply).await,
             Inbound::StartBackground => self.start_background(Utc::now()).await,
             Inbound::Backup { path, reply } => self.backup(path, reply).await,
@@ -202,7 +225,7 @@ impl Router {
             let outbound = self.outbound_for(&answer.thread).await;
             resumed.push(answer.thread.as_str().to_owned());
             tools::deliver(&self.system.sender(), answer.thread, answer.id, answer.call_id, answer.text).await?;
-            tokio::task::spawn_local(pump(handle, Turn::continuing(), outbound, None));
+            tokio::task::spawn_local(pump(handle, Turn::continuing(), outbound, None, self.telemetry.clone()));
         }
 
         for input in self.inbox.unsettled().await? {
@@ -222,6 +245,7 @@ impl Router {
     /// thread, then waits for the database to finish queued writes.
     pub async fn shutdown(self) {
         self.system.shutdown().await;
+        self.telemetry.flush().await;
 
         if let Err(error) = self.db.flush().await {
             tracing::error!(%error, "cannot flush the database at shutdown");
@@ -258,7 +282,7 @@ impl Router {
             return;
         }
 
-        tokio::task::spawn_local(pump(handle, turn, outbound, Some((self.inbox.clone(), id))));
+        tokio::task::spawn_local(pump(handle, turn, outbound, Some((self.inbox.clone(), id)), self.telemetry.clone()));
     }
 
     /// Where resumed work in `thread` reports: its run's record, or its Discord channel, if it is one.
@@ -336,8 +360,10 @@ impl Router {
     }
 
     async fn usage(&self, reply: mpsc::Sender<Response>) {
-        let text = match self.usages.by_conversation(usage::SHOWN).await {
-            Ok(conversations) => usage::render(&conversations),
+        self.telemetry.flush().await;
+
+        let text = match self.usage_text().await {
+            Ok(text) => text,
             Err(error) => {
                 let _ = reply.send(Response::Error { message: format!("cannot read usage: {error}") }).await;
                 return;
@@ -347,6 +373,52 @@ impl Router {
         if reply.send(Response::Text { text }).await.is_ok() {
             let _ = reply.send(Response::Done).await;
         }
+    }
+
+    async fn usage_text(&self) -> Result<String, shade_store::db::DbError> {
+        let conversations = self.usages.by_conversation(usage::SHOWN).await?;
+        let origins = self.usages.by_origin().await?;
+        let text = usage::render(&conversations, &origins);
+
+        Ok(format!("{text}\nObservations dropped this process: {}\n", self.telemetry.dropped()))
+    }
+
+    async fn audit(&self, since: i64, root: Option<String>, reply: mpsc::Sender<Response>) {
+        self.telemetry.flush().await;
+
+        let chunks = match self.audit_chunks(since, root).await {
+            Ok(chunks) => chunks,
+            Err(error) => {
+                let _ = reply.send(Response::Error { message: format!("cannot read audit: {error}") }).await;
+                return;
+            }
+        };
+
+        for text in chunks {
+            if reply.send(Response::Text { text }).await.is_err() {
+                return;
+            }
+        }
+
+        let _ = reply.send(Response::Done).await;
+    }
+
+    async fn audit_chunks(&self, since: i64, root: Option<String>) -> Result<Vec<String>, shade_store::db::DbError> {
+        let roots = Audit::new(self.db.clone()).recent(since, root).await?;
+        let mut chunks = Vec::new();
+
+        for root in roots {
+            let usage = self.usages.for_root(root.id.to_owned()).await?;
+            chunks.push(crate::audit::render(&root, &self.policy, &usage));
+        }
+
+        if chunks.is_empty() {
+            chunks.push("No matching activity.\n".to_owned());
+        }
+
+        chunks.push(format!("\nUp to 20 roots, last 50 entries each. Tool ledger is durable; observer/usage records are best effort.\nObservations dropped this process: {}\n", self.telemetry.dropped()));
+
+        Ok(chunks)
     }
 
     async fn new_conversation(&self, adapter: Adapter, key: String, reply: mpsc::Sender<Response>) {
@@ -368,16 +440,32 @@ impl Router {
 /// turn fails is settled before its sender hears of it, so it is never run
 /// again after a restart. A pump cut short by shutdown leaves its input to
 /// be resent.
-async fn pump(mut handle: ThreadHandle, mut turn: Turn, mut outbound: Outbound, input: Option<(Inbox, String)>) {
+async fn pump(mut handle: ThreadHandle, mut turn: Turn, mut outbound: Outbound, input: Option<(Inbox, String)>, telemetry: Telemetry) {
     while let Some(event) = handle.recv().await {
+        telemetry.observe(handle.thread_id().as_str(), &event);
+
         let Some(step) = turn.on_event(event) else {
             continue;
+        };
+
+        let step = match step {
+            Step::Failed(message) => Step::Failed(telemetry.redact(message)),
+            step => step,
         };
 
         let last = step.is_last();
 
         if let (Some(message), Some((inbox, id))) = (failure(&step), &input) {
             settle(inbox, id, message).await;
+        }
+
+        if last {
+            let summary = match &step {
+                Step::Failed(_) => "failed",
+                Step::Superseded => "superseded",
+                _ => "completed",
+            };
+            telemetry.event(handle.thread_id().as_str(), "turn", summary.to_owned());
         }
 
         outbound.send(handle.thread_id().as_str(), step).await;

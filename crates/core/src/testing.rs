@@ -19,13 +19,13 @@ use shade_store::conversation::Conversations;
 use shade_store::db::Db;
 use shade_store::grants::Grants;
 use shade_store::state::States;
-use shade_store::usage::Usages;
 use tokio::task::LocalSet;
 
 use crate::authority::{Authority, Metered};
 use crate::error::BoxError;
 use crate::notify::Notifier;
 use crate::router::Router;
+use crate::telemetry::Telemetry;
 use crate::thread_config::{Services, ThreadTools};
 
 pub type System = LaunchingSystem<Conversations, States, NoRapHttp>;
@@ -35,6 +35,7 @@ pub struct Harness {
     pub model: MockModelController,
     pub conversations: Conversations,
     pub authority: Authority,
+    pub telemetry: Telemetry,
 }
 
 /// Chat may use `caps`, under `limits`.
@@ -80,7 +81,7 @@ pub async fn start_with(db: &Db, policy: Arc<Policy>) -> Result<Harness, BoxErro
 pub fn services(sandbox: Option<Arc<Sandbox>>, notifier: Option<Notifier>) -> Services {
     let job_files = Arc::new(JobFiles::new(std::env::temp_dir().join(format!("shade-test-jobs-{}", uuid::Uuid::new_v4()))));
 
-    Services { sandbox, notifier, job_files, mcp: Default::default(), memory: None }
+    Services { sandbox, notifier, job_files, mcp: Default::default(), memory: None, redactor: Default::default() }
 }
 
 /// A system whose tools reach `services`.
@@ -95,22 +96,23 @@ pub async fn start_with_tools(db: &Db, policy: Arc<Policy>, services: Services) 
     };
     let static_model = StaticModel::new(Arc::new(SingleModelProvider::new(entry, mock)), "mock").await?;
 
-    let authority = Authority::new(Grants::new(db.clone()), policy);
+    let authority = Authority::new(Grants::new(db.clone()), policy).with_redactor(Arc::clone(&services.redactor));
+    let telemetry = Telemetry::new(db.clone(), Arc::clone(&services.redactor));
     let conversations = Conversations::new(db.clone());
     let memory = services.memory.clone();
     let tools = ThreadTools::new(conversations.clone(), authority.clone(), db.clone(), services);
-    let metered = Metered::new(static_model, authority.clone(), Usages::new(db.clone()), memory);
+    let metered = Metered::new(static_model, authority.clone(), telemetry.clone(), memory, None);
     let builder = AgentSystemBuilder::new_local(conversations.clone(), States::new(db.clone()), metered);
     let system = builder.without_builtin_tools().thread_config(tools).start();
 
-    Ok(Harness { system, model, conversations, authority })
+    Ok(Harness { system, model, conversations, authority, telemetry })
 }
 
 /// A router on `db` with a scripted model, as the daemon builds it.
 pub async fn router(db: &Db, policy: Arc<Policy>) -> Result<(Router, MockModelController), BoxError> {
-    let Harness { system, model, .. } = start_with(db, Arc::clone(&policy)).await?;
+    let Harness { system, model, telemetry, .. } = start_with(db, Arc::clone(&policy)).await?;
 
-    Ok((Router::new(db.clone(), system, policy, None, services(None, None)), model))
+    Ok((Router::new(db.clone(), system, policy, None, services(None, None), telemetry), model))
 }
 
 /// Attaches to a registered thread and waits out the idle its attach-spawned driver emits.

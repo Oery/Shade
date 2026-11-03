@@ -232,6 +232,50 @@ async fn second_scheduler(db: &Db, now: DateTime<Utc>) -> Result<(), BoxError> {
     Ok(())
 }
 
+/// One scheduled turn is traceable from its grant through a tool result to
+/// provider usage and completion, using the same reports as the socket CLI.
+#[tokio::test(flavor = "current_thread")]
+async fn scheduled_run_is_visible_in_audit_and_usage() -> Result<(), BoxError> {
+    within(async {
+        let db = Db::in_memory()?;
+        let now = Utc::now();
+        let schedules = Schedules::new(db.clone());
+        schedules.add("weather", "once", "2026-01-01T00:00:00Z", now.timestamp()).await?;
+        let (router, mut model) = testing::router(&db, testing::policy(&[Cap::Now], Limits::default())).await?;
+        router.schedule(now).await;
+
+        model.next_request().await;
+        model.send_tool_call("call-time", "now", serde_json::json!({"password": "do-not-audit-this"}));
+        let usage = infinity_provider_protocol::Usage { input_tokens: 100, output_tokens: 10, ..Default::default() };
+        model.finish_with_usage(Some(usage));
+        model.next_request().await;
+        model.send_text("finished");
+        model.finish_with_usage(Some(usage));
+
+        while schedules.statuses().await? != ["completed"] {
+            tokio::task::yield_now().await;
+        }
+
+        router.telemetry.flush().await;
+        let roots = shade_store::audit::Audit::new(db).recent(0, None).await?;
+        assert_eq!(roots.len(), 1);
+        let audit = router.audit_chunks(0, Some(roots[0].id.to_owned())).await?.join("");
+        assert!(audit.contains("schedule:weather") && audit.contains("status=completed"), "{audit}");
+        assert!(audit.contains("grant=[\"now\"] effective=now"), "{audit}");
+        assert!(audit.contains("requested now") && audit.contains("tool result received"), "{audit}");
+        assert!(audit.contains("requests=2 input=200 cached=0 output=20"), "{audit}");
+        assert!(!audit.contains("do-not-audit-this"), "{audit}");
+
+        let usage = router.usage_text().await?;
+        assert!(usage.contains(&roots[0].id) && usage.contains("schedule:weather"), "{usage}");
+        assert!(usage.contains("requests=2 input=200 cached=0 output=20"), "{usage}");
+        router.shutdown().await;
+
+        Ok(())
+    })
+    .await
+}
+
 /// An approved change applies once and only while fresh: a change drafted
 /// before another one applied, or older than a day, does nothing. The
 /// conversation that proposed it hears the decision and answers.

@@ -42,6 +42,10 @@ pub struct Model {
 impl Model {
     /// Reads the API key and checks the configuration, so mistakes surface at startup.
     pub fn new(config: ModelConfig, secrets: &mut Secrets) -> Result<Self, Error> {
+        if let Some(prices) = config.prices {
+            prices.validate()?;
+        }
+
         let Some(api_key) = secrets.take(&config.api_key_env) else {
             return Err(Error::MissingApiKey(config.api_key_env));
         };
@@ -61,6 +65,10 @@ impl Model {
 
     pub fn id(&self) -> &str {
         &self.config.id
+    }
+
+    pub fn prices(&self) -> Option<crate::usage::Prices> {
+        self.config.prices
     }
 
     fn headers(&self, thread_id: &str) -> Result<HeaderMap, BoxError> {

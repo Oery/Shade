@@ -21,7 +21,7 @@ use rmcp::transport::TokioChildProcess;
 use rmcp::{Peer, RoleClient, ServiceExt};
 use serde::Deserialize;
 use thiserror::Error;
-use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::io::AsyncReadExt;
 use tokio::process::{ChildStderr, Command};
 use tokio::sync::Mutex;
 
@@ -222,12 +222,16 @@ async fn start(name: &str, launch: &Launch) -> Result<(Client, Vec<Tool>), Strin
     }
 }
 
-/// A server's diagnostics go to Shade's log, line by line.
-async fn log_stderr(server: String, stderr: ChildStderr) {
-    let mut lines = BufReader::new(stderr).lines();
+/// A child can print credentials or arbitrarily long lines. Observe its
+/// diagnostics with fixed memory, without copying their contents into logs.
+async fn log_stderr(server: String, mut stderr: ChildStderr) {
+    let mut buffer = [0; 4096];
 
-    while let Ok(Some(line)) = lines.next_line().await {
-        tracing::debug!(%server, "{line}");
+    loop {
+        match stderr.read(&mut buffer).await {
+            Ok(0) | Err(_) => return,
+            Ok(bytes) => tracing::debug!(%server, bytes, "MCP diagnostics received; content omitted"),
+        }
     }
 }
 
@@ -256,8 +260,8 @@ impl Servers {
         }
 
         while let Some(Ok((result, server))) = starting.join_next().await {
-            if let Err(reason) = result {
-                tracing::warn!(server = %server.name, %reason, "MCP server unavailable; its tools are not offered until it starts");
+            if result.is_err() {
+                tracing::warn!(server = %server.name, "MCP server unavailable; its tools are not offered until it starts");
             }
         }
     }
@@ -268,10 +272,8 @@ impl Servers {
             tokio::time::sleep(RETRY).await;
 
             for server in &self.servers {
-                if server.client.lock().await.is_none()
-                    && let Err(reason) = server.connect().await
-                {
-                    tracing::debug!(server = %server.name, %reason, "MCP server still unavailable");
+                if server.client.lock().await.is_none() && server.connect().await.is_err() {
+                    tracing::debug!(server = %server.name, "MCP server still unavailable");
                 }
             }
         }

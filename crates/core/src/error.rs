@@ -55,6 +55,9 @@ pub enum Error {
     #[error("cannot set up the model: {0}")]
     Model(BoxError),
 
+    #[error("[model.prices] values must be finite USD per million tokens between 0 and 1000000")]
+    Prices,
+
     #[error("`shell` is granted but the config has no [sandbox] section")]
     SandboxNotConfigured,
 

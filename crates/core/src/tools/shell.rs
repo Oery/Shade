@@ -111,7 +111,7 @@ impl<M: InputSender + 'static> Tool<M> for Shell {
 
 impl Work {
     async fn answer<M: InputSender>(&self, args: serde_json::Value, call: Call<M>) {
-        let text = self.run(args, &call).await;
+        let text = self.authority.redact(self.run(args, &call).await);
 
         if let Err(error) = tools::deliver(&call.sender, call.thread, call.id, call.call_id, text).await {
             tracing::warn!(%error, "cannot deliver a shell result; restart recovery will");
@@ -144,6 +144,7 @@ impl Work {
             Ok(finished) => render(&finished, timeout),
             Err(error) => format!("Error: {error}"),
         };
+        let text = self.authority.redact(text);
 
         if let Err(error) = self.operations.finish(thread, &call.id, &text).await {
             tracing::error!(%error, %thread, "cannot record a shell result");

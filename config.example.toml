@@ -16,6 +16,16 @@ max_output_tokens = 128000
 # 100k, or 75% of context_window if that is smaller.
 # compact_at_tokens = 100000
 
+# Optional estimates for `shade usage`: your prices, in USD per million
+# tokens (0..1000000). Omit this for subscriptions or unknown prices.
+# Input includes cached tokens; Shade subtracts those before charging the
+# uncached input rate. All three rates are required. These are examples,
+# not prices for the model above. Each request keeps its historical estimate.
+# [model.prices]
+# input_per_million = 2.0
+# cached_input_per_million = 0.5
+# output_per_million = 10.0
+
 # OpenCode Go subscription instead (https://opencode.ai/docs/en/go/).
 # Use the API format the model page lists: `openai_compatible` with
 # base_url ".../go/openai/v1", or `anthropic` with base_url ".../go/anthropic".

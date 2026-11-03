@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 /// Sent in the hello of every connection. Client and daemon must match.
-pub const PROTOCOL_VERSION: u32 = 2;
+pub const PROTOCOL_VERSION: u32 = 3;
 
 /// Longest accepted message line in bytes, newline included.
 pub const MAX_LINE_BYTES: u64 = 1 << 20;
@@ -53,7 +53,11 @@ pub enum Request {
         action: Manage,
     },
     ThreadsList,
-    Audit,
+    Audit {
+        /// Unix timestamp; filtering is done by the daemon.
+        since: i64,
+        root: Option<String>,
+    },
     Usage,
     /// Absolute destination path, resolved by the client.
     Backup {

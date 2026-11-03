@@ -30,6 +30,7 @@ use crate::authority::Authority;
 use crate::error::BoxError;
 use crate::memory::Memory;
 use crate::notify::Notifier;
+use crate::redact::Redactor;
 use crate::tools::mcp::McpTool;
 use crate::tools::notify::Notify;
 use crate::tools::now::Now;
@@ -60,6 +61,7 @@ pub struct Services {
     pub mcp: Arc<Servers>,
     /// Shown to roots holding the vault server's capability.
     pub memory: Option<Arc<Memory>>,
+    pub redactor: Arc<Redactor>,
 }
 
 pub struct ThreadTools {

@@ -13,17 +13,19 @@ use futures_util::StreamExt;
 use infinity_agent_core::ThreadId;
 use infinity_agent_core::system::{ModelSource, ResolvedModel};
 use infinity_provider_protocol::{
-    CompletionError, CompletionRequest, ErrorClass, FinalResponse, ModelEntry, ModelProvider, ModelStream, StreamChunk, Usage,
+    CompletionError, CompletionRequest, ErrorClass, FinalResponse, ModelEntry, ModelProvider, ModelStream, StreamChunk,
 };
 use shade_policy::{Cap, Caps, Charge, Origin, Policy};
 use shade_store::db::DbError;
 use shade_store::grants::{Grants, Refusal};
-use shade_store::usage::Usages;
 use thiserror::Error;
 
 use crate::error::BoxError;
 use crate::memory::Memory;
 use crate::prompt;
+use crate::redact::Redactor;
+use crate::telemetry::Telemetry;
+use crate::usage::Prices;
 
 #[derive(Debug, Error)]
 pub enum Denied {
@@ -60,11 +62,22 @@ pub struct Authorized {
 pub struct Authority {
     grants: Grants,
     policy: Arc<Policy>,
+    redactor: Arc<Redactor>,
 }
 
 impl Authority {
     pub fn new(grants: Grants, policy: Arc<Policy>) -> Self {
-        Self { grants, policy }
+        Self { grants, policy, redactor: Arc::new(Redactor::default()) }
+    }
+
+    pub fn with_redactor(mut self, redactor: Arc<Redactor>) -> Self {
+        self.redactor = redactor;
+
+        self
+    }
+
+    pub fn redact(&self, text: String) -> String {
+        self.redactor.redact(text)
     }
 
     pub fn policy(&self) -> &Policy {
@@ -135,13 +148,14 @@ impl Authority {
 pub struct Metered<S> {
     inner: S,
     authority: Authority,
-    usages: Usages,
+    telemetry: Telemetry,
+    prices: Option<Prices>,
     memory: Option<Arc<Memory>>,
 }
 
 impl<S> Metered<S> {
-    pub fn new(inner: S, authority: Authority, usages: Usages, memory: Option<Arc<Memory>>) -> Self {
-        Self { inner, authority, usages, memory }
+    pub fn new(inner: S, authority: Authority, telemetry: Telemetry, memory: Option<Arc<Memory>>, prices: Option<Prices>) -> Self {
+        Self { inner, authority, telemetry, memory, prices }
     }
 }
 
@@ -154,7 +168,8 @@ impl<S: ModelSource> ModelSource for Metered<S> {
             inner: model.provider,
             thread: thread_id.to_owned(),
             authority: self.authority.clone(),
-            usages: self.usages.clone(),
+            telemetry: self.telemetry.clone(),
+            prices: self.prices,
             memory: self.memory.clone(),
         };
         model.provider = Arc::new(provider);
@@ -167,7 +182,8 @@ struct MeteredProvider {
     inner: Arc<dyn ModelProvider>,
     thread: ThreadId,
     authority: Authority,
-    usages: Usages,
+    telemetry: Telemetry,
+    prices: Option<Prices>,
     memory: Option<Arc<Memory>>,
 }
 
@@ -182,7 +198,10 @@ impl ModelProvider for MeteredProvider {
     async fn invoke_model(&self, model_id: &str, mut request: CompletionRequest) -> Result<ModelStream, CompletionError> {
         let authorized = match self.authority.admit_completion(&self.thread).await {
             Ok(authorized) => authorized,
-            Err(denied) => return Err(CompletionError::provider(ErrorClass::Fatal, denied.to_string())),
+            Err(denied) => {
+                self.telemetry.event(self.thread.as_str(), "refused", denied.to_string());
+                return Err(CompletionError::provider(ErrorClass::Fatal, denied.to_string()));
+            }
         };
 
         let memory = match &self.memory {
@@ -196,27 +215,32 @@ impl ModelProvider for MeteredProvider {
             None => {}
         }
 
-        let stream = self.inner.invoke_model(model_id, request).await?;
-        let (usages, thread, model) = (self.usages.clone(), self.thread.as_str().to_owned(), model_id.to_owned());
+        self.telemetry.event(self.thread.as_str(), "completion", format!("request {model_id}"));
 
-        let recorded = stream.inspect(move |chunk| {
-            if let Ok(StreamChunk::Final(FinalResponse { usage: Some(usage) })) = chunk {
-                record(usages.clone(), thread.to_owned(), model.to_owned(), *usage);
+        let stream = match self.inner.invoke_model(model_id, request).await {
+            Ok(stream) => stream,
+            Err(error) => {
+                self.telemetry.event(self.thread.as_str(), "error", "provider request failed".to_owned());
+                return Err(error);
             }
+        };
+        let (telemetry, thread, model, prices) =
+            (self.telemetry.clone(), self.thread.as_str().to_owned(), model_id.to_owned(), self.prices);
+
+        let recorded = stream.inspect(move |chunk| match chunk {
+            Ok(StreamChunk::Final(FinalResponse { usage })) => {
+                telemetry.event(&thread, "completion", format!("finished {model}; usage reported={}", usage.is_some()));
+
+                if let Some(usage) = usage {
+                    telemetry.usage(&thread, &model, *usage, prices.map(|price| price.estimate(usage)));
+                }
+            }
+            Err(_) => telemetry.event(&thread, "error", "provider stream failed".to_owned()),
+            _ => {}
         });
 
         Ok(Box::pin(recorded))
     }
-}
-
-/// Usage is a record for the owner, not a gate: writing it must not hold up
-/// the stream, and losing it to a storage error only costs the record.
-fn record(usages: Usages, thread: String, model: String, usage: Usage) {
-    tokio::spawn(async move {
-        if let Err(error) = usages.record(thread, model, usage).await {
-            tracing::warn!(%error, "cannot record token usage");
-        }
-    });
 }
 
 #[cfg(test)]
