@@ -10,6 +10,7 @@
 
 mod render;
 
+use std::collections::BTreeMap;
 use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
@@ -37,9 +38,12 @@ const RETRY: Duration = Duration::from_secs(60);
 pub struct Config {
     /// The server's program and its arguments.
     pub command: Vec<String>,
-    /// Variables passed to the server, read from Shade's environment or the `.env` next to its config.
+    /// Secrets passed to the server, by name: read from Shade's environment or the `.env` next to its config.
     #[serde(default)]
     pub env: Vec<String>,
+    /// Settings passed to the server as they are written, such as a path.
+    #[serde(default)]
+    pub vars: BTreeMap<String, String>,
     /// What the server is for, shown to the model when it chooses a job's caps.
     pub description: String,
     /// Seconds the server has to start and list its tools.
@@ -109,8 +113,12 @@ impl Server {
             return Err(format!("[mcp.{name}] command is empty"));
         };
 
-        let mut env = env;
-        env.extend(INHERITED.into_iter().filter_map(|key| Some((key.to_owned(), std::env::var(key).ok()?))));
+        // Later entries win: what the config names overrides what the daemon inherited.
+        let mut all: Vec<(String, String)> =
+            INHERITED.into_iter().filter_map(|key| Some((key.to_owned(), std::env::var(key).ok()?))).collect();
+        all.extend(config.vars.iter().map(|(key, value)| (key.to_owned(), value.to_owned())));
+        all.extend(env);
+        let env = all;
 
         let launch =
             Launch { program: program.to_owned(), args: args.to_vec(), env, startup: Duration::from_secs(config.startup_timeout_seconds) };
