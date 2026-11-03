@@ -94,7 +94,8 @@ impl Memory {
 
         Some(format!(
             "## Memory\n\nYou keep durable memories for the owner in their vault, through the {server} tools: an index at \
-             `{index}` (below) and one short note per memory in `{folder}/`. Read a note when it is relevant. When you learn \
+             `{index}` (below) and one short note per memory in `{folder}/`. When an index line answers the question, answer from \
+             it; open a note only for details the index does not have. When you learn \
              something that will matter later (a preference, a fact about the owner, an ongoing project, where something is), \
              save it as its own note starting with `type: user|preference|project|reference` and `updated: <date>`, and add one \
              line to the index: `- [Title](memories/<name>.md) — what it is about`. Update a note rather than adding a \

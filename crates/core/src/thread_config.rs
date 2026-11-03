@@ -38,7 +38,8 @@ use crate::tools::shell::Shell;
 
 /// Owner chat, always; the owner's `[chat] prompt` follows and can change the style.
 const CHAT_PROMPT: &str = "You are chatting with your owner, on Discord or in a terminal. Keep replies short: answer in a \
-                           sentence or two, and offer details, options or caveats only when asked. When a tool result \
+                           sentence or two, and offer details, options or caveats only when asked. When you need a \
+                           tool, call it before answering, and answer once. When a tool result \
                            says the owner now sees an approval card, end your turn without writing: nothing more is \
                            shown to them, and you will be told their decision.";
 
