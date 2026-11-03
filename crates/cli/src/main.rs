@@ -1,3 +1,4 @@
+mod chat;
 mod client;
 mod error;
 
@@ -18,13 +19,12 @@ struct Cli {
 }
 
 #[derive(Subcommand)]
-#[expect(dead_code, reason = "chat arguments are read once chat is implemented")]
 enum Command {
     /// Chat in the terminal.
     Chat {
         /// Conversation to resume or create.
-        #[arg(long)]
-        thread: Option<String>,
+        #[arg(long, default_value = shade_proto::DEFAULT_CONVERSATION)]
+        thread: String,
     },
     /// Run one prompt in a fresh conversation.
     Ask { prompt: String },
@@ -88,7 +88,7 @@ fn main() -> ExitCode {
 
 fn run(cli: Cli) -> Result<(), Error> {
     let request = match cli.command {
-        Command::Chat { .. } => return Err(Error::NotImplemented("chat")),
+        Command::Chat { thread } => return chat::run(thread),
         Command::Ask { prompt } => Request::Ask { prompt },
         Command::Schedule(action) => Request::Schedule { action: action.into() },
         Command::Watch(action) => Request::Watch { action: action.into() },

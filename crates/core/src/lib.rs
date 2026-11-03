@@ -27,8 +27,8 @@ use crate::model::Model;
 use crate::router::Router;
 use crate::secrets::Secrets;
 
-/// Pending asks between the control socket and the router.
-const ASK_QUEUE: usize = 16;
+/// Pending commands between the control socket and the router.
+const COMMAND_QUEUE: usize = 16;
 
 /// Runs the daemon until SIGINT or SIGTERM.
 pub fn run(config: Option<PathBuf>) -> Result<(), Error> {
@@ -57,15 +57,15 @@ async fn serve(config_path: Option<PathBuf>) -> Result<(), Error> {
     let model = Model::new(config.model, &mut secrets)?;
     let db = Db::open(&data_dir.join(db::DB_FILE))?;
 
-    let (asks, ask_queue) = mpsc::channel(ASK_QUEUE);
-    let socket = ControlSocket::bind(shade_proto::socket_path(&data_dir), asks)?;
+    let (commands, command_queue) = mpsc::channel(COMMAND_QUEUE);
+    let socket = ControlSocket::bind(shade_proto::socket_path(&data_dir), commands)?;
     tracing::info!(path = %socket.path().display(), model = %model.id(), "listening");
 
     let router = Router::start(model, db);
 
     let result = tokio::select! {
         () = socket.serve() => Ok(()),
-        () = router.serve(ask_queue) => Ok(()),
+        () = router.serve(command_queue) => Ok(()),
         result = shutdown_signal() => result,
     };
 

@@ -4,9 +4,6 @@ use thiserror::Error;
 
 #[derive(Debug, Error)]
 pub enum Error {
-    #[error("`{0}` is not implemented yet")]
-    NotImplemented(&'static str),
-
     #[error("cannot resolve path {path}: {source}")]
     Path { path: PathBuf, source: std::io::Error },
 

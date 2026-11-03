@@ -15,7 +15,7 @@ use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{Semaphore, mpsc};
 
 use crate::Error;
-use crate::router::{Ask, REPLY_QUEUE};
+use crate::router::{Command, REPLY_QUEUE, Target};
 
 const MAX_CONNECTIONS: usize = 16;
 
@@ -43,12 +43,12 @@ pub struct ControlSocket {
     listener: UnixListener,
     path: PathBuf,
     owner_uid: u32,
-    asks: mpsc::Sender<Ask>,
+    commands: mpsc::Sender<Command>,
 }
 
 impl ControlSocket {
     /// The caller must hold the execution lock: it proves a leftover socket file is stale.
-    pub fn bind(path: PathBuf, asks: mpsc::Sender<Ask>) -> Result<Self, Error> {
+    pub fn bind(path: PathBuf, commands: mpsc::Sender<Command>) -> Result<Self, Error> {
         if let Err(source) = remove_if_present(&path) {
             return Err(Error::Socket { path, source });
         }
@@ -63,7 +63,7 @@ impl ControlSocket {
             Err(source) => return Err(Error::Socket { path, source }),
         };
 
-        Ok(Self { listener, path, owner_uid, asks })
+        Ok(Self { listener, path, owner_uid, commands })
     }
 
     pub fn path(&self) -> &Path {
@@ -88,10 +88,10 @@ impl ControlSocket {
             };
 
             let owner_uid = self.owner_uid;
-            let asks = self.asks.clone();
+            let commands = self.commands.clone();
 
             tokio::spawn(async move {
-                if let Err(error) = handle(stream, owner_uid, asks).await {
+                if let Err(error) = handle(stream, owner_uid, commands).await {
                     tracing::warn!(%error, "control connection failed");
                 }
 
@@ -124,7 +124,7 @@ fn restrict_to_owner(path: &Path) -> std::io::Result<u32> {
     Ok(metadata.uid())
 }
 
-async fn handle(stream: UnixStream, owner_uid: u32, asks: mpsc::Sender<Ask>) -> Result<(), ConnectionError> {
+async fn handle(stream: UnixStream, owner_uid: u32, commands: mpsc::Sender<Command>) -> Result<(), ConnectionError> {
     let peer_uid = stream.peer_cred()?.uid();
 
     if peer_uid != owner_uid {
@@ -146,23 +146,48 @@ async fn handle(stream: UnixStream, owner_uid: u32, asks: mpsc::Sender<Ask>) -> 
     let request: Request = read_message(&mut reader).await?;
 
     match request {
-        Request::Ask { prompt } => forward_ask(prompt, &asks, &mut write).await,
+        Request::Ask { prompt } => {
+            forward(|reply| Command::Prompt { target: Target::Fresh, text: prompt, reply }, &commands, &mut write).await
+        }
+        Request::Chat { conversation, text } => {
+            if !shade_proto::valid_conversation(&conversation) {
+                return write_message(&mut write, &invalid_conversation()).await;
+            }
+
+            let target = Target::Terminal(conversation);
+            forward(|reply| Command::Prompt { target, text, reply }, &commands, &mut write).await
+        }
+        Request::NewConversation { conversation } => {
+            if !shade_proto::valid_conversation(&conversation) {
+                return write_message(&mut write, &invalid_conversation()).await;
+            }
+
+            forward(|reply| Command::NewConversation { key: conversation, reply }, &commands, &mut write).await
+        }
         other => write_message(&mut write, &not_implemented(other)).await,
     }
 }
 
-/// Streams the router's replies until the final one.
-async fn forward_ask(prompt: String, asks: &mpsc::Sender<Ask>, write: &mut Writer) -> Result<(), ConnectionError> {
+/// Sends a command to the router and streams its replies until the final one.
+async fn forward<F>(command: F, commands: &mpsc::Sender<Command>, write: &mut Writer) -> Result<(), ConnectionError>
+where
+    F: FnOnce(mpsc::Sender<Response>) -> Command,
+{
     let (reply, mut replies) = mpsc::channel(REPLY_QUEUE);
 
-    if asks.send(Ask { prompt, reply }).await.is_err() {
+    if commands.send(command(reply)).await.is_err() {
         let message = "the daemon is shutting down".to_owned();
         return write_message(write, &Response::Error { message }).await;
     }
 
     while let Some(response) = replies.recv().await {
         let terminal = !matches!(response, Response::Text { .. });
-        write_message(write, &response).await?;
+
+        // Leaving mid-turn is normal: the turn finishes without this client.
+        if let Err(error) = write_message(write, &response).await {
+            tracing::debug!(%error, "client left before the reply ended");
+            return Ok(());
+        }
 
         if terminal {
             return Ok(());
@@ -174,9 +199,20 @@ async fn forward_ask(prompt: String, asks: &mpsc::Sender<Ask>, write: &mut Write
     write_message(write, &Response::Error { message }).await
 }
 
+fn invalid_conversation() -> Response {
+    let message = format!(
+        "conversation names are 1 to {} bytes without control characters",
+        shade_proto::MAX_CONVERSATION_BYTES
+    );
+
+    Response::Error { message }
+}
+
 fn not_implemented(request: Request) -> Response {
     let name = match request {
         Request::Ask { .. } => "ask",
+        Request::Chat { .. } => "chat",
+        Request::NewConversation { .. } => "chat",
         Request::Schedule { .. } => "schedule",
         Request::Watch { .. } => "watch",
         Request::ThreadsList => "threads",

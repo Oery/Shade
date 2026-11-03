@@ -3,7 +3,7 @@
 //! Semantics follow Infinity's reference `InMemoryConversationStore`, with two
 //! deliberate differences:
 //!
-//! - Roots exist only through [`Conversations::register_root`].
+//! - Roots exist only through registration ([`super::roots`]).
 //!   `ensure_root_thread` never creates one, so input for an unknown ID cannot
 //!   mint a root. Children and messages need an existing thread.
 //! - `append_messages` records the IDs of user and subscription-event inputs as
@@ -17,6 +17,8 @@ use infinity_agent_core::traits::{ConversationStore, SpawnContext};
 use rap_protocol::ToolCallId;
 use rusqlite::{Connection, OptionalExtension, Statement, params};
 
+#[cfg(test)]
+use super::roots::insert_root;
 use crate::db::{Db, DbError};
 
 #[derive(Clone)]
@@ -37,17 +39,12 @@ impl Conversations {
         Self { db }
     }
 
-    /// Creates a root thread. This is the only way a root comes into existence.
+    /// Creates a root with a chosen ID, for tests. Entry points use [`Roots`](super::roots::Roots).
+    #[cfg(test)]
     pub async fn register_root(&self, thread_id: &ThreadId<str>) -> Result<(), DbError> {
         let id = thread_id.as_str().to_owned();
 
-        self.db
-            .call(move |connection| {
-                connection.execute("INSERT INTO threads (id, root_id) VALUES (?1, ?1)", [&id])?;
-
-                Ok(())
-            })
-            .await
+        self.db.call(move |connection| insert_root(connection, &id)).await
     }
 
     /// Reads one boolean column of a thread. Unknown threads read as `false`, as in the reference store.

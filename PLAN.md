@@ -63,7 +63,7 @@ The daemon is the only process that opens `shade.db` or drives Infinity. It acqu
 
 - Path `<data_dir>/shade.sock`, where the data directory is `$XDG_DATA_HOME/shade`, else `~/.local/share/shade`; relative or empty values are ignored. Both binaries resolve it with the same `shade-proto` function. Unix socket paths are limited to 108 bytes, so a very long data directory fails at bind with a clear error. The data directory is created `0700` and the socket is `0600`. The daemon also checks the peer UID (`SO_PEERCRED`) and rejects other users.
 - Newline-delimited JSON. Each connection starts with a hello carrying the protocol version; a mismatch fails with a clear error. Client and daemon ship from the same workspace and are upgraded together, so there is no compatibility layer for old protocol versions.
-- One request per connection, answered by zero or more events and one final `done` or `error`. `chat` keeps its connection open for the session and sends one request per user line.
+- One request per connection, answered by zero or more events and one final `done` or `error`. `chat` opens one connection per user line, so the daemon keeps no session state.
 - Lines and queues are bounded. Request and response types live in `shade-proto`.
 - A connection carries owner authority. Terminal chat and `ask` enter as `Chat` origin through the same root registration and durable delivery path as Discord. Administrative requests are an explicit owner-operated path and are not agent tools.
 - Closing the client does not cancel a turn. The turn finishes and remains in history; only output delivery to that connection stops.
@@ -572,6 +572,7 @@ Each milestone is one reviewable PR. `Check` is a manual demonstration; `Tests` 
 - **Scope:** `shade chat` sessions over the control socket, conversation mapping, `/new`, and the shared root-registration service.
 - **Check:** conversation resumes after a daemon restart; closing the client mid-turn lets the turn finish and keeps it in history.
 - **Tests:** only lock/registration races not covered by dependency guarantees.
+- **Done:** `conversations(adapter, key, root_id)` maps terminal names (`default`, `--thread NAME`, 1–64 bytes, no control characters) to roots; `/new` repoints the name and keeps the old root. `store::roots` is the only place roots are created, for `ask` and chat alike, always before attaching. A turn's pump ignores events until Infinity echoes its input (`UserInput`), so the tail of an earlier turn (a client that left mid-reply) cannot end it; a second `UserInput` means another terminal interrupted it, and the turn ends with an error instead of showing the other reply. A client leaving mid-turn is logged at debug, not as a failure.
 
 ### M5 — Grants and shared execution limits
 
