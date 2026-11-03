@@ -33,7 +33,12 @@ enum CrashAfter {
 }
 
 async fn accept(router: &Router) -> Result<Input, BoxError> {
-    Ok(router.inbox.accept(Adapter::Terminal, Target::Named("default".to_owned()), TEXT.to_owned()).await?)
+    let target = Target::Named("default".to_owned());
+
+    match router.inbox.accept(Adapter::Terminal, target, TEXT.to_owned(), None).await? {
+        Some(input) => Ok(input),
+        None => Err("a terminal input was taken for a duplicate".into()),
+    }
 }
 
 /// The final response of a turn.
@@ -127,6 +132,36 @@ async fn failed_input_is_settled_before_its_sender_hears() -> Result<(), BoxErro
 
         assert!(matches!(last(&mut replies).await, Some(Response::Error { .. })));
         assert!(router.inbox.unsettled().await?.is_empty(), "a failed input would run again after a restart");
+
+        Ok(())
+    })
+    .await
+}
+
+/// Discord may deliver a message twice: one input, one turn, one reply.
+#[tokio::test(flavor = "current_thread")]
+async fn message_delivered_twice_is_accepted_once() -> Result<(), BoxError> {
+    within(async {
+        let db = Db::in_memory()?;
+        let (router, mut model) = testing::router(&db, testing::policy(&[], Limits::default())).await?;
+        let mut replies = Vec::new();
+
+        for _ in 0..2 {
+            let (reply, receiver) = mpsc::channel(REPLY_QUEUE);
+            let (target, source_key) = (Target::Named("42".to_owned()), Some("discord:7".to_owned()));
+            router.prompt(Adapter::Discord, target, TEXT.to_owned(), source_key, Outbound::Client(reply)).await;
+            replies.push(receiver);
+        }
+
+        model.next_request().await;
+        model.send_text("noted");
+        model.finish();
+
+        assert!(matches!(last(&mut replies[0]).await, Some(Response::Done)));
+        assert!(replies[1].recv().await.is_none(), "the duplicate got a reply of its own");
+
+        let accepted: i64 = db.call(|connection| Ok(connection.query_row("SELECT COUNT(*) FROM inbox", [], |row| row.get(0))?)).await?;
+        assert_eq!(accepted, 1);
 
         Ok(())
     })

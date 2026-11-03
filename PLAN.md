@@ -136,7 +136,7 @@ crates/
       sandbox/output.rs     bounded head/tail capture
       adapters/
         socket.rs           control socket server
-        discord.rs
+        discord.rs          owner chat, chunked replies, typing, safe mentions
         webhook.rs
 ```
 
@@ -626,6 +626,8 @@ Each milestone is one reviewable PR. `Check` is a manual demonstration; `Tests` 
 - **Scope:** allowlist, DMs/mentions, message-ID deduplication, chunking, typing status, safe mentions, `/new`, and bounded adapter output.
 - **Check:** authorized chat resumes after restart; unauthorized/bot input ignored; channel privacy behavior documented.
 - **Tests:** Unicode/long-line chunk boundaries and duplicate message delivery producing one accepted input.
+- **Done:** `adapters/discord.rs` on serenity 0.12 (client, gateway, model, rustls; no cache, no framework). `[discord]` names the token variable and a non-empty `owners` list of user IDs. Intents are `DIRECT_MESSAGES | GUILD_MESSAGES` only: Discord sends a bot the content of DMs and of messages that mention it without the privileged Message Content intent. A message is heard when its author is an owner and not a bot, and it is a DM or mentions the bot; the mention is stripped and attachment URLs are appended. Each channel is a conversation (`conversations(discord, channel_id)`), `/new` repoints it, and the message ID is the inbox `source_key`, so a redelivered message is accepted once. Replies buffer text and post it when a completion ends (including one that pauses on an async tool), never at a superseded turn, in chunks of at most 2000 UTF-16 units split at line breaks, else between characters. Grapheme clusters may still be split. A reply buffer keeps 16 KiB between posts and says when it dropped the rest. Replies allow no mentions (not even the replied-to user) and, in server channels, reference the message they answer. "Typing…" lasts from receipt to the end of the turn. Resumed work in a Discord conversation posts to its channel. The gateway starts after `resume`, and shuts down before the router. The turn tracker now starts at its own input's text, so a fast second message cannot be mistaken for the first one's acceptance.
+- **Check (pending):** needs the bot token in `~/.config/shade/.env`.
 
 ### M10 — Notifications
 

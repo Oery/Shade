@@ -26,10 +26,11 @@ use tokio::task::LocalSet;
 
 pub use error::Error;
 
+use crate::adapters::discord::Discord;
 use crate::adapters::socket::ControlSocket;
 use crate::config::Config;
 use crate::model::Model;
-use crate::router::Router;
+use crate::router::{Inbound, Router};
 use crate::secrets::Secrets;
 use crate::store::db::{self, Db};
 
@@ -49,7 +50,7 @@ pub fn run(config: Option<PathBuf>) -> Result<(), Error> {
 
 async fn serve(config_path: Option<PathBuf>) -> Result<(), Error> {
     let config_path = config::path(config_path)?;
-    let Config { model, timezone, chat, hooks, limits, sandbox } = config::load(&config_path)?;
+    let Config { model, timezone, chat, hooks, limits, sandbox, discord } = config::load(&config_path)?;
     let policy = config::policy(&config_path, chat, hooks, limits, timezone)?;
     let mut secrets = Secrets::load(secrets::path_for(&config_path))?;
 
@@ -68,23 +69,47 @@ async fn serve(config_path: Option<PathBuf>) -> Result<(), Error> {
     let db = Db::open(&data_dir.join(db::DB_FILE))?;
 
     let (inbound, inbound_queue) = mpsc::channel(INBOUND_QUEUE);
+
+    let discord = match discord {
+        Some(config) => Some(Discord::connect(config, &mut secrets, inbound.clone()).await?),
+        None => None,
+    };
+
     let socket = ControlSocket::bind(shade_proto::socket_path(&data_dir), inbound)?;
     tracing::info!(path = %socket.path().display(), model = %model.id(), "listening");
 
-    let router = Router::start(model, db, Arc::new(policy), sandbox.map(Arc::new));
+    let http = discord.as_ref().map(Discord::http);
+    let router = Router::start(model, db, Arc::new(policy), sandbox.map(Arc::new), http);
 
     if let Err(source) = router.resume().await {
         router.shutdown().await;
         return Err(Error::Recovery(source));
     }
 
+    let result = listen(&socket, &router, inbound_queue, discord).await;
+    router.shutdown().await;
+
+    result
+}
+
+/// Serves new input until a shutdown signal. The Discord gateway starts
+/// here, after resumed work, so a new message cannot overtake it.
+async fn listen(socket: &ControlSocket, router: &Router, inbound: mpsc::Receiver<Inbound>, discord: Option<Discord>) -> Result<(), Error> {
+    let shards = discord.as_ref().map(Discord::shards);
+
+    if let Some(discord) = discord {
+        tokio::spawn(discord.run());
+    }
+
     let result = tokio::select! {
         () = socket.serve() => Ok(()),
-        () = router.serve(inbound_queue) => Ok(()),
+        () = router.serve(inbound) => Ok(()),
         result = shutdown_signal() => result,
     };
 
-    router.shutdown().await;
+    if let Some(shards) = shards {
+        shards.shutdown_all().await;
+    }
 
     result
 }

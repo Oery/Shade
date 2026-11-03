@@ -25,6 +25,17 @@ pub struct Config {
     pub limits: Limits,
     /// Where `shell` runs. Required when any origin holds `shell`.
     pub sandbox: Option<SandboxConfig>,
+    /// Owner chat over Discord. Off without this section.
+    pub discord: Option<DiscordConfig>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DiscordConfig {
+    /// Name of the environment variable holding the bot token, like `model.api_key_env`.
+    pub token_env: String,
+    /// Discord user IDs allowed to chat. Everyone else is ignored.
+    pub owners: Vec<u64>,
 }
 
 #[derive(Debug, Default, Deserialize)]

@@ -7,7 +7,7 @@
 //! is unsettled and is sent again, with the same ID, when the daemon starts.
 
 use infinity_agent_core::ThreadId;
-use rusqlite::params;
+use rusqlite::{OptionalExtension, params};
 
 use crate::store::db::{Db, DbError};
 use crate::store::roots::{self, Adapter, Target};
@@ -31,19 +31,28 @@ impl Inbox {
     }
 
     /// Records `text` for `target`'s conversation and starts its turn.
-    pub async fn accept(&self, adapter: Adapter, target: Target, text: String) -> Result<Input, DbError> {
+    /// `None` when `source_key` was accepted before: the sender delivered it twice.
+    pub async fn accept(
+        &self, adapter: Adapter, target: Target, text: String, source_key: Option<String>,
+    ) -> Result<Option<Input>, DbError> {
         let id = uuid::Uuid::new_v4().to_string();
 
         self.db
             .call(move |connection| {
                 let transaction = connection.transaction()?;
+                let seen = transaction.query_row("SELECT 1 FROM inbox WHERE source_key = ?1", [&source_key], |_| Ok(())).optional()?;
+
+                if seen.is_some() {
+                    return Ok(None);
+                }
+
                 let root = roots::turn(&transaction, adapter, &target)?;
 
-                let sql = "INSERT INTO inbox (id, root_id, text) VALUES (?1, ?2, ?3)";
-                transaction.execute(sql, params![&id, &root, &text])?;
+                let sql = "INSERT INTO inbox (id, root_id, text, source_key) VALUES (?1, ?2, ?3, ?4)";
+                transaction.execute(sql, params![&id, &root, &text, &source_key])?;
                 transaction.commit()?;
 
-                Ok(Input { root: ThreadId::from(root), id, text })
+                Ok(Some(Input { root: ThreadId::from(root), id, text }))
             })
             .await
     }

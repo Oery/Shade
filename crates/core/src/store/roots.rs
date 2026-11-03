@@ -20,16 +20,23 @@ pub enum Target {
 }
 
 /// Where a named conversation lives. Names are scoped per adapter.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Adapter {
     Terminal,
+    /// Keys are channel IDs.
+    Discord,
 }
 
 impl Adapter {
     fn name(self) -> &'static str {
         match self {
             Self::Terminal => "terminal",
+            Self::Discord => "discord",
         }
+    }
+
+    fn parse(name: &str) -> Option<Self> {
+        [Self::Terminal, Self::Discord].into_iter().find(|adapter| adapter.name() == name)
     }
 }
 
@@ -41,6 +48,26 @@ pub struct Roots {
 impl Roots {
     pub fn new(db: Db) -> Self {
         Self { db }
+    }
+
+    /// The conversation name that currently points at `root`, if any.
+    pub async fn conversation_of(&self, root: &ThreadId<str>) -> Result<Option<(Adapter, String)>, DbError> {
+        let id = root.as_str().to_owned();
+
+        let row: Option<(String, String)> = self
+            .db
+            .call(move |connection| {
+                let sql = "SELECT adapter, key FROM conversations WHERE root_id = ?1";
+
+                Ok(connection.query_row(sql, [&id], |row| Ok((row.get(0)?, row.get(1)?))).optional()?)
+            })
+            .await?;
+
+        let Some((adapter, key)) = row else {
+            return Ok(None);
+        };
+
+        Ok(Adapter::parse(&adapter).map(|adapter| (adapter, key)))
     }
 
     /// Points `key` at a new root. The previous root keeps its history.

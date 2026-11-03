@@ -87,7 +87,7 @@ pub async fn start_sandboxed(db: &Db, policy: Arc<Policy>, sandbox: Option<Arc<S
 pub async fn router(db: &Db, policy: Arc<Policy>) -> Result<(Router, MockModelController), BoxError> {
     let Harness { system, model, .. } = start_with(db, policy).await?;
 
-    Ok((Router::new(db.clone(), system), model))
+    Ok((Router::new(db.clone(), system, None), model))
 }
 
 /// Attaches to a registered thread and waits out the idle its attach-spawned driver emits.

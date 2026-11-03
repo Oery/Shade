@@ -16,7 +16,7 @@ use tokio::sync::{Semaphore, mpsc};
 
 use crate::Error;
 use crate::router::{Inbound, Outbound, REPLY_QUEUE};
-use crate::store::roots::Target;
+use crate::store::roots::{Adapter, Target};
 
 const MAX_CONNECTIONS: usize = 16;
 
@@ -148,7 +148,13 @@ async fn handle(stream: UnixStream, owner_uid: u32, inbound: mpsc::Sender<Inboun
 
     match request {
         Request::Ask { prompt } => {
-            let prompt = |reply| Inbound::Prompt { target: Target::Fresh, text: prompt, outbound: Outbound::Client(reply) };
+            let prompt = |reply| Inbound::Prompt {
+                adapter: Adapter::Terminal,
+                target: Target::Fresh,
+                text: prompt,
+                source_key: None,
+                outbound: Outbound::Client(reply),
+            };
             forward(prompt, &inbound, &mut write).await
         }
         Request::Chat { conversation, text } => {
@@ -157,14 +163,17 @@ async fn handle(stream: UnixStream, owner_uid: u32, inbound: mpsc::Sender<Inboun
             }
 
             let target = Target::Named(conversation);
-            forward(|reply| Inbound::Prompt { target, text, outbound: Outbound::Client(reply) }, &inbound, &mut write).await
+            let prompt =
+                |reply| Inbound::Prompt { adapter: Adapter::Terminal, target, text, source_key: None, outbound: Outbound::Client(reply) };
+            forward(prompt, &inbound, &mut write).await
         }
         Request::NewConversation { conversation } => {
             if !shade_proto::valid_conversation(&conversation) {
                 return write_message(&mut write, &invalid_conversation()).await;
             }
 
-            forward(|reply| Inbound::NewConversation { key: conversation, reply }, &inbound, &mut write).await
+            let new = |reply| Inbound::NewConversation { adapter: Adapter::Terminal, key: conversation, reply };
+            forward(new, &inbound, &mut write).await
         }
         other => write_message(&mut write, &not_implemented(other)).await,
     }

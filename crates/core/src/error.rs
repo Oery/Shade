@@ -2,6 +2,7 @@ use std::path::PathBuf;
 
 use thiserror::Error;
 
+use crate::adapters::discord::DiscordError;
 use crate::sandbox::SandboxError;
 
 pub type BoxError = Box<dyn std::error::Error + Send + Sync>;
@@ -61,6 +62,9 @@ pub enum Error {
 
     #[error(transparent)]
     Sandbox(#[from] SandboxError),
+
+    #[error(transparent)]
+    Discord(#[from] DiscordError),
 
     #[error("cannot resume work interrupted by the last shutdown: {0}")]
     Recovery(BoxError),

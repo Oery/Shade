@@ -5,7 +5,7 @@
 //! its turn to the end. A pump outlives its client, so a turn's outcome is
 //! always settled. Work interrupted by a restart re-enters the same path.
 
-mod turn;
+pub mod turn;
 
 #[cfg(test)]
 mod tests;
@@ -16,15 +16,17 @@ use infinity_agent_core::ThreadId;
 use infinity_agent_core::message::InputMessage;
 use infinity_agent_core::system::local::{LaunchingSystem, ThreadHandle};
 use infinity_agent_core::system::{AgentSystemBuilder, NoRapHttp};
+use serenity::all::Http;
 use shade_proto::Response;
 use tokio::sync::mpsc;
 
+use crate::adapters::discord::Reply;
 use crate::authority::{Authority, Metered};
 use crate::error::BoxError;
 use crate::model::Model;
 use crate::policy::Policy;
 use crate::recovery;
-use crate::router::turn::Turn;
+use crate::router::turn::{Step, Turn};
 use crate::sandbox::Sandbox;
 use crate::store::conversation::Conversations;
 use crate::store::db::Db;
@@ -44,26 +46,38 @@ pub type System = LaunchingSystem<Conversations, States, NoRapHttp>;
 /// Input from an adapter.
 pub enum Inbound {
     /// User text for a conversation.
-    Prompt { target: Target, text: String, outbound: Outbound },
-    /// Points a terminal conversation name at a fresh root.
-    NewConversation { key: String, reply: mpsc::Sender<Response> },
+    Prompt {
+        adapter: Adapter,
+        target: Target,
+        text: String,
+        /// The sender's own ID for this input, so a redelivery is accepted once.
+        source_key: Option<String>,
+        outbound: Outbound,
+    },
+    /// Points a conversation name at a fresh root.
+    NewConversation { adapter: Adapter, key: String, reply: mpsc::Sender<Response> },
 }
 
 /// Where a turn's output goes. The turn runs to its end either way.
 pub enum Outbound {
     /// A connected client. If it leaves, the turn finishes without it.
     Client(mpsc::Sender<Response>),
-    /// Nobody: work resumed after a restart. The outcome is logged.
+    /// A Discord channel.
+    Discord(Reply),
+    /// Nobody: resumed work in a conversation no adapter listens to. The outcome is logged.
     Detached,
 }
 
 impl Outbound {
-    async fn send(&self, thread: &str, response: Response) {
+    async fn send(&mut self, thread: &str, step: Step) {
         match self {
             Self::Client(reply) => {
-                let _ = reply.send(response).await;
+                if let Some(response) = response_for(step) {
+                    let _ = reply.send(response).await;
+                }
             }
-            Self::Detached => log_detached(thread, &response),
+            Self::Discord(reply) => reply.send(step).await,
+            Self::Detached => log_detached(thread, &step),
         }
     }
 }
@@ -74,11 +88,13 @@ pub struct Router {
     roots: Roots,
     operations: Operations,
     system: System,
+    /// For replies to resumed work in Discord conversations.
+    discord: Option<Arc<Http>>,
 }
 
 impl Router {
     /// Built-in tools stay off: spawning has no limit hook (see docs/infinity-notes.md).
-    pub fn start(model: Model, db: Db, policy: Arc<Policy>, sandbox: Option<Arc<Sandbox>>) -> Self {
+    pub fn start(model: Model, db: Db, policy: Arc<Policy>, sandbox: Option<Arc<Sandbox>>, discord: Option<Arc<Http>>) -> Self {
         let authority = Authority::new(Grants::new(db.clone()), policy);
         let conversations = Conversations::new(db.clone());
         let tools = ThreadTools::new(conversations.clone(), authority.clone(), Operations::new(db.clone()), sandbox);
@@ -86,23 +102,25 @@ impl Router {
         let builder = AgentSystemBuilder::new_local(conversations, States::new(db.clone()), model);
         let system = builder.without_builtin_tools().thread_config(tools).start();
 
-        Self::new(db, system)
+        Self::new(db, system, discord)
     }
 
-    pub fn new(db: Db, system: System) -> Self {
+    pub fn new(db: Db, system: System, discord: Option<Arc<Http>>) -> Self {
         let inbox = Inbox::new(db.clone());
         let roots = Roots::new(db.clone());
         let operations = Operations::new(db.clone());
 
-        Self { db, inbox, roots, operations, system }
+        Self { db, inbox, roots, operations, system, discord }
     }
 
     /// Handles input until the channel closes. Must run inside a `LocalSet`.
     pub async fn serve(&self, mut inbound: mpsc::Receiver<Inbound>) {
         while let Some(input) = inbound.recv().await {
             match input {
-                Inbound::Prompt { target, text, outbound } => self.prompt(target, text, outbound).await,
-                Inbound::NewConversation { key, reply } => self.new_conversation(key, reply).await,
+                Inbound::Prompt { adapter, target, text, source_key, outbound } => {
+                    self.prompt(adapter, target, text, source_key, outbound).await;
+                }
+                Inbound::NewConversation { adapter, key, reply } => self.new_conversation(adapter, key, reply).await,
             }
         }
     }
@@ -113,13 +131,15 @@ impl Router {
     pub async fn resume(&self) -> Result<(), BoxError> {
         for answer in recovery::answers(&self.operations).await? {
             let handle = self.attach(&answer.thread).await?;
+            let outbound = self.outbound_for(&answer.thread).await;
             tools::deliver(&self.system.sender(), answer.thread, answer.id, answer.call_id, answer.text).await?;
-            tokio::task::spawn_local(pump(handle, Turn::continuing(), Outbound::Detached, None));
+            tokio::task::spawn_local(pump(handle, Turn::continuing(), outbound, None));
         }
 
         for input in self.inbox.unsettled().await? {
             tracing::info!(root = %input.root, input = %input.id, "resending an input accepted before the restart");
-            self.dispatch(input, Outbound::Detached).await;
+            let outbound = self.outbound_for(&input.root).await;
+            self.dispatch(input, outbound).await;
         }
 
         Ok(())
@@ -135,34 +155,58 @@ impl Router {
         }
     }
 
-    async fn prompt(&self, target: Target, text: String, outbound: Outbound) {
-        match self.inbox.accept(Adapter::Terminal, target, text).await {
-            Ok(input) => self.dispatch(input, outbound).await,
-            Err(error) => outbound.send("", error_response(format!("cannot accept the message: {error}"))).await,
+    async fn prompt(&self, adapter: Adapter, target: Target, text: String, source_key: Option<String>, mut outbound: Outbound) {
+        match self.inbox.accept(adapter, target, text, source_key).await {
+            Ok(Some(input)) => self.dispatch(input, outbound).await,
+            Ok(None) => tracing::debug!("ignoring a message delivered twice"),
+            Err(error) => outbound.send("", Step::Failed(format!("cannot accept the message: {error}"))).await,
         }
     }
 
     /// Sends a recorded input and follows its turn.
-    async fn dispatch(&self, input: Input, outbound: Outbound) {
+    async fn dispatch(&self, input: Input, mut outbound: Outbound) {
         let Input { root, id, text } = input;
 
         let handle = match self.attach(&root).await {
             Ok(handle) => handle,
             Err(message) => {
                 settle(&self.inbox, &id, &message).await;
-                outbound.send(root.as_str(), error_response(message)).await;
+                outbound.send(root.as_str(), Step::Failed(message)).await;
                 return;
             }
         };
 
+        let turn = Turn::for_input(&text);
+
         // Unsettled until processed: if this fails, the next start sends it again.
         if handle.send(InputMessage::user_text(root, text), &id).await.is_err() {
             let message = "the daemon is shutting down; the message will be answered after it restarts".to_owned();
-            outbound.send(handle.thread_id().as_str(), error_response(message)).await;
+            outbound.send(handle.thread_id().as_str(), Step::Failed(message)).await;
             return;
         }
 
-        tokio::task::spawn_local(pump(handle, Turn::default(), outbound, Some((self.inbox.clone(), id))));
+        tokio::task::spawn_local(pump(handle, turn, outbound, Some((self.inbox.clone(), id))));
+    }
+
+    /// Where resumed work in `thread` reports: its Discord channel, if it is one.
+    async fn outbound_for(&self, thread: &ThreadId<str>) -> Outbound {
+        let Some(http) = &self.discord else {
+            return Outbound::Detached;
+        };
+
+        let key = match self.roots.conversation_of(thread).await {
+            Ok(Some((Adapter::Discord, key))) => key,
+            Ok(_) => return Outbound::Detached,
+            Err(error) => {
+                tracing::warn!(%error, %thread, "cannot find where resumed work reports");
+                return Outbound::Detached;
+            }
+        };
+
+        match Reply::to_channel(Arc::clone(http), &key) {
+            Some(reply) => Outbound::Discord(reply),
+            None => Outbound::Detached,
+        }
     }
 
     /// Roots are registered before this, so configuration never resolves for an unregistered thread.
@@ -174,8 +218,8 @@ impl Router {
         }
     }
 
-    async fn new_conversation(&self, key: String, reply: mpsc::Sender<Response>) {
-        if let Err(error) = self.roots.replace(Adapter::Terminal, key).await {
+    async fn new_conversation(&self, adapter: Adapter, key: String, reply: mpsc::Sender<Response>) {
+        if let Err(error) = self.roots.replace(adapter, key).await {
             let message = format!("cannot start a new conversation: {error}");
             let _ = reply.send(Response::Error { message }).await;
             return;
@@ -193,19 +237,19 @@ impl Router {
 /// turn fails is settled before its sender hears of it, so it is never run
 /// again after a restart. A pump cut short by shutdown leaves its input to
 /// be resent.
-async fn pump(mut handle: ThreadHandle, mut turn: Turn, outbound: Outbound, input: Option<(Inbox, String)>) {
+async fn pump(mut handle: ThreadHandle, mut turn: Turn, mut outbound: Outbound, input: Option<(Inbox, String)>) {
     while let Some(event) = handle.recv().await {
-        let Some(response) = turn.on_event(event) else {
+        let Some(step) = turn.on_event(event) else {
             continue;
         };
 
-        let last = !matches!(response, Response::Text { .. });
+        let last = step.is_last();
 
-        if let (Response::Error { message }, Some((inbox, id))) = (&response, &input) {
+        if let (Some(message), Some((inbox, id))) = (failure(&step), &input) {
             settle(inbox, id, message).await;
         }
 
-        outbound.send(handle.thread_id().as_str(), response).await;
+        outbound.send(handle.thread_id().as_str(), step).await;
 
         if last {
             return;
@@ -213,20 +257,37 @@ async fn pump(mut handle: ThreadHandle, mut turn: Turn, outbound: Outbound, inpu
     }
 }
 
+/// Why a turn ended without its answer, if it did.
+fn failure(step: &Step) -> Option<&str> {
+    match step {
+        Step::Failed(message) => Some(message),
+        Step::Superseded => Some(SUPERSEDED),
+        _ => None,
+    }
+}
+
+const SUPERSEDED: &str = "interrupted by newer input to this conversation";
+
 async fn settle(inbox: &Inbox, id: &str, message: &str) {
     if let Err(error) = inbox.fail(id, message).await {
         tracing::error!(%error, input = %id, "cannot record a failed input; it will be resent after a restart");
     }
 }
 
-fn error_response(message: String) -> Response {
-    Response::Error { message }
+fn response_for(step: Step) -> Option<Response> {
+    match step {
+        Step::Text(text) => Some(Response::Text { text }),
+        Step::Paused => None,
+        Step::Done => Some(Response::Done),
+        Step::Failed(message) => Some(Response::Error { message }),
+        Step::Superseded => Some(Response::Error { message: SUPERSEDED.to_owned() }),
+    }
 }
 
-fn log_detached(thread: &str, response: &Response) {
-    match response {
-        Response::Text { .. } => {}
-        Response::Done => tracing::info!(%thread, "finished resumed work"),
-        Response::Error { message } => tracing::warn!(%thread, %message, "resumed work failed"),
+fn log_detached(thread: &str, step: &Step) {
+    match step {
+        Step::Done => tracing::info!(%thread, "finished resumed work"),
+        Step::Failed(message) => tracing::warn!(%thread, %message, "resumed work failed"),
+        _ => {}
     }
 }
