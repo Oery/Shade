@@ -8,7 +8,7 @@ use chrono_tz::Tz;
 use serde::Deserialize;
 
 use crate::Error;
-use crate::policy::{Cap, Caps, Limits, Policy};
+use crate::policy::{Caps, Limits, Policy};
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -53,24 +53,11 @@ pub struct ChatConfig {
     pub prompt: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct JobsConfig {
     /// Replaces Shade's default instructions for background runs.
     pub prompt: Option<String>,
-    /// Owner chat changes jobs within these alone; beyond them, the owner approves.
-    #[serde(default = "default_agent_caps")]
-    pub agent_caps: Caps,
-}
-
-impl Default for JobsConfig {
-    fn default() -> Self {
-        Self { prompt: None, agent_caps: default_agent_caps() }
-    }
-}
-
-fn default_agent_caps() -> Caps {
-    [Cap::Now, Cap::Notify].into_iter().collect()
 }
 
 #[derive(Debug, Deserialize)]
@@ -180,16 +167,7 @@ pub fn policy(path: &Path, config: Sections) -> Result<Policy, Error> {
     };
 
     let hooks = hooks.into_iter().map(|(name, hook)| (name, hook.caps)).collect();
-    let policy = Policy {
-        chat: chat.caps,
-        chat_prompt: chat.prompt,
-        jobs_prompt: jobs.prompt,
-        agent_caps: jobs.agent_caps,
-        channels,
-        hooks,
-        limits,
-        timezone,
-    };
+    let policy = Policy { chat: chat.caps, chat_prompt: chat.prompt, jobs_prompt: jobs.prompt, channels, hooks, limits, timezone };
 
     if let Err(message) = policy.validate() {
         return Err(invalid(path, message));

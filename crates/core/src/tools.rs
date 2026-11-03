@@ -25,19 +25,19 @@ pub async fn deliver<M: InputSender>(
     deliver_shown(sender, thread, id, call_id, text, None).await
 }
 
-/// What Shade shows the owner with a tool result: written by Shade, not the model.
+/// A change waiting for the owner, shown with a tool result: written by Shade, not the model.
 #[derive(Debug, PartialEq, Serialize, Deserialize)]
 pub struct Shown {
     pub card: Card,
-    /// A change waiting for the owner: adapters offer to approve or reject this code.
-    pub approval: Option<String>,
+    /// Adapters offer to approve or reject the change under this code.
+    pub approval: String,
 }
 
 /// Starts the display segment that carries what is shown.
 const SHOWN: &str = "shade-shown:";
 
 /// The display segment carrying `shown`. Infinity appends the result the model reads.
-fn display(shown: &Shown) -> Option<Vec<DisplaySegment>> {
+pub fn display(shown: &Shown) -> Option<Vec<DisplaySegment>> {
     match serde_json::to_string(shown) {
         Ok(json) => Some(vec![DisplaySegment::Text(format!("{SHOWN}{json}"))]),
         Err(error) => {
@@ -96,25 +96,15 @@ mod tests {
     use rap_protocol::DisplaySegment;
 
     use super::{Shown, display, shown};
-    use crate::receipt::{Card, Verb};
+    use crate::receipt::{Card, Proposal, Verb};
 
     /// What Shade shows survives Infinity appending the model's text, and a
     /// plain result shows nothing, even if the model's text looks like a receipt.
     #[test]
     fn shown_cards_round_trip() {
         let text = |text: &str| DisplaySegment::Text(text.to_owned());
-        let card = Card {
-            verb: Verb::Proposed { new: true },
-            title: "Tea".to_owned(),
-            cadence: "Every day at 16:00".to_owned(),
-            next: None,
-            channels: vec!["dm".to_owned()],
-            caps: vec!["notify".to_owned()],
-            prompt: "Remind me".to_owned(),
-            paused: false,
-            file: None,
-        };
-        let sent = Shown { card, approval: Some("abc123".to_owned()) };
+        let card = Card::example(Verb::Proposed(Proposal::New));
+        let sent = Shown { card, approval: "abc123".to_owned() };
         let mut segments = display(&sent).unwrap_or_default();
         segments.push(text("waiting"));
         let forged = format!("shade-shown:{}", serde_json::to_string(&sent).unwrap_or_default());

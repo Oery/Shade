@@ -19,10 +19,15 @@ pub enum Verb {
     Created,
     Updated,
     Deleted,
-    /// Waits for the owner: a new job, or a change to an existing one.
-    Proposed {
-        new: bool,
-    },
+    /// Waits for the owner's approval.
+    Proposed(Proposal),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub enum Proposal {
+    New,
+    Change,
+    Delete,
 }
 
 /// One job change, as the owner sees it.
@@ -75,7 +80,7 @@ impl Card {
         text.push_str(&format!("\n   {} · next run: {}", self.cadence, self.next_run()));
         text.push_str(&format!("\n   posts to {} · can use {}", self.posts_to(), self.can_use()));
 
-        if matches!(self.verb, Verb::Proposed { .. }) {
+        if matches!(self.verb, Verb::Proposed(_)) {
             text.push_str(&format!("\n   asks: {}", self.prompt));
         }
 
@@ -95,7 +100,7 @@ impl Card {
             Verb::Created => "📅",
             Verb::Updated => "📝",
             Verb::Deleted => "🗑️",
-            Verb::Proposed { .. } => "⏳",
+            Verb::Proposed(_) => "⏳",
         }
     }
 
@@ -104,8 +109,9 @@ impl Card {
             Verb::Created => "Scheduled",
             Verb::Updated => "Changed",
             Verb::Deleted => "Deleted",
-            Verb::Proposed { new: true } => "New job, waiting for your approval:",
-            Verb::Proposed { new: false } => "Change waiting for your approval:",
+            Verb::Proposed(Proposal::New) => "New job, waiting for your approval:",
+            Verb::Proposed(Proposal::Change) => "Change waiting for your approval:",
+            Verb::Proposed(Proposal::Delete) => "Deletion waiting for your approval:",
         }
     }
 
@@ -268,6 +274,23 @@ fn friendly(instant: DateTime<Utc>, zone: Tz, home: Tz, now: DateTime<Utc>) -> S
     };
 
     format!("{day}, {}{suffix}", local.format("%H:%M"))
+}
+
+#[cfg(test)]
+impl Card {
+    pub fn example(verb: Verb) -> Self {
+        Self {
+            verb,
+            title: "Tea".to_owned(),
+            cadence: "Every day at 16:00".to_owned(),
+            next: Some("today, 16:00".to_owned()),
+            channels: vec!["dm".to_owned()],
+            caps: vec!["notify".to_owned()],
+            prompt: "Remind the owner about tea.".to_owned(),
+            paused: false,
+            file: Some("jobs/tea.toml".to_owned()),
+        }
+    }
 }
 
 #[cfg(test)]

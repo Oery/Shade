@@ -42,19 +42,9 @@ pub struct Harness {
 pub fn policy(caps: &[Cap], limits: Limits) -> Arc<Policy> {
     let chat = caps.iter().copied().collect();
 
-    let agent_caps = [Cap::Now, Cap::Notify].into_iter().collect();
     let channels = [("alerts".to_owned(), 42)].into_iter().collect();
 
-    Arc::new(Policy {
-        chat,
-        chat_prompt: None,
-        jobs_prompt: None,
-        agent_caps,
-        channels,
-        hooks: Default::default(),
-        limits,
-        timezone: chrono_tz::UTC,
-    })
+    Arc::new(Policy { chat, chat_prompt: None, jobs_prompt: None, channels, hooks: Default::default(), limits, timezone: chrono_tz::UTC })
 }
 
 /// Runs `test` on a `LocalSet`, failing it after ten seconds instead of hanging.

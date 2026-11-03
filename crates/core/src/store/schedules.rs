@@ -85,11 +85,18 @@ pub struct Waiting {
 
 /// A change waiting for the owner's approval.
 pub struct Pending {
+    pub code: String,
     pub job: String,
     /// `None` for a new job.
     pub base_version: Option<i64>,
+    /// The job as it will be, or as it is when the change deletes it.
     pub definition: Definition,
+    pub deletes: bool,
+    /// What `shade schedule approve` shows once it applies.
     pub receipt: String,
+    /// The thread that proposed it, told of the owner's decision.
+    pub thread: Option<String>,
+    /// Unix seconds; set by the database when stored.
     pub created_at: i64,
 }
 
@@ -119,15 +126,8 @@ pub enum Change {
         /// Its file is removed first.
         file: bool,
     },
-    /// Waits for the owner: nothing changes until they approve `code`.
-    /// `receipt` is shown when it applies.
-    Propose {
-        code: String,
-        id: String,
-        base_version: Option<i64>,
-        definition: Definition,
-        receipt: String,
-    },
+    /// Waits for the owner: nothing changes until they approve it.
+    Propose(Pending),
 }
 
 /// The tool call a change answers, and the receipt it answers with.
@@ -581,9 +581,11 @@ fn apply_change(connection: &Connection, change: Change, thread: Option<&str>) -
 
             Ok(None)
         }
-        Change::Propose { code, id, base_version, definition, receipt } => {
-            let sql = "INSERT INTO pending_changes (code, job_id, base_version, definition, receipt) VALUES (?1, ?2, ?3, ?4, ?5)";
-            connection.execute(sql, params![code, id, base_version, serde_json::to_string(&definition)?, receipt])?;
+        Change::Propose(pending) => {
+            let sql = "INSERT INTO pending_changes (code, job_id, base_version, definition, deletes, receipt, thread_id)
+                       VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)";
+            let Pending { code, job, base_version, definition, deletes, receipt, thread, .. } = pending;
+            connection.execute(sql, params![code, job, base_version, serde_json::to_string(&definition)?, deletes, receipt, thread])?;
 
             Ok(None)
         }
@@ -622,20 +624,25 @@ fn insert_job(connection: &Connection, id: &str, definition: &Definition, thread
 }
 
 fn pending_change(connection: &mut Connection, code: &str) -> Result<Option<Pending>, DbError> {
-    let sql = "SELECT job_id, base_version, definition, receipt, created_at FROM pending_changes WHERE code = ?1";
-    let row: Option<(String, Option<i64>, String, String, i64)> =
-        connection.query_row(sql, [code], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?))).optional()?;
+    let sql = "SELECT job_id, base_version, definition, deletes, receipt, thread_id, created_at FROM pending_changes WHERE code = ?1";
+    let mut statement = connection.prepare(sql)?;
+    let mut rows = statement.query([code])?;
 
-    let Some((job, base_version, definition, receipt, created_at)) = row else {
+    let Some(row) = rows.next()? else {
         return Ok(None);
     };
 
+    let definition: String = row.get(2)?;
+
     Ok(Some(Pending {
-        job,
-        base_version,
+        code: code.to_owned(),
+        job: row.get(0)?,
+        base_version: row.get(1)?,
         definition: serde_json::from_str(&definition)?,
-        receipt,
-        created_at,
+        deletes: row.get(3)?,
+        receipt: row.get(4)?,
+        thread: row.get(5)?,
+        created_at: row.get(6)?,
     }))
 }
 
@@ -701,7 +708,7 @@ mod tests {
 
         /// Proposes `title` for `job` as drafted against `base_version`, under `code`.
         pub async fn propose(
-            &self, code: &'static str, job: &'static str, base_version: Option<i64>, title: &'static str,
+            &self, code: &'static str, job: &'static str, base_version: Option<i64>, title: &'static str, thread: Option<&'static str>,
         ) -> Result<(), DbError> {
             self.db
                 .call(move |connection| {
@@ -712,13 +719,16 @@ mod tests {
 
                     let mut definition = found.definition;
                     definition.title = title.to_owned();
-                    let change = super::Change::Propose {
+                    let change = super::Change::Propose(super::Pending {
                         code: code.to_owned(),
-                        id: job.to_owned(),
+                        job: job.to_owned(),
                         base_version,
                         definition,
+                        deletes: false,
                         receipt: title.to_owned(),
-                    };
+                        thread: thread.map(str::to_owned),
+                        created_at: 0,
+                    });
                     super::apply_change(connection, change, None)?;
 
                     Ok(())

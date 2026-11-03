@@ -233,27 +233,31 @@ async fn second_scheduler(db: &Db, now: DateTime<Utc>) -> Result<(), BoxError> {
 }
 
 /// An approved change applies once and only while fresh: a change drafted
-/// before another one applied, or older than a day, does nothing.
+/// before another one applied, or older than a day, does nothing. The
+/// conversation that proposed it hears the decision and answers.
 #[tokio::test(flavor = "current_thread")]
 async fn approvals_apply_only_fresh_changes() -> Result<(), BoxError> {
     within(async {
         let db = Db::in_memory()?;
-        let (router, _model) = testing::router(&db, testing::policy(&[Cap::Now], Limits::default())).await?;
+        let (router, mut model) = testing::router(&db, testing::policy(&[Cap::Now], Limits::default())).await?;
         let schedules = Schedules::new(db.clone());
         let now = Utc::now();
         schedules.add("tea", "cron", "0 16 * * *", now.timestamp() + 3600).await?;
+        Conversations::new(db.clone()).register_root(&ThreadId::from("chat".to_owned())).await?;
 
-        schedules.propose("first", "tea", Some(1), "Green tea").await?;
-        schedules.propose("second", "tea", Some(1), "Black tea").await?;
+        schedules.propose("first", "tea", Some(1), "Green tea", Some("chat")).await?;
+        schedules.propose("second", "tea", Some(1), "Black tea", None).await?;
 
         assert!(router.approve("first".to_owned(), now).await.is_ok());
+        let told = model.next_request().await;
+        assert!(format!("{:?}", told.chat_history).contains("The owner approved"), "the proposer was not told");
         assert!(router.approve("first".to_owned(), now).await.is_err(), "a change applied twice");
         assert!(
             router.approve("second".to_owned(), now).await.is_err(),
             "a change drafted against an old version applied"
         );
 
-        schedules.propose("late", "tea", Some(2), "Mint tea").await?;
+        schedules.propose("late", "tea", Some(2), "Mint tea", None).await?;
         let tomorrow = now + TimeDelta::hours(25);
         assert!(router.approve("late".to_owned(), tomorrow).await.is_err(), "an expired change applied");
 

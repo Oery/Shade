@@ -169,9 +169,6 @@ pub struct Policy {
     pub chat_prompt: Option<String>,
     /// Replaces the default system prompt addition of background runs.
     pub jobs_prompt: Option<String>,
-    /// Owner chat changes a job alone only while the job stays within
-    /// these; beyond them the owner approves each change.
-    pub agent_caps: Caps,
     /// Named Discord channels, for notifications.
     pub channels: BTreeMap<String, u64>,
     pub hooks: BTreeMap<String, Caps>,
@@ -183,10 +180,6 @@ impl Policy {
     /// Checks the rules config parsing cannot express.
     pub fn validate(&self) -> Result<(), String> {
         check_caps("[chat]", &self.chat)?;
-
-        if let Some(cap) = self.agent_caps.iter().find(|cap| cap.is_management()) {
-            return Err(format!("[jobs] agent_caps: `{}` belongs to owner chat and cannot be given to a job", cap.name()));
-        }
 
         for (name, id) in &self.channels {
             check_channel(name, *id)?;
@@ -291,7 +284,6 @@ mod tests {
             chat: caps(chat),
             chat_prompt: None,
             jobs_prompt: None,
-            agent_caps: Caps::new(),
             channels: BTreeMap::new(),
             hooks,
             limits: Limits::default(),

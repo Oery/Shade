@@ -24,12 +24,12 @@ use crate::error::BoxError;
 use crate::jobfiles::{self, JobFiles};
 use crate::notify;
 use crate::policy::{self, Cap, Caps};
-use crate::receipt::{Card, Verb};
+use crate::receipt::{Card, Proposal, Verb};
 use crate::schedule::{self, TriggerArgs};
 use crate::store::db::Db;
 use crate::store::operations::Operations;
 use crate::store::roots::{Adapter, Roots};
-use crate::store::schedules::{Applied, Change, Definition, MAX_JOBS, Receipt, Schedules};
+use crate::store::schedules::{Applied, Change, Definition, MAX_JOBS, Pending, Receipt, Schedules};
 use crate::tools::{self, Shown};
 
 const MAX_TITLE: usize = 100;
@@ -214,11 +214,15 @@ impl Work {
         // Every change is read, written to its file and stored under one lock,
         // so a job file never disagrees with SQLite while the daemon runs.
         let _files = self.job_files.lock().await;
-        let Prepared { change, said, card } = self.change(action, args, &authorized.caps, &call.thread).await?;
+        let Prepared { mut change, said, card } = self.change(action, args, &authorized.caps, &call.thread).await?;
         self.write_file(&change)?;
 
-        let code = match &change {
-            Change::Propose { code, .. } => Some(code.to_owned()),
+        // A proposal is the only change the owner is shown: as a card asking for approval.
+        let code = match &mut change {
+            Change::Propose(pending) => {
+                pending.thread = Some(thread.to_owned());
+                Some(pending.code.to_owned())
+            }
             _ => None,
         };
 
@@ -230,7 +234,7 @@ impl Work {
         };
 
         let answer = match applied {
-            Applied::Done(said) => Answer { text: said, shown: Some(Shown { card, approval: code }) },
+            Applied::Done(said) => Answer { text: said, shown: code.map(|approval| Shown { card, approval }) },
             Applied::Refused(text) | Applied::Replayed(text) => Answer { text, shown: None },
         };
 
@@ -325,14 +329,10 @@ impl Work {
         }
     }
 
-    /// A job holding caps beyond `[jobs] agent_caps` changes only when the
-    /// owner approves: Shade shows what would change and a code for it.
+    /// A job file is the owner's: owner chat may draft one, but it is
+    /// written only when the owner approves. Other jobs change at once.
     fn gate(&self, id: String, base_version: Option<i64>, definition: Definition, card: Card) -> Prepared {
-        let agent_caps = &self.authority.policy().agent_caps;
-        let beyond: Vec<&str> =
-            definition.caps.iter().map(String::as_str).filter(|name| !agent_caps.iter().any(|cap| cap.name() == *name)).collect();
-
-        if beyond.is_empty() {
+        if !definition.file {
             let said = said(&card, &id);
 
             let change = match base_version {
@@ -343,20 +343,13 @@ impl Work {
             return Prepared { change, said, card };
         }
 
-        let mut code = uuid::Uuid::new_v4().simple().to_string();
-        code.truncate(6);
+        let proposal = if base_version.is_none() {
+            Proposal::New
+        } else {
+            Proposal::Change
+        };
 
-        // Shown by `shade schedule approve` once it applies.
-        let receipt = card.text();
-        let card = Card { verb: Verb::Proposed { new: base_version.is_none() }, ..card };
-
-        let said = format!(
-            "Job {id} is not {} yet: it would hold {}, beyond the owner's agent_caps, so the owner was asked to approve it. {SHOWN}",
-            if base_version.is_none() { "created" } else { "changed" },
-            beyond.join(", ")
-        );
-
-        Prepared { change: Change::Propose { code, id, base_version, definition, receipt }, said, card }
+        propose(id, base_version, definition, card, proposal)
     }
 
     fn home(&self) -> chrono_tz::Tz {
@@ -452,28 +445,47 @@ impl Work {
         };
 
         let card = Card::new(Verb::Deleted, &job.id, &job.definition, self.home(), now);
+
+        if job.definition.file {
+            return Ok(propose(job.id, Some(job.version), job.definition, card, Proposal::Delete));
+        }
+
         let said = said(&card, &job.id);
 
-        Ok(Prepared { change: Change::Delete { id: job.id, file: job.definition.file }, said, card })
+        Ok(Prepared { change: Change::Delete { id: job.id, file: false }, said, card })
     }
 }
 
-/// What the model is told about an applied change: enough to refer to the
-/// job later, and that the owner already sees the rest.
-fn said(card: &Card, id: &str) -> String {
-    let done = match card.verb {
-        Verb::Created => "Created",
-        Verb::Updated => "Updated",
-        Verb::Deleted => "Deleted",
-        Verb::Proposed { .. } => "Proposed",
+/// A change that waits for the owner, shown to them as a card with buttons.
+fn propose(id: String, base_version: Option<i64>, definition: Definition, card: Card, proposal: Proposal) -> Prepared {
+    let mut code = uuid::Uuid::new_v4().simple().to_string();
+    code.truncate(6);
+
+    let undone = match proposal {
+        Proposal::New => "created",
+        Proposal::Change => "changed",
+        Proposal::Delete => "deleted",
     };
 
-    format!("{done} job {id} (next run: {}). {SHOWN}", card.next_run())
+    let said = format!(
+        "Job {id} is not {undone} yet: job files change only with the owner's approval, and they now see a card asking \
+         for it. Nothing you write in this turn is shown to them, so end it. You will get a message when they decide."
+    );
+
+    // What `shade schedule approve` shows once it applies.
+    let receipt = card.text();
+    let card = Card { verb: Verb::Proposed(proposal), ..card };
+    let deletes = proposal == Proposal::Delete;
+    let pending = Pending { code, job: id, base_version, definition, deletes, receipt, thread: None, created_at: 0 };
+
+    Prepared { change: Change::Propose(pending), said, card }
 }
 
-/// The card is the answer; anything the model adds would repeat it.
-const SHOWN: &str = "Shade has shown the owner a card with every detail, and it answers them. End your turn now without \
-                     writing anything, unless the owner also asked for something else.";
+/// What the model is told about a change that applied: the details, to
+/// confirm in its own words.
+fn said(card: &Card, id: &str) -> String {
+    format!("Done (job {id}):\n{}\nConfirm it to the owner in one short sentence.", card.text())
+}
 
 fn parse<T: DeserializeOwned>(args: serde_json::Value) -> Result<T, String> {
     match serde_json::from_value(args) {
@@ -532,16 +544,15 @@ fn describe(action: Action) -> String {
         Action::Create => {
             "Create a scheduled job: at each trigger, a fresh background run gets `prompt` and only `caps`. The run does \
              not see this conversation, so write a self-contained prompt; it reaches the owner only through notify, so \
-             reminders need the notify cap. A job holding caps beyond the owner's agent_caps waits for their approval. \
-             The owner is shown a receipt."
+             reminders need the notify cap. A job file (`file`) waits for the owner's approval; other jobs apply at once."
         }
         Action::List => "List scheduled jobs with their triggers, next runs, caps, prompts, and last runs.",
         Action::Update => {
             "Change a scheduled job; omitted fields stay as they are. A new trigger counts from now and resumes the job. \
-             paused stops or resumes runs. Runs already started keep their old definition. A change leaving the job \
-             with caps beyond the owner's agent_caps waits for their approval. The owner is shown a receipt."
+             paused stops or resumes runs. Runs already started keep their old definition. Changing a job file waits \
+             for the owner's approval, except pausing or resuming it."
         }
-        Action::Delete => "Delete a scheduled job. Its run history is kept. The owner is shown a receipt.",
+        Action::Delete => "Delete a scheduled job. Its run history is kept. Deleting a job file waits for the owner's approval.",
     };
 
     text.to_owned()
@@ -671,7 +682,6 @@ mod tests {
     use crate::store::grants::Grants;
     use crate::store::schedules::Schedules;
     use crate::testing::{self, Dirs};
-    use crate::tools::Shown;
 
     struct Setup {
         work: Arc<Work>,
@@ -681,7 +691,7 @@ mod tests {
         _dirs: Dirs,
     }
 
-    /// Owner chat holding `caps` and `schedules`; `[jobs] agent_caps` is `now` and `notify`.
+    /// Owner chat holding `caps` and `schedules`.
     async fn setup(caps: &[Cap]) -> Result<Setup, BoxError> {
         let db = Db::in_memory()?;
         Conversations::new(db.clone()).register_root(&ThreadId::from("chat".to_owned())).await?;
@@ -728,11 +738,10 @@ mod tests {
     async fn repeated_and_refused_calls_change_nothing() -> Result<(), BoxError> {
         let Setup { work, schedules, .. } = setup(&[Cap::Now, Cap::Notify]).await?;
 
-        let Ok(Answer { text: receipt, shown: Some(_) }) = call(&work, "chat", Action::Create, "call-1", create_args()).await else {
+        let Ok(Answer { text: receipt, shown: None }) = call(&work, "chat", Action::Create, "call-1", create_args()).await else {
             return Err("the job was not created".into());
         };
 
-        // The replay is not shown to the owner again.
         let replay = call(&work, "chat", Action::Create, "call-1", create_args()).await;
         assert!(matches!(replay, Ok(Answer { text, shown: None }) if text == receipt));
 
@@ -788,28 +797,33 @@ mod tests {
         Ok(())
     }
 
-    /// Owner chat changes a job alone while it stays within `[jobs]
-    /// agent_caps`; beyond them nothing changes until the owner approves.
-    /// A job file is written only for a change that applied.
+    /// Job files are the owner's: creating or deleting one waits for their
+    /// approval and writes nothing until then. Other jobs change at once,
+    /// whatever their caps, and show the owner nothing.
     #[tokio::test]
-    async fn powerful_jobs_wait_for_approval() -> Result<(), BoxError> {
+    async fn job_files_wait_for_approval() -> Result<(), BoxError> {
         let Setup { work, schedules, job_files, .. } = setup(&[Cap::Now, Cap::Notify, Cap::Shell]).await?;
-        let file_job = |caps: &[&str], name: &str| json!({ "title": "Brief", "prompt": "Summarize.", "trigger": { "kind": "cron", "expression": "0 8 * * *" }, "caps": caps, "file": name });
+        let job = |caps: &[&str], file: Option<&str>| json!({ "title": "Brief", "prompt": "Summarize.", "trigger": { "kind": "cron", "expression": "0 8 * * *" }, "caps": caps, "file": file });
 
-        let within = call(&work, "chat", Action::Create, "call-1", file_job(&["now", "notify"], "light")).await?;
-        assert!(matches!(within.shown, Some(Shown { approval: None, .. })), "{}", within.text);
-        assert!(job_files.path("light").exists(), "the job file was not written");
+        let quick = call(&work, "chat", Action::Create, "call-1", job(&["now", "shell"], None)).await?;
+        assert!(quick.shown.is_none(), "{}", quick.text);
+        assert_eq!(schedules.list().await?.len(), 1);
 
-        let beyond = call(&work, "chat", Action::Create, "call-2", file_job(&["now", "shell"], "heavy")).await?;
-        assert!(matches!(beyond.shown, Some(Shown { approval: Some(_), .. })), "{}", beyond.text);
-        assert!(schedules.get("heavy").await?.is_none(), "a job beyond agent_caps was created without approval");
-        assert!(!job_files.path("heavy").exists(), "a waiting change wrote its file");
+        let file = call(&work, "chat", Action::Create, "call-2", job(&["now"], Some("daily"))).await?;
+        assert!(file.shown.is_some(), "{}", file.text);
+        assert!(schedules.get("daily").await?.is_none(), "a job file was created without approval");
+        assert!(!job_files.path("daily").exists(), "a waiting change wrote its file");
 
-        // Widening a job past agent_caps waits too, and leaves it as it was.
-        let widen = call(&work, "chat", Action::Update, "call-3", json!({ "id": "light", "caps": ["shell"] })).await?;
-        assert!(matches!(widen.shown, Some(Shown { approval: Some(_), .. })), "{}", widen.text);
-        let caps = schedules.get("light").await?.map(|job| job.definition.caps);
-        assert_eq!(caps, Some(vec!["now".to_owned(), "notify".to_owned()]));
+        // A job file the owner wrote: deleting it waits too.
+        let Some(mut definition) = schedules.list().await?.into_iter().next().map(|job| job.definition) else {
+            return Err("no job".into());
+        };
+        definition.file = true;
+        schedules.sync_files(vec!["daily".to_owned()], vec![("daily".to_owned(), definition)]).await?;
+
+        let delete = call(&work, "chat", Action::Delete, "call-3", json!({ "id": "daily" })).await?;
+        assert!(delete.shown.is_some(), "{}", delete.text);
+        assert!(schedules.get("daily").await?.is_some(), "a job file was deleted without approval");
 
         Ok(())
     }

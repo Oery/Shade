@@ -13,7 +13,7 @@ use crate::router::turn::Step;
 use crate::schedule::APPROVAL_WINDOW;
 use crate::schedule::{self, Trigger};
 use crate::store::db::DbError;
-use crate::store::schedules::{Change, Definition, Due, Run, Schedules};
+use crate::store::schedules::{Change, Definition, Due, Pending, Run, Schedules};
 
 impl Router {
     /// Claims every due occurrence, then starts queued runs while capacity allows.
@@ -89,13 +89,25 @@ impl Router {
         }
     }
 
-    /// Applies a change owner chat proposed, if it is recent and the job has
-    /// not changed since. A cron job's next run counts from now; a one-shot
-    /// job whose time has passed is refused rather than run late.
+    /// Applies a change owner chat proposed, then tells the conversation
+    /// that proposed it, which answers the owner.
     pub(super) async fn approve(&self, code: String, now: DateTime<Utc>) -> Result<String, String> {
+        let (receipt, thread) = self.apply_approved(&code, now).await?;
+
+        let note = format!("[Shade] The owner approved the change you proposed; it is in effect now:\n{receipt}");
+        self.tell_proposer(thread, &code, note).await;
+
+        Ok(receipt)
+    }
+
+    /// Applies a change if it is recent and the job has not changed since.
+    /// A cron job's next run counts from now; a one-shot job whose time has
+    /// passed is refused rather than run late. Returns what applied, and
+    /// who proposed it.
+    async fn apply_approved(&self, code: &str, now: DateTime<Utc>) -> Result<(String, Option<String>), String> {
         let _files = self.job_files.lock().await;
 
-        let mut pending = match self.schedules.pending(&code).await {
+        let pending = match self.schedules.pending(code).await {
             Ok(Some(pending)) => pending,
             Ok(None) => return Err(format!("no change waits under code {code}")),
             Err(error) => return Err(format!("cannot read pending changes: {error}")),
@@ -107,37 +119,68 @@ impl Router {
 
         self.still_current(&pending.job, pending.base_version).await?;
 
-        if pending.definition.enabled {
-            let next = schedule::resumed_next(&pending.definition, now)?;
+        let Pending { job, base_version, mut definition, deletes, receipt, thread, .. } = pending;
 
-            if next <= now.timestamp() {
-                return Err(format!("the time of change {code} has passed; ask for it again"));
+        let change = match (deletes, base_version) {
+            (true, _) => {
+                self.job_files.remove(&job)?;
+                Change::Delete { id: job, file: true }
             }
+            (false, base_version) => {
+                definition.next_at = next_after_approval(&definition, code, now)?;
 
-            pending.definition.next_at = Some(next);
-        }
+                if definition.file {
+                    self.job_files.write(&job, &definition)?;
+                }
 
-        if pending.definition.file {
-            self.job_files.write(&pending.job, &pending.definition)?;
-        }
-
-        let change = match pending.base_version {
-            Some(version) => Change::Update { id: pending.job, version, definition: pending.definition },
-            None => Change::Create { id: pending.job, definition: pending.definition },
+                match base_version {
+                    Some(version) => Change::Update { id: job, version, definition },
+                    None => Change::Create { id: job, definition },
+                }
+            }
         };
 
-        match self.schedules.approve(&code, change).await {
-            Ok(None) => Ok(pending.receipt),
+        match self.schedules.approve(code, change).await {
+            Ok(None) => Ok((receipt, thread)),
             Ok(Some(refusal)) => Err(refusal),
             Err(error) => Err(format!("cannot apply change {code}: {error}")),
         }
     }
 
     async fn reject(&self, code: String) -> Result<String, String> {
-        match self.schedules.reject(&code).await {
-            Ok(true) => Ok(format!("Dropped change {code}; nothing was changed.")),
-            Ok(false) => Err(format!("no change waits under code {code}")),
-            Err(error) => Err(format!("cannot drop change {code}: {error}")),
+        let pending = match self.schedules.pending(&code).await {
+            Ok(Some(pending)) => pending,
+            Ok(None) => return Err(format!("no change waits under code {code}")),
+            Err(error) => return Err(format!("cannot read pending changes: {error}")),
+        };
+
+        if let Err(error) = self.schedules.reject(&code).await {
+            return Err(format!("cannot drop change {code}: {error}"));
+        }
+
+        let note = format!(
+            "[Shade] The owner rejected the change you proposed to \"{}\"; nothing was changed.",
+            pending.definition.title
+        );
+        self.tell_proposer(pending.thread, &code, note).await;
+
+        Ok(format!("Dropped change {code}; nothing was changed."))
+    }
+
+    /// Starts a turn in the conversation that proposed a change, so the
+    /// model speaks once the owner has decided. Recorded like any input.
+    async fn tell_proposer(&self, thread: Option<String>, code: &str, note: String) {
+        let Some(thread) = thread else {
+            return;
+        };
+
+        match self.inbox.accept_for_thread(thread, note, format!("decision:{code}")).await {
+            Ok(Some(input)) => {
+                let outbound = self.outbound_for(&input.root).await;
+                self.dispatch(input, outbound).await;
+            }
+            Ok(None) => {}
+            Err(error) => tracing::warn!(%error, "cannot tell the proposing conversation about the owner's decision"),
         }
     }
 
@@ -257,6 +300,22 @@ impl Router {
 
         Ok(format!("Resumed {id}. Next run: {}", schedule::when(Some(next), &job.timezone)))
     }
+}
+
+/// When an approved job runs next: a cron job from now, a one-shot job at
+/// its time if that has not passed. Paused jobs keep their stored time.
+fn next_after_approval(definition: &Definition, code: &str, now: DateTime<Utc>) -> Result<Option<i64>, String> {
+    if !definition.enabled {
+        return Ok(definition.next_at);
+    }
+
+    let next = schedule::resumed_next(definition, now)?;
+
+    if next <= now.timestamp() {
+        return Err(format!("the time of change {code} has passed; ask for it again"));
+    }
+
+    Ok(Some(next))
 }
 
 /// A due job's timing, or `None` (logged) for a damaged definition, which is disabled.

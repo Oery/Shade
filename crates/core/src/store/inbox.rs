@@ -10,6 +10,7 @@ use infinity_agent_core::ThreadId;
 use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::store::db::{Db, DbError};
+use crate::store::grants::start_budget;
 use crate::store::roots::{self, Adapter, Target};
 
 /// An input recorded and ready to send.
@@ -49,6 +50,31 @@ impl Inbox {
                 let root = roots::turn(&transaction, adapter, &target)?;
 
                 insert(&transaction, &id, &root, &text, source_key.as_deref())?;
+                transaction.commit()?;
+
+                Ok(Some(Input { root: ThreadId::from(root), id, text }))
+            })
+            .await
+    }
+
+    /// Records `text` as a new turn of the root that owns `thread`. `None`
+    /// when `source_key` was accepted before, or the thread is unknown.
+    pub async fn accept_for_thread(&self, thread: String, text: String, source_key: String) -> Result<Option<Input>, DbError> {
+        let id = uuid::Uuid::new_v4().to_string();
+
+        self.db
+            .call(move |connection| {
+                let transaction = connection.transaction()?;
+                let seen = transaction.query_row("SELECT 1 FROM inbox WHERE source_key = ?1", [&source_key], |_| Ok(())).optional()?;
+                let root: Option<String> =
+                    transaction.query_row("SELECT root_id FROM threads WHERE id = ?1", [&thread], |row| row.get(0)).optional()?;
+
+                let (None, Some(root)) = (seen, root) else {
+                    return Ok(None);
+                };
+
+                start_budget(&transaction, &root)?;
+                insert(&transaction, &id, &root, &text, Some(&source_key))?;
                 transaction.commit()?;
 
                 Ok(Some(Input { root: ThreadId::from(root), id, text }))

@@ -79,7 +79,10 @@ caps = ["now"]
 # to this config: jobs/morning-brief.toml becomes job `morning-brief`. They
 # are read at startup (a bad file stops the daemon) and win over earlier
 # edits; run history and pause state are kept. Owner chat can draft and edit
-# them too. For example:
+# them too, but each create, edit or delete of a job file waits for the
+# owner: Approve and Reject buttons in Discord, or `shade schedule approve
+# <code>` / `reject <code>`. Jobs kept only in the database never ask.
+# For example:
 #
 #   title = "Morning brief"
 #   cron = "0 8 * * 1-5"              # or: at = "2026-12-24T18:00:00+01:00"
@@ -94,10 +97,6 @@ caps = ["now"]
 # Replaces Shade's default instructions, which tell the model that nobody
 # reads its replies and to use `notify` when the owner should know.
 # prompt = "You are running a background job."
-# Owner chat creates and changes jobs alone while they hold only these caps.
-# A job holding more waits for the owner: Approve and Reject buttons in
-# Discord, or `shade schedule approve <code>` / `reject <code>`. Default:
-# agent_caps = ["now", "notify"]
 
 # Webhook sources. Hooks can never hold `schedules` or `watches`.
 # [hooks.github]

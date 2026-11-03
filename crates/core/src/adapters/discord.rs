@@ -307,16 +307,12 @@ impl Reply {
         self.truncated |= kept.len() < text.len();
     }
 
-    /// Posts Shade's own card; a change waiting for approval gets its buttons under it.
+    /// Posts a change waiting for approval: Shade's card, with the buttons under it.
     async fn show(&mut self, shown: Shown) {
         let Shown { card, approval } = shown;
-        let mut message = addressed(CreateMessage::new().embed(embed(&card)), self.channel, self.answering.take());
+        let message = CreateMessage::new().embed(embed(&card)).components(interactions::approval_buttons(&approval));
 
-        if let Some(code) = approval {
-            message = message.components(interactions::approval_buttons(&code));
-        }
-
-        send(&self.http, self.channel, message).await;
+        send(&self.http, self.channel, addressed(message, self.channel, self.answering.take())).await;
     }
 
     async fn flush(&mut self) {
@@ -385,7 +381,7 @@ fn embed(card: &Card) -> CreateEmbed {
         Verb::Created => 0x57_F2_87,
         Verb::Updated => 0x58_65_F2,
         Verb::Deleted => 0x99_AA_B5,
-        Verb::Proposed { .. } => 0xFE_E7_5C,
+        Verb::Proposed(_) => 0xFE_E7_5C,
     };
 
     let label = format!("{} {}", card.icon(), card.label().trim_end_matches(':'));

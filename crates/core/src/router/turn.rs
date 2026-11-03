@@ -43,6 +43,9 @@ pub struct Turn {
     started: bool,
     /// Tool calls seen without their results.
     pending_tools: usize,
+    /// An approval card was shown: the rest of the turn is hidden, and the
+    /// model speaks again once the owner has decided.
+    quiet: bool,
     failure: Option<String>,
 }
 
@@ -66,6 +69,7 @@ impl Turn {
             }
             AgentEvent::Info { text } => self.on_info(text),
             _ if !self.accepted => None,
+            AgentEvent::TextChunk { .. } if self.quiet => None,
             AgentEvent::TextChunk { text } => Some(Step::Text(text)),
             AgentEvent::CompletionStarted => {
                 self.started = true;
@@ -77,7 +81,10 @@ impl Turn {
             }
             AgentEvent::ToolResult { segments } => {
                 self.pending_tools = self.pending_tools.saturating_sub(1);
-                tools::shown(segments).map(Step::Shown)
+                let shown = tools::shown(segments)?;
+                self.quiet = true;
+
+                Some(Step::Shown(shown))
             }
             AgentEvent::CompletionFinished { .. } if self.pending_tools > 0 && self.failure.is_none() => {
                 self.started = false;
@@ -115,6 +122,9 @@ mod tests {
     use infinity_agent_core::system::AgentEvent;
 
     use super::{Step, Turn};
+    use crate::receipt::{Card, Proposal, Verb};
+    use crate::tools::{self, Shown};
+    use rap_protocol::DisplaySegment;
 
     fn text(text: &str) -> AgentEvent {
         AgentEvent::TextChunk { text: text.to_owned() }
@@ -134,6 +144,14 @@ mod tests {
 
     fn tool_call() -> AgentEvent {
         AgentEvent::ToolCall { name: "shell".to_owned(), args: serde_json::json!({}), display_as: None }
+    }
+
+    fn approval() -> AgentEvent {
+        let shown = Shown { card: Card::example(Verb::Proposed(Proposal::New)), approval: "abc123".to_owned() };
+        let mut segments = tools::display(&shown).unwrap_or_default();
+        segments.push(DisplaySegment::Text("waiting".to_owned()));
+
+        AgentEvent::ToolResult { segments }
     }
 
     fn tool_result() -> AgentEvent {
@@ -157,7 +175,7 @@ mod tests {
                 Step::Paused => "paused".to_owned(),
                 Step::Done => "done".to_owned(),
                 Step::Failed(message) => format!("error: {message}"),
-                Step::Shown(shown) => format!("shown: {shown:?}"),
+                Step::Shown(shown) => format!("shown: {}", shown.card.title),
                 Step::Superseded => "superseded".to_owned(),
             });
 
@@ -197,6 +215,11 @@ mod tests {
             (
                 vec![input("hi"), started(), tool_call(), finished(), tool_result(), started(), text("answer"), finished()],
                 vec!["paused", "answer", "done"],
+            ),
+            // After an approval card, the model's words wait for the owner's decision.
+            (
+                vec![input("hi"), started(), text("asking"), tool_call(), finished(), approval(), started(), text("hidden"), finished()],
+                vec!["asking", "paused", "shown: Tea", "done"],
             ),
             // A synchronous tool answers inside the completion.
             (
