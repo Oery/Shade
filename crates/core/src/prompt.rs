@@ -15,14 +15,20 @@ const IDENTITY: &str = "You are Shade, a personal assistant working for one owne
 const THREAD_LINE: &str = "\n\nYour current thread ID is `";
 
 /// Shade's preamble in place of Infinity's: the identity, then Shade's own
-/// instructions for the thread, if any.
-pub fn preamble(infinity: &str) -> Option<String> {
+/// instructions for the thread, then the memory section, if any.
+pub fn preamble(infinity: &str, memory: Option<&str>) -> Option<String> {
     let (_, rest) = infinity.split_once(THREAD_LINE)?;
+    let mut preamble = IDENTITY.to_owned();
 
-    match rest.split_once("\n\n") {
-        Some((_, instructions)) => Some(format!("{IDENTITY}\n\n{instructions}")),
-        None => Some(IDENTITY.to_owned()),
+    if let Some((_, instructions)) = rest.split_once("\n\n") {
+        preamble.push_str(&format!("\n\n{instructions}"));
     }
+
+    if let Some(memory) = memory {
+        preamble.push_str(&format!("\n\n{memory}"));
+    }
+
+    Some(preamble)
 }
 
 #[cfg(test)]
@@ -44,7 +50,10 @@ mod tests {
         ];
 
         for (infinity, expected) in cases {
-            assert_eq!(preamble(infinity), expected);
+            assert_eq!(preamble(infinity, None), expected);
         }
+
+        let remembered = preamble(&with, Some("## Memory"));
+        assert_eq!(remembered, Some(format!("{IDENTITY}\n\nYou are chatting.\n\nBe brief.\n\n## Memory")));
     }
 }

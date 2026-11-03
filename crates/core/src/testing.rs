@@ -80,7 +80,7 @@ pub async fn start_with(db: &Db, policy: Arc<Policy>) -> Result<Harness, BoxErro
 pub fn services(sandbox: Option<Arc<Sandbox>>, notifier: Option<Notifier>) -> Services {
     let job_files = Arc::new(JobFiles::new(std::env::temp_dir().join(format!("shade-test-jobs-{}", uuid::Uuid::new_v4()))));
 
-    Services { sandbox, notifier, job_files, mcp: Default::default() }
+    Services { sandbox, notifier, job_files, mcp: Default::default(), memory: None }
 }
 
 /// A system whose tools reach `services`.
@@ -97,8 +97,9 @@ pub async fn start_with_tools(db: &Db, policy: Arc<Policy>, services: Services) 
 
     let authority = Authority::new(Grants::new(db.clone()), policy);
     let conversations = Conversations::new(db.clone());
+    let memory = services.memory.clone();
     let tools = ThreadTools::new(conversations.clone(), authority.clone(), db.clone(), services);
-    let metered = Metered::new(static_model, authority.clone(), Usages::new(db.clone()));
+    let metered = Metered::new(static_model, authority.clone(), Usages::new(db.clone()), memory);
     let builder = AgentSystemBuilder::new_local(conversations.clone(), States::new(db.clone()), metered);
     let system = builder.without_builtin_tools().thread_config(tools).start();
 

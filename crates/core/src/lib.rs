@@ -5,6 +5,7 @@ mod authority;
 mod config;
 mod error;
 mod lock;
+mod memory;
 mod model;
 mod notify;
 mod prompt;
@@ -38,6 +39,7 @@ use shade_store::grants::Grants;
 use crate::adapters::discord::Discord;
 use crate::adapters::socket::ControlSocket;
 use crate::config::Config;
+use crate::memory::Memory;
 use crate::model::Model;
 use crate::notify::Notifier;
 use crate::router::{Inbound, Router};
@@ -61,9 +63,10 @@ pub fn run(config: Option<PathBuf>) -> Result<(), Error> {
 
 async fn serve(config_path: Option<PathBuf>) -> Result<(), Error> {
     let config_path = config::path(config_path)?;
-    let Config { model, timezone, chat, jobs, hooks, limits, sandbox, mut discord, mcp } = config::load(&config_path)?;
+    let Config { model, timezone, chat, jobs, hooks, limits, sandbox, mut discord, mcp, memory } = config::load(&config_path)?;
     let channels = discord.as_mut().map(|discord| std::mem::take(&mut discord.channels)).unwrap_or_default();
     let servers = mcp.iter().map(|(name, server)| (name.to_owned(), server.description.to_owned())).collect();
+    let memory = start_memory(memory, &mcp, &config_path)?;
     let sections = config::Sections { chat, jobs, hooks, limits, timezone, channels, servers };
     let policy = config::policy(&config_path, sections)?;
     let mut secrets = Secrets::load(secrets::path_for(&config_path))?;
@@ -96,7 +99,7 @@ async fn serve(config_path: Option<PathBuf>) -> Result<(), Error> {
     let http = discord.as_ref().map(Discord::http);
     let notifier = discord.as_ref().map(|discord| notifications(discord, &db));
     let job_files = Arc::new(JobFiles::new(jobfiles::dir_for(&config_path)));
-    let services = Services { sandbox: sandbox.map(Arc::new), notifier, job_files, mcp };
+    let services = Services { sandbox: sandbox.map(Arc::new), notifier, job_files, mcp, memory };
     let router = Router::start(model, db, Arc::new(policy), services, http);
 
     // Job files are config: a bad one stops the daemon before it runs anything.
@@ -134,6 +137,22 @@ async fn start_sandbox(
     let sandbox = shade_sandbox::start(config, data_dir, config_path).await?;
 
     Ok(Some(sandbox))
+}
+
+/// Checks `[memory]` against the configured servers. A bad section stops startup.
+fn start_memory(
+    config: Option<memory::Config>, servers: &BTreeMap<String, shade_mcp::Config>, path: &Path,
+) -> Result<Option<Arc<Memory>>, Error> {
+    let Some(config) = config else {
+        return Ok(None);
+    };
+
+    let names: Vec<&str> = servers.keys().map(String::as_str).collect();
+
+    match Memory::new(config, &names) {
+        Ok(memory) => Ok(Some(Arc::new(memory))),
+        Err(message) => Err(Error::ConfigInvalid { path: path.to_owned(), message }),
+    }
 }
 
 /// Starts every MCP server, each within its startup timeout, so a server

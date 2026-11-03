@@ -33,6 +33,8 @@ pub struct Config {
     /// MCP servers by name. Each name is a capability that grants its tools.
     #[serde(default)]
     pub mcp: BTreeMap<String, shade_mcp::Config>,
+    /// Durable memories in the vault. Off without this section.
+    pub memory: Option<crate::memory::Config>,
 }
 
 #[derive(Debug, Deserialize)]

@@ -119,6 +119,15 @@ caps = ["now"]
 # vars = { OBSIDIAN_VAULT = "/home/me/Notes" }
 # description = "Read and edit the notes of the owner's Obsidian vault."
 
+# Durable memory in the vault: an index (one line per memory) and a note per
+# memory next to it, kept by the model with the vault server's tools. Only
+# conversations and jobs holding that server's capability see the index. It
+# is re-read on every model request, at most 4 KiB.
+# [memory]
+# server = "obsidian"
+# vault = "/home/me/Notes"     # the server's vault directory
+# index = "Shade/MEMORY.md"    # relative to the vault; this is the default
+
 # Webhook sources. Hooks can never hold `schedules` or `watches`.
 # [hooks.github]
 # caps = ["now", "notify"]

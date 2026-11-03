@@ -130,7 +130,7 @@ impl Router {
         let authority = Authority::new(Grants::new(db.clone()), Arc::clone(&policy));
         let conversations = Conversations::new(db.clone());
         let tools = ThreadTools::new(conversations.clone(), authority.clone(), db.clone(), services.clone());
-        let model = Metered::new(model, authority, Usages::new(db.clone()));
+        let model = Metered::new(model, authority, Usages::new(db.clone()), services.memory.clone());
         let builder = AgentSystemBuilder::new_local(conversations, States::new(db.clone()), model);
         let system = builder.without_builtin_tools().thread_config(tools).start();
 

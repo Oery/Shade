@@ -22,6 +22,7 @@ use shade_store::usage::Usages;
 use thiserror::Error;
 
 use crate::error::BoxError;
+use crate::memory::Memory;
 use crate::prompt;
 
 #[derive(Debug, Error)]
@@ -113,10 +114,11 @@ impl Authority {
     }
 
     /// Admits one request to the model provider.
-    pub async fn admit_completion(&self, thread: &ThreadId<str>) -> Result<(), Denied> {
-        self.authorize(thread).await?;
+    pub async fn admit_completion(&self, thread: &ThreadId<str>) -> Result<Authorized, Denied> {
+        let authorized = self.authorize(thread).await?;
+        self.charge(thread, Charge::Completion).await?;
 
-        self.charge(thread, Charge::Completion).await
+        Ok(authorized)
     }
 
     async fn charge(&self, thread: &ThreadId<str>, charge: Charge) -> Result<(), Denied> {
@@ -134,11 +136,12 @@ pub struct Metered<S> {
     inner: S,
     authority: Authority,
     usages: Usages,
+    memory: Option<Arc<Memory>>,
 }
 
 impl<S> Metered<S> {
-    pub fn new(inner: S, authority: Authority, usages: Usages) -> Self {
-        Self { inner, authority, usages }
+    pub fn new(inner: S, authority: Authority, usages: Usages, memory: Option<Arc<Memory>>) -> Self {
+        Self { inner, authority, usages, memory }
     }
 }
 
@@ -152,6 +155,7 @@ impl<S: ModelSource> ModelSource for Metered<S> {
             thread: thread_id.to_owned(),
             authority: self.authority.clone(),
             usages: self.usages.clone(),
+            memory: self.memory.clone(),
         };
         model.provider = Arc::new(provider);
 
@@ -164,6 +168,7 @@ struct MeteredProvider {
     thread: ThreadId,
     authority: Authority,
     usages: Usages,
+    memory: Option<Arc<Memory>>,
 }
 
 #[async_trait]
@@ -175,11 +180,17 @@ impl ModelProvider for MeteredProvider {
     /// A refusal is fatal, so Infinity ends the step instead of retrying.
     /// Also replaces Infinity's coding-agent prompt with Shade's (see `prompt`).
     async fn invoke_model(&self, model_id: &str, mut request: CompletionRequest) -> Result<ModelStream, CompletionError> {
-        if let Err(denied) = self.authority.admit_completion(&self.thread).await {
-            return Err(CompletionError::provider(ErrorClass::Fatal, denied.to_string()));
-        }
+        let authorized = match self.authority.admit_completion(&self.thread).await {
+            Ok(authorized) => authorized,
+            Err(denied) => return Err(CompletionError::provider(ErrorClass::Fatal, denied.to_string())),
+        };
 
-        match request.preamble.as_deref().map(prompt::preamble) {
+        let memory = match &self.memory {
+            Some(memory) => memory.section(&authorized.caps).await,
+            None => None,
+        };
+
+        match request.preamble.as_deref().map(|infinity| prompt::preamble(infinity, memory.as_deref())) {
             Some(Some(preamble)) => request.preamble = Some(preamble),
             Some(None) => tracing::warn!("Infinity's system prompt has an unknown layout; sending it unchanged"),
             None => {}

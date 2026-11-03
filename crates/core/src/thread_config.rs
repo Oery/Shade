@@ -28,6 +28,7 @@ use shade_store::roots::{Adapter, Conversation, Roots};
 
 use crate::authority::Authority;
 use crate::error::BoxError;
+use crate::memory::Memory;
 use crate::notify::Notifier;
 use crate::tools::mcp::McpTool;
 use crate::tools::notify::Notify;
@@ -56,6 +57,8 @@ pub struct Services {
     pub job_files: Arc<JobFiles>,
     /// Configured MCP servers, running or not.
     pub mcp: Arc<Servers>,
+    /// Shown to roots holding the vault server's capability.
+    pub memory: Option<Arc<Memory>>,
 }
 
 pub struct ThreadTools {
