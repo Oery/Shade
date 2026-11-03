@@ -12,6 +12,8 @@ Avoid cloning. Dont unwrap/expect. prefer returning a new error instead of using
 
 Write functions as short paragraphs, not one dense block. Put a blank line between unrelated steps: between groups of declarations, before and after control-flow blocks (`if`, `match`, `loop`, `for`, `while`) that are separate steps, and before the final return value, which goes on its own line. Lines that belong to one step stay together.
 
+SQL and database access live only under `crates/core/src/store/`. Other modules call typed store methods; they never run queries themselves. New persistent data gets its own small store module.
+
 EXAMPLE USE CASES:
 - Asking the agent to plan a task that will get triggered at some date
 - Agent can write into a shared Obsidian database (probably should not be part of the runtime)

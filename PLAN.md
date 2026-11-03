@@ -104,10 +104,11 @@ crates/
       lock.rs               data directory creation and execution lock
       config.rs             TOML parsing and policy validation
       secrets.rs            optional private .env next to the config
-      db.rs                 database worker and migrations (SQL in crates/core/migrations/)
-      store/
+      store/                the SQLite adapter: all SQL lives here
+        db.rs               database worker and migrations (SQL in crates/core/migrations/)
         conversation.rs     Infinity ConversationStore
         state.rs            Infinity StateStore
+        roots.rs            root registration and conversation names
       thread_config.rs      per-thread tools (close_thread for compaction threads)
       grants.rs             origins, capabilities, delegation, root ownership
       model.rs              provider and completion-budget enforcement

@@ -6,7 +6,7 @@
 use infinity_agent_core::ThreadId;
 use rusqlite::{Connection, OptionalExtension, params};
 
-use crate::db::{Db, DbError};
+use crate::store::db::{Db, DbError};
 
 /// Where a named conversation lives. Names are scoped per adapter.
 #[derive(Clone, Copy)]
@@ -104,8 +104,8 @@ fn new_id() -> String {
 #[cfg(test)]
 mod tests {
     use super::{Adapter, Roots};
-    use crate::db::Db;
     use crate::error::BoxError;
+    use crate::store::db::Db;
 
     async fn count(db: &Db, sql: &'static str) -> Result<i64, BoxError> {
         Ok(db.call(move |connection| Ok(connection.query_row(sql, [], |row| row.get(0))?)).await?)

@@ -6,9 +6,9 @@ use infinity_agent_core::system::{AgentEvent, AgentSystemBuilder, NoRapHttp};
 use shade_proto::Response;
 use tokio::sync::mpsc;
 
-use crate::db::Db;
 use crate::model::Model;
 use crate::store::conversation::Conversations;
+use crate::store::db::Db;
 use crate::store::roots::{Adapter, Roots};
 use crate::store::state::States;
 use crate::thread_config::ThreadTools;

@@ -1,6 +1,7 @@
-//! Infinity stores backed by SQLite.
+//! The SQLite adapter: the database worker and every store. SQL lives only here.
 
 pub mod conversation;
+pub mod db;
 pub mod roots;
 pub mod state;
 

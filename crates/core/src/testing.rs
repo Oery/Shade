@@ -11,9 +11,9 @@ use infinity_provider_protocol::mock::{MockModelController, mock_model};
 use infinity_provider_protocol::{ModelEntry, SingleModelProvider};
 use tokio::task::LocalSet;
 
-use crate::db::Db;
 use crate::error::BoxError;
 use crate::store::conversation::Conversations;
+use crate::store::db::Db;
 use crate::store::state::States;
 use crate::thread_config::ThreadTools;
 

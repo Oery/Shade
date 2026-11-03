@@ -19,7 +19,7 @@ use rusqlite::{Connection, OptionalExtension, Statement, params};
 
 #[cfg(test)]
 use super::roots::insert_root;
-use crate::db::{Db, DbError};
+use crate::store::db::{Db, DbError};
 
 #[derive(Clone)]
 pub struct Conversations {

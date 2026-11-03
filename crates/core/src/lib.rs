@@ -2,7 +2,6 @@
 
 mod adapters;
 mod config;
-mod db;
 mod error;
 mod lock;
 mod model;
@@ -22,10 +21,10 @@ use tokio::task::LocalSet;
 pub use error::Error;
 
 use crate::adapters::socket::ControlSocket;
-use crate::db::Db;
 use crate::model::Model;
 use crate::router::Router;
 use crate::secrets::Secrets;
+use crate::store::db::{self, Db};
 
 /// Pending commands between the control socket and the router.
 const COMMAND_QUEUE: usize = 16;

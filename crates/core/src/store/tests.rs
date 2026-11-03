@@ -13,8 +13,8 @@ use rap_protocol::ChoiceId;
 
 use super::conversation::Conversations;
 use super::state::States;
-use crate::db::Db;
 use crate::error::BoxError;
+use crate::store::db::Db;
 use crate::testing::{self, attach, reaches_model, reply, within};
 
 fn root() -> ThreadId {

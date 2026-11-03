@@ -56,8 +56,8 @@ mod tests {
     use infinity_provider_protocol::CompletionRequest;
     use infinity_provider_protocol::message::UserContent;
 
-    use crate::db::Db;
     use crate::error::BoxError;
+    use crate::store::db::Db;
     use crate::testing::{self, attach, reaches_model, reply, until, within};
 
     fn offers_close(request: &CompletionRequest) -> bool {
