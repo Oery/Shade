@@ -11,10 +11,9 @@ use std::collections::BTreeMap;
 use std::num::NonZeroU64;
 
 use infinity_agent_core::ThreadId;
+use shade_store::grants::Grants;
 use thiserror::Error;
 use tokio::sync::{mpsc, oneshot};
-
-use crate::store::grants::Grants;
 
 /// Notices waiting for the adapter.
 const QUEUE: usize = 16;

@@ -6,9 +6,9 @@ use std::path::{Path, PathBuf};
 
 use chrono_tz::Tz;
 use serde::Deserialize;
+use shade_policy::{Caps, Limits, Policy};
 
 use crate::Error;
-use crate::policy::{Caps, Limits, Policy};
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]

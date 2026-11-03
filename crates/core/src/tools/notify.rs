@@ -17,16 +17,16 @@ use infinity_agent_core::tools::{Tool, ToolContext};
 use infinity_agent_core::traits::InputSender;
 use rap_protocol::{ProviderCallId, ToolCallId};
 use serde::Deserialize;
+use shade_policy::{Cap, Origin};
+use shade_store::db::Db;
+use shade_store::operations::Operations;
+use shade_store::roots::{Adapter, Roots};
+use shade_store::schedules::Schedules;
 
 use crate::authority::Authority;
 use crate::error::BoxError;
 use crate::notify::{self, Destination, Notifier};
-use crate::policy::{Cap, Origin};
 use crate::recovery::UNKNOWN_OUTCOME;
-use crate::store::db::Db;
-use crate::store::operations::Operations;
-use crate::store::roots::{Adapter, Roots};
-use crate::store::schedules::Schedules;
 use crate::tools;
 
 /// Longest message, in UTF-16 units, so the notice fits in one Discord message.
@@ -238,16 +238,16 @@ fn parse(args: serde_json::Value) -> Result<(String, Option<String>), String> {
 mod tests {
     use infinity_agent_core::ThreadId;
     use infinity_agent_core::message::InputMessage;
+    use shade_policy::{Cap, Limits};
+    use shade_store::conversation::Conversations;
+    use shade_store::db::Db;
+    use shade_store::grants::Grants;
+    use shade_store::operations::Operations;
     use tokio::sync::{mpsc, oneshot};
 
     use crate::error::BoxError;
     use crate::notify::{Destination, Failure, Notice, Notifier};
-    use crate::policy::{Cap, Limits};
     use crate::recovery::{self, UNKNOWN_OUTCOME};
-    use crate::store::conversation::Conversations;
-    use crate::store::db::Db;
-    use crate::store::grants::Grants;
-    use crate::store::operations::Operations;
     use crate::testing::{self, attach, within};
     use crate::tools;
 

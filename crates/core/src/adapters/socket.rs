@@ -9,6 +9,7 @@ use std::sync::Arc;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use shade_proto::{Hello, MAX_LINE_BYTES, PROTOCOL_VERSION, Request, Response};
+use shade_store::roots::{Adapter, Target};
 use thiserror::Error;
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
@@ -16,7 +17,6 @@ use tokio::sync::{Semaphore, mpsc};
 
 use crate::Error;
 use crate::router::{Inbound, Outbound, REPLY_QUEUE};
-use crate::store::roots::{Adapter, Target};
 
 const MAX_CONNECTIONS: usize = 16;
 

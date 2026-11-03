@@ -10,8 +10,10 @@ publish = false
 
 [workspace.dependencies]
 shade-core = { path = "crates/core" }
+shade-policy = { path = "crates/policy" }
 shade-proto = { path = "crates/proto" }
 shade-sandbox = { path = "crates/sandbox" }
+shade-store = { path = "crates/store" }
 async-trait = "0.1"
 chrono = { version = "0.4.45", default-features = false, features = ["clock", "std"] }
 chrono-tz = "0.10.4"

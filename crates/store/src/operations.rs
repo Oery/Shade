@@ -11,7 +11,7 @@ use infinity_agent_core::message::InfinityMessage;
 use infinity_provider_protocol::message::ToolCall;
 use rusqlite::{Connection, OptionalExtension, params};
 
-use crate::store::db::{Db, DbError};
+use crate::db::{Db, DbError};
 
 /// Infinity's compaction child calls this and closes; its result never comes.
 const CLOSE_THREAD: &str = "close_thread";
@@ -171,7 +171,7 @@ fn unanswered(trailing: Vec<InfinityMessage>) -> Vec<ToolCall> {
 }
 
 /// Records a call answered inside the caller's transaction, with the change it made.
-pub fn insert_done(connection: &Connection, thread: &str, call: &str, tool: &str, result: &str) -> Result<(), DbError> {
+pub(crate) fn insert_done(connection: &Connection, thread: &str, call: &str, tool: &str, result: &str) -> Result<(), DbError> {
     let sql =
         "INSERT INTO tool_operations (thread_id, call_id, tool, state, result, finished_at) VALUES (?1, ?2, ?3, 'done', ?4, unixepoch())";
     connection.execute(sql, params![thread, call, tool, result])?;
@@ -179,7 +179,7 @@ pub fn insert_done(connection: &Connection, thread: &str, call: &str, tool: &str
     Ok(())
 }
 
-pub fn captured(connection: &Connection, thread: &str, call: &str) -> Result<Option<String>, DbError> {
+pub(crate) fn captured(connection: &Connection, thread: &str, call: &str) -> Result<Option<String>, DbError> {
     let sql = "SELECT result FROM tool_operations WHERE thread_id = ?1 AND call_id = ?2 AND state = 'done'";
     let result = connection.query_row(sql, params![thread, call], |row| row.get(0)).optional()?;
 

@@ -9,11 +9,11 @@ use serenity::all::{
     CreateInteractionResponse, CreateInteractionResponseMessage, EditInteractionResponse, Http, Interaction, User,
 };
 use shade_proto::{Manage, Response};
+use shade_store::roots::Adapter;
 use tokio::sync::mpsc;
 
 use super::{Handler, MESSAGE_LIMIT};
 use crate::router::{Inbound, REPLY_QUEUE};
-use crate::store::roots::Adapter;
 
 const NEW: &str = "new";
 const APPROVE: &str = "approve:";

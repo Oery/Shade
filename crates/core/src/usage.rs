@@ -1,8 +1,7 @@
 //! The `shade usage` report: what each conversation has cost in tokens.
 
 use chrono::DateTime;
-
-use crate::store::usage::ConversationUsage;
+use shade_store::usage::ConversationUsage;
 
 /// Conversations shown, most recently active first.
 pub const SHOWN: i64 = 20;

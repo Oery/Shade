@@ -26,6 +26,7 @@ use serenity::all::{
     GatewayIntents, Http, HttpError, Interaction, Message, MessageId, Ready, ShardManager, Typing, UserId,
 };
 use serenity::async_trait;
+use shade_store::roots::{Adapter, Target};
 
 use thiserror::Error;
 use tokio::sync::mpsc;
@@ -36,7 +37,6 @@ use crate::receipt::{Card, Verb};
 use crate::router::turn::Step;
 use crate::router::{Inbound, Outbound};
 use crate::secrets::Secrets;
-use crate::store::roots::{Adapter, Target};
 use crate::tools::Shown;
 
 /// Discord's message limit is 2000 characters; counting UTF-16 units stays

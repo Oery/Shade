@@ -17,16 +17,16 @@ use infinity_agent_core::system::local::ChannelSender;
 use infinity_agent_core::system::{NoRapHttp, ThreadConfig, ThreadConfigSource};
 use infinity_agent_core::tools::thread::CloseThreadTool;
 use infinity_agent_core::traits::ConversationStore;
+use shade_policy::{Cap, Origin};
 use shade_sandbox::Sandbox;
+use shade_store::conversation::Conversations;
+use shade_store::db::Db;
+use shade_store::operations::Operations;
 
 use crate::authority::Authority;
 use crate::error::BoxError;
 use crate::jobfiles::JobFiles;
 use crate::notify::Notifier;
-use crate::policy::{Cap, Origin};
-use crate::store::conversation::Conversations;
-use crate::store::db::Db;
-use crate::store::operations::Operations;
 use crate::tools::notify::Notify;
 use crate::tools::now::Now;
 use crate::tools::schedules::{self, Action, ScheduleTool};
@@ -129,9 +129,9 @@ mod tests {
     use infinity_agent_core::traits::{ConversationStore, InputSender};
     use infinity_provider_protocol::CompletionRequest;
     use infinity_provider_protocol::message::UserContent;
+    use shade_store::db::Db;
 
     use crate::error::BoxError;
-    use crate::store::db::Db;
     use crate::testing::{self, attach, reaches_model, reply, until, within};
 
     fn offers_close(request: &CompletionRequest) -> bool {
@@ -169,8 +169,7 @@ mod tests {
         handle.send(compaction(&root), "compact-1").await?;
         assert!(offers_close(&harness.model.next_request().await), "the compaction thread needs close_thread");
 
-        let sql = "SELECT id FROM threads WHERE compaction = 1";
-        let child: String = db.call(move |connection| Ok(connection.query_row(sql, [], |row| row.get(0))?)).await?;
+        let child = harness.conversations.compaction_thread().await?;
         let close = serde_json::json!({ "thread_id": child, "report_to_parent": "they said hi" });
         harness.model.send_tool_call("call-close", "close_thread", close);
         harness.model.finish();

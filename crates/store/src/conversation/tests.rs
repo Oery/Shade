@@ -8,8 +8,8 @@ use infinity_provider_protocol::message::{AssistantContent, ToolResult, UserCont
 use rap_protocol::ToolCallId;
 
 use super::Conversations;
-use crate::error::BoxError;
-use crate::store::db::{Db, DbError};
+use crate::BoxError;
+use crate::db::{Db, DbError};
 
 fn user(text: &str) -> InfinityMessage {
     InfinityMessage::User { content: UserContent::text(text.to_owned()) }

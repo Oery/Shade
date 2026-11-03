@@ -3,7 +3,7 @@
 use infinity_provider_protocol::Usage;
 use rusqlite::params;
 
-use crate::store::db::{Db, DbError};
+use crate::db::{Db, DbError};
 
 /// One conversation's model requests, its compaction children included.
 pub struct ConversationUsage {
@@ -27,6 +27,14 @@ pub struct Usages {
 impl Usages {
     pub fn new(db: Db) -> Self {
         Self { db }
+    }
+
+    /// The first recorded request's input tokens, for tests.
+    #[cfg(any(test, feature = "testing"))]
+    pub async fn first_input_tokens(&self) -> Result<Option<i64>, DbError> {
+        use rusqlite::OptionalExtension;
+
+        self.db.call(|connection| Ok(connection.query_row("SELECT input_tokens FROM usage", [], |row| row.get(0)).optional()?)).await
     }
 
     pub async fn record(&self, thread: String, model: String, usage: Usage) -> Result<(), DbError> {

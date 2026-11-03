@@ -6,10 +6,10 @@
 
 use infinity_agent_core::ThreadId;
 use rusqlite::{Connection, OptionalExtension, params};
+use shade_policy::{Grant, Origin};
 
-use crate::policy::{Grant, Origin};
-use crate::store::db::{Db, DbError};
-use crate::store::grants::{insert_grant, start_budget};
+use crate::db::{Db, DbError};
+use crate::grants::{insert_grant, start_budget};
 
 /// Which conversation an input belongs to.
 pub enum Target {
@@ -50,6 +50,12 @@ impl Roots {
         Self { db }
     }
 
+    /// A root with no grant, which no entry point creates, for tests.
+    #[cfg(any(test, feature = "testing"))]
+    pub async fn insert_ungranted(&self, id: &'static str) -> Result<(), DbError> {
+        self.db.call(move |connection| Ok(connection.execute("INSERT INTO threads (id, root_id) VALUES (?1, ?1)", [id]).map(drop)?)).await
+    }
+
     /// The conversation name that currently points at the root of `thread`, if any.
     pub async fn conversation_of(&self, thread: &ThreadId<str>) -> Result<Option<(Adapter, String)>, DbError> {
         let id = thread.as_str().to_owned();
@@ -86,7 +92,7 @@ impl Roots {
 
 /// Starts a turn in `target`'s root, creating it on first use. Each turn
 /// gets its own budget. Runs inside the caller's transaction.
-pub fn turn(connection: &Connection, adapter: Adapter, target: &Target) -> Result<String, DbError> {
+pub(crate) fn turn(connection: &Connection, adapter: Adapter, target: &Target) -> Result<String, DbError> {
     let id = match target {
         Target::Fresh => {
             let id = new_id();
@@ -112,14 +118,14 @@ fn named(connection: &Connection, adapter: Adapter, key: &str) -> Result<String,
 }
 
 /// Creates a chat root and its grant. Chat grants follow the current `[chat]` policy.
-pub fn register(connection: &Connection, id: &str, adapter: Adapter) -> Result<(), DbError> {
+pub(crate) fn register(connection: &Connection, id: &str, adapter: Adapter) -> Result<(), DbError> {
     let grant = Grant { origin: Origin::Chat, source: adapter.name().to_owned(), caps: None };
 
     insert_root(connection, id, &grant)
 }
 
 /// Creates a root with its grant: the only way a root comes to exist.
-pub fn insert_root(connection: &Connection, id: &str, grant: &Grant) -> Result<(), DbError> {
+pub(crate) fn insert_root(connection: &Connection, id: &str, grant: &Grant) -> Result<(), DbError> {
     connection.execute("INSERT INTO threads (id, root_id) VALUES (?1, ?1)", [id])?;
 
     insert_grant(connection, id, grant)
@@ -137,7 +143,7 @@ fn point(connection: &Connection, adapter: Adapter, key: &str) -> Result<String,
     Ok(id)
 }
 
-pub fn new_id() -> String {
+pub(crate) fn new_id() -> String {
     uuid::Uuid::new_v4().to_string()
 }
 
@@ -146,8 +152,8 @@ mod tests {
     use infinity_agent_core::ThreadId;
 
     use super::{Adapter, Roots, Target};
-    use crate::error::BoxError;
-    use crate::store::db::{Db, DbError};
+    use crate::BoxError;
+    use crate::db::{Db, DbError};
 
     async fn count(db: &Db, sql: &'static str) -> Result<i64, BoxError> {
         Ok(db.call(move |connection| Ok(connection.query_row(sql, [], |row| row.get(0))?)).await?)

@@ -6,8 +6,10 @@ rust-version.workspace = true
 publish.workspace = true
 
 [dependencies]
+shade-policy.workspace = true
 shade-proto.workspace = true
 shade-sandbox.workspace = true
+shade-store.workspace = true
 async-trait.workspace = true
 chrono.workspace = true
 chrono-tz.workspace = true
@@ -20,7 +22,6 @@ infinity-provider-protocol.workspace = true
 infinity-provider-rig.workspace = true
 rap-protocol.workspace = true
 rig-core.workspace = true
-rusqlite.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 serenity.workspace = true
@@ -32,6 +33,7 @@ uuid.workspace = true
 
 [dev-dependencies]
 infinity-provider-protocol = { workspace = true, features = ["mock"] }
+shade-store = { workspace = true, features = ["testing"] }
 
 [lints]
 workspace = true

@@ -16,12 +16,12 @@ use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use shade_policy::{Cap, Caps, Policy};
+use shade_store::schedules::{Definition, Job};
 use tokio::sync::{Mutex, MutexGuard};
 
 use crate::notify;
-use crate::policy::{self, Cap, Caps, Policy};
 use crate::schedule::{self, TriggerArgs};
-use crate::store::schedules::{Definition, Job};
 
 /// The longest job file name, without `.toml`.
 const MAX_NAME: usize = 40;
@@ -245,7 +245,7 @@ fn trigger_parts(trigger: &TriggerArgs, policy: &Policy) -> (&'static str, Strin
 
 /// A file may give a job anything owner chat holds, except management.
 fn file_caps(names: Vec<String>, chat: &Caps) -> Result<Vec<String>, String> {
-    let allowed = policy::delegable(chat);
+    let allowed = shade_policy::delegable(chat);
     let mut caps = Caps::new();
 
     for name in names {

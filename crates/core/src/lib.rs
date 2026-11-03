@@ -8,13 +8,13 @@ mod jobfiles;
 mod lock;
 mod model;
 mod notify;
-mod policy;
 mod receipt;
 mod recovery;
+#[cfg(test)]
+mod replay;
 mod router;
 mod schedule;
 mod secrets;
-mod store;
 #[cfg(test)]
 mod testing;
 mod thread_config;
@@ -31,17 +31,18 @@ use tokio::task::LocalSet;
 
 pub use error::Error;
 
+use shade_policy::{Cap, Policy};
+use shade_store::db::{self, Db};
+use shade_store::grants::Grants;
+
 use crate::adapters::discord::Discord;
 use crate::adapters::socket::ControlSocket;
 use crate::config::Config;
 use crate::jobfiles::JobFiles;
 use crate::model::Model;
 use crate::notify::Notifier;
-use crate::policy::{Cap, Policy};
 use crate::router::{Inbound, Router};
 use crate::secrets::Secrets;
-use crate::store::db::{self, Db};
-use crate::store::grants::Grants;
 use crate::thread_config::Services;
 
 /// Pending input between the control socket and the router.

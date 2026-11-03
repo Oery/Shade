@@ -9,9 +9,9 @@
 use infinity_agent_core::ThreadId;
 use rusqlite::{Connection, OptionalExtension, params};
 
-use crate::store::db::{Db, DbError};
-use crate::store::grants::start_budget;
-use crate::store::roots::{self, Adapter, Target};
+use crate::db::{Db, DbError};
+use crate::grants::start_budget;
+use crate::roots::{self, Adapter, Target};
 
 /// An input recorded and ready to send.
 pub struct Input {
@@ -29,6 +29,12 @@ pub struct Inbox {
 impl Inbox {
     pub fn new(db: Db) -> Self {
         Self { db }
+    }
+
+    /// How many inputs were ever accepted, for tests.
+    #[cfg(any(test, feature = "testing"))]
+    pub async fn count(&self) -> Result<i64, DbError> {
+        self.db.call(|connection| Ok(connection.query_row("SELECT COUNT(*) FROM inbox", [], |row| row.get(0))?)).await
     }
 
     /// Records `text` for `target`'s conversation and starts its turn.
@@ -120,7 +126,7 @@ impl Inbox {
 }
 
 /// Records an input for `root`. Runs inside the caller's transaction.
-pub fn insert(connection: &Connection, id: &str, root: &str, text: &str, source_key: Option<&str>) -> Result<(), DbError> {
+pub(crate) fn insert(connection: &Connection, id: &str, root: &str, text: &str, source_key: Option<&str>) -> Result<(), DbError> {
     let sql = "INSERT INTO inbox (id, root_id, text, source_key) VALUES (?1, ?2, ?3, ?4)";
     connection.execute(sql, params![id, root, text, source_key])?;
 

@@ -97,6 +97,25 @@ crates/
       error.rs
   daemon/                   shade-daemon: the `shaded` binary
     src/main.rs             --config, logging, signals, calls shade_core::run
+  policy/                   shade-policy: capabilities, origins, ceilings, limit checks
+    src/lib.rs
+  store/                    shade-store: the SQLite adapter; the only crate with rusqlite
+    migrations/             schema, applied in order by db.rs
+    src/
+      db.rs                 database worker and migrations
+      conversation.rs       Infinity ConversationStore
+      state.rs              Infinity StateStore
+      roots.rs              root registration and conversation names
+      grants.rs             grants, per-turn budgets, atomic charging
+      operations.rs         tool operations and unanswered-call lookup
+      inbox.rs              accepted input and its acknowledgment
+      schedules.rs          scheduled jobs and their runs
+      usage.rs              token usage per request
+  sandbox/                  shade-sandbox: bubblewrap for shell commands
+    src/
+      lib.rs                mounts, environment, bounded runs, startup probe
+      paths.rs              protected-path validation
+      output.rs             bounded head/tail capture
   core/                     shade-core: the runtime library
     src/
       lib.rs
@@ -104,16 +123,7 @@ crates/
       lock.rs               data directory creation and execution lock
       config.rs             TOML parsing and policy validation
       secrets.rs            optional private .env next to the config
-      store/                the SQLite adapter: all SQL lives here
-        db.rs               database worker and migrations (SQL in crates/core/migrations/)
-        conversation.rs     Infinity ConversationStore
-        state.rs            Infinity StateStore
-        roots.rs            root registration and conversation names
-        grants.rs           grants, per-turn budgets, atomic charging
-        operations.rs       tool operations and unanswered-call lookup
-        inbox.rs            accepted input and its acknowledgment
       thread_config.rs      per-thread tools (close_thread for compaction threads)
-      policy.rs             capabilities, origins, ceilings, limit checks
       authority.rs          grant/budget admission for config, provider requests, tools
       model.rs              provider and completion-budget enforcement
       router.rs             durable ingress, routing, output pumps, resume, shutdown
@@ -131,9 +141,6 @@ crates/
         watch.rs
         notify.rs
         now.rs
-      sandbox.rs            bubblewrap mounts, environment, bounded runs, startup probe
-      sandbox/paths.rs      protected-path validation
-      sandbox/output.rs     bounded head/tail capture
       adapters/
         socket.rs           control socket server
         discord.rs          owner chat, chunked replies, typing, safe mentions

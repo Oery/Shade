@@ -18,18 +18,18 @@ use infinity_agent_core::traits::InputSender;
 use rap_protocol::{ProviderCallId, ToolCallId};
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
+use shade_policy::{Cap, Caps};
+use shade_store::db::Db;
+use shade_store::operations::Operations;
+use shade_store::roots::{Adapter, Roots};
+use shade_store::schedules::{Applied, Change, Definition, MAX_JOBS, Pending, Receipt, Schedules};
 
 use crate::authority::Authority;
 use crate::error::BoxError;
 use crate::jobfiles::{self, JobFiles};
 use crate::notify;
-use crate::policy::{self, Cap, Caps};
 use crate::receipt::{Card, Proposal, Verb};
 use crate::schedule::{self, TriggerArgs};
-use crate::store::db::Db;
-use crate::store::operations::Operations;
-use crate::store::roots::{Adapter, Roots};
-use crate::store::schedules::{Applied, Change, Definition, MAX_JOBS, Pending, Receipt, Schedules};
 use crate::tools::{self, Shown};
 
 const MAX_TITLE: usize = 100;
@@ -142,7 +142,7 @@ impl Work {
 impl ScheduleTool {
     /// The tool for `action`, described for a conversation holding `caps`.
     pub fn new(action: Action, work: &Arc<Work>, caps: &Caps) -> Self {
-        let delegable = policy::delegable(caps);
+        let delegable = shade_policy::delegable(caps);
         let timezone = work.authority.policy().timezone.name();
 
         Self { action, description: describe(action), parameters: parameters(action, &delegable, timezone), work: Arc::clone(work) }
@@ -511,7 +511,7 @@ fn bounded(field: &str, text: String, max: usize) -> Result<String, String> {
 /// The caps a job may get from a conversation holding `held`: its own,
 /// minus management. Anything else is refused by name.
 fn delegate(requested: Vec<String>, held: &Caps) -> Result<Vec<String>, String> {
-    let delegable = policy::delegable(held);
+    let delegable = shade_policy::delegable(held);
     let mut caps = Caps::new();
     let mut refused = Vec::new();
 
@@ -671,16 +671,16 @@ mod tests {
 
     use infinity_agent_core::ThreadId;
     use serde_json::json;
+    use shade_policy::{Cap, Limits};
+    use shade_store::conversation::Conversations;
+    use shade_store::db::Db;
+    use shade_store::grants::Grants;
+    use shade_store::schedules::Schedules;
 
     use super::{Action, Answer, Call, Work};
     use crate::authority::Authority;
     use crate::error::BoxError;
     use crate::jobfiles::JobFiles;
-    use crate::policy::{Cap, Limits};
-    use crate::store::conversation::Conversations;
-    use crate::store::db::Db;
-    use crate::store::grants::Grants;
-    use crate::store::schedules::Schedules;
     use crate::testing::{self, Dirs};
 
     struct Setup {

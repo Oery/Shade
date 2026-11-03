@@ -2293,12 +2293,13 @@ dependencies = [
  "infinity-provider-rig",
  "rap-protocol",
  "rig-core",
- "rusqlite",
  "serde",
  "serde_json",
  "serenity",
+ "shade-policy",
  "shade-proto",
  "shade-sandbox",
+ "shade-store",
  "thiserror 2.0.21",
  "tokio",
  "toml",
@@ -2317,6 +2318,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "shade-policy"
+version = "0.1.0"
+dependencies = [
+ "chrono-tz",
+ "serde",
+ "tracing",
+]
+
+[[package]]
 name = "shade-proto"
 version = "0.1.0"
 dependencies = [
@@ -2329,6 +2339,24 @@ version = "0.1.0"
 dependencies = [
  "serde",
  "shade-proto",
+ "thiserror 2.0.21",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "shade-store"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "infinity-agent-core",
+ "infinity-provider-protocol",
+ "rap-protocol",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "shade-policy",
  "thiserror 2.0.21",
  "tokio",
  "tracing",

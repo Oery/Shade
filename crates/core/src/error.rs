@@ -1,6 +1,7 @@
 use std::path::PathBuf;
 
 use shade_sandbox::SandboxError;
+use shade_store::db::OpenError;
 use thiserror::Error;
 
 use crate::adapters::discord::DiscordError;
@@ -45,17 +46,8 @@ pub enum Error {
     #[error("{0} (model.api_key_env) is not set in the environment or the .env file next to the config")]
     MissingApiKey(String),
 
-    #[error("cannot create database {path}: {source}")]
-    DatabaseFile { path: PathBuf, source: std::io::Error },
-
-    #[error("cannot open the database: {0}")]
-    Database(#[from] rusqlite::Error),
-
-    #[error("the database has schema version {found}, but this shaded supports up to {supported}; upgrade shaded")]
-    SchemaTooNew { found: u32, supported: u32 },
-
-    #[error("cannot start the database worker: {0}")]
-    DatabaseWorker(std::io::Error),
+    #[error(transparent)]
+    Database(#[from] OpenError),
 
     #[error("model.compact_at_tokens is {compact_at}; it must be between 1 and {limit} (75% of context_window)")]
     CompactionBudget { compact_at: usize, limit: usize },

@@ -12,8 +12,7 @@ use chrono_tz::Tz;
 use croner::Cron;
 use croner::parser::{CronParser, Seconds, Year};
 use serde::Deserialize;
-
-use crate::store::schedules::{Definition, Job, Waiting};
+use shade_store::schedules::{Definition, Job, Waiting};
 
 /// How long a proposed change may wait for approval, in seconds.
 pub const APPROVAL_WINDOW: i64 = 24 * 3600;

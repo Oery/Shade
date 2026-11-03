@@ -7,10 +7,10 @@ use infinity_agent_core::tools::{Tool, ToolContext};
 use infinity_agent_core::traits::InputSender;
 use infinity_provider_protocol::{Text, ToolResult, ToolResultContent};
 use rap_protocol::{ProviderCallId, ToolCallId};
+use shade_policy::Cap;
 
 use crate::authority::Authority;
 use crate::error::BoxError;
-use crate::policy::Cap;
 
 pub struct Now {
     authority: Authority,

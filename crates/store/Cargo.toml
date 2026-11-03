@@ -1,0 +1,27 @@
+[package]
+name = "shade-store"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[features]
+# Typed helpers that other crates' tests use to set up and inspect the database.
+testing = []
+
+[dependencies]
+shade-policy.workspace = true
+async-trait.workspace = true
+infinity-agent-core.workspace = true
+infinity-provider-protocol.workspace = true
+rap-protocol.workspace = true
+rusqlite.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+uuid.workspace = true
+
+[lints]
+workspace = true

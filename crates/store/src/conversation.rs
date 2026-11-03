@@ -17,9 +17,9 @@ use infinity_agent_core::traits::{ConversationStore, SpawnContext};
 use rap_protocol::ToolCallId;
 use rusqlite::{Connection, OptionalExtension, Statement, params};
 
-#[cfg(test)]
-use super::roots::{Adapter, register};
-use crate::store::db::{Db, DbError};
+use crate::db::{Db, DbError};
+#[cfg(any(test, feature = "testing"))]
+use crate::roots::{Adapter, register};
 
 #[derive(Clone)]
 pub struct Conversations {
@@ -41,7 +41,7 @@ impl Conversations {
 
     /// Registers a terminal chat root with a chosen ID and starts its first
     /// turn, for tests. Entry points use [`Roots`](super::roots::Roots).
-    #[cfg(test)]
+    #[cfg(any(test, feature = "testing"))]
     pub async fn register_root(&self, thread_id: &ThreadId<str>) -> Result<(), DbError> {
         let id = thread_id.as_str().to_owned();
 
@@ -55,6 +55,12 @@ impl Conversations {
                 Ok(())
             })
             .await
+    }
+
+    /// The compaction thread's ID, for tests that answer as its model.
+    #[cfg(any(test, feature = "testing"))]
+    pub async fn compaction_thread(&self) -> Result<String, DbError> {
+        self.db.call(|connection| Ok(connection.query_row("SELECT id FROM threads WHERE compaction = 1", [], |row| row.get(0))?)).await
     }
 
     /// Reads one boolean column of a thread. Unknown threads read as `false`, as in the reference store.

@@ -12,10 +12,10 @@ use infinity_agent_core::traits::InputSender;
 use infinity_provider_protocol::message::{Text, ToolResult, ToolResultContent, UserContent};
 use rap_protocol::DisplaySegment;
 use serde::{Deserialize, Serialize};
+use shade_store::operations::{Operations, Started};
 
 use crate::receipt::Card;
 use crate::recovery::UNKNOWN_OUTCOME;
-use crate::store::operations::{Operations, Started};
 
 /// Sends the result of an asynchronous call. The call ID is the dedup ID,
 /// so Infinity ignores a result for a call that already has one.

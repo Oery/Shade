@@ -8,8 +8,7 @@
 use chrono::{DateTime, Datelike, Utc};
 use chrono_tz::Tz;
 use serde::{Deserialize, Serialize};
-
-use crate::store::schedules::Definition;
+use shade_store::schedules::Definition;
 
 /// Longest prompt excerpt on a card, in characters.
 const PROMPT_EXCERPT: usize = 300;

@@ -5,9 +5,9 @@
 //! else an explicit unknown outcome. Nothing is run again.
 
 use infinity_agent_core::ThreadId;
+use shade_store::operations::Operations;
 
 use crate::error::BoxError;
-use crate::store::operations::Operations;
 
 /// The result of a call whose outcome was lost.
 pub const UNKNOWN_OUTCOME: &str = "Interrupted before the result was recorded. The action may have completed. Verify its outcome before retrying an action with side effects.";
@@ -54,13 +54,13 @@ mod tests {
 
     use infinity_agent_core::ThreadId;
     use infinity_agent_core::message::InputMessage;
+    use shade_policy::{Cap, Limits};
+    use shade_store::conversation::Conversations;
+    use shade_store::db::Db;
+    use shade_store::operations::Operations;
 
     use super::{UNKNOWN_OUTCOME, answers};
     use crate::error::BoxError;
-    use crate::policy::{Cap, Limits};
-    use crate::store::conversation::Conversations;
-    use crate::store::db::Db;
-    use crate::store::operations::Operations;
     use crate::testing::{self, Dirs, attach, within};
     use crate::tools;
 

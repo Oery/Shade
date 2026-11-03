@@ -15,13 +15,13 @@ use infinity_agent_core::system::{ModelSource, ResolvedModel};
 use infinity_provider_protocol::{
     CompletionError, CompletionRequest, ErrorClass, FinalResponse, ModelEntry, ModelProvider, ModelStream, StreamChunk, Usage,
 };
+use shade_policy::{Cap, Caps, Charge, Origin, Policy};
+use shade_store::db::DbError;
+use shade_store::grants::{Grants, Refusal};
+use shade_store::usage::Usages;
 use thiserror::Error;
 
 use crate::error::BoxError;
-use crate::policy::{Cap, Caps, Charge, Origin, Policy};
-use crate::store::db::DbError;
-use crate::store::grants::{Grants, Refusal};
-use crate::store::usage::Usages;
 
 #[derive(Debug, Error)]
 pub enum Denied {
@@ -207,12 +207,13 @@ mod tests {
     use infinity_agent_core::system::AgentEvent;
     use infinity_agent_core::traits::InputSender;
     use infinity_provider_protocol::Usage;
-    use rusqlite::OptionalExtension;
+    use shade_policy::{Cap, Limits};
+    use shade_store::db::Db;
+    use shade_store::roots::Roots;
+    use shade_store::usage::Usages;
 
     use super::Denied;
     use crate::error::BoxError;
-    use crate::policy::{Cap, Limits};
-    use crate::store::db::Db;
     use crate::testing::{self, attach, reaches_model, until, within};
 
     fn root() -> ThreadId {
@@ -225,7 +226,7 @@ mod tests {
         within(async {
             let db = Db::in_memory()?;
             let mut harness = testing::start(&db).await?;
-            db.call(|connection| Ok(connection.execute("INSERT INTO threads (id, root_id) VALUES ('root', 'root')", [])?)).await?;
+            Roots::new(db.clone()).insert_ungranted("root").await?;
 
             let input = InputMessage::user_text(root(), "hi");
             harness.system.sender().send_to_input_queue(input, "input-1").await?;
@@ -311,11 +312,9 @@ mod tests {
                 "a turn past the budget did not compact"
             );
 
-            let sql = "SELECT input_tokens FROM usage";
+            let usages = Usages::new(db);
 
-            while db.call(move |connection| Ok(connection.query_row(sql, [], |row| row.get::<_, i64>(0)).optional()?)).await?
-                != Some(76_000)
-            {
+            while usages.first_input_tokens().await? != Some(76_000) {
                 tokio::task::yield_now().await;
             }
 

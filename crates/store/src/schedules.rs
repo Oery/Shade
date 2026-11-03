@@ -9,13 +9,13 @@
 
 use infinity_agent_core::ThreadId;
 use rusqlite::{Connection, OptionalExtension, params};
+use shade_policy::{Grant, Origin};
 
-use crate::policy::{Grant, Origin};
-use crate::store::db::{Db, DbError};
-use crate::store::grants::start_budget;
-use crate::store::inbox::{self, Input};
-use crate::store::operations;
-use crate::store::roots::{insert_root, new_id};
+use crate::db::{Db, DbError};
+use crate::grants::start_budget;
+use crate::inbox::{self, Input};
+use crate::operations;
+use crate::roots::{insert_root, new_id};
 use serde::{Deserialize, Serialize};
 
 /// A job whose next occurrence has come.
@@ -695,74 +695,73 @@ fn sync_files(connection: &mut Connection, present: &[String], changed: &[(Strin
     Ok(())
 }
 
+#[cfg(any(test, feature = "testing"))]
+impl Schedules {
+    /// A job that may use `now`, due at `next_at`.
+    pub async fn add(&self, id: &str, kind: &'static str, spec: &'static str, next_at: i64) -> Result<(), DbError> {
+        let id = id.to_owned();
+
+        self.db
+            .call(move |connection| {
+                let sql = "INSERT INTO schedules (id, title, kind, spec, timezone, prompt, caps, next_at)
+                           VALUES (?1, ?1, ?2, ?3, 'Europe/Paris', 'check the weather', '[\"now\"]', ?4)";
+                connection.execute(sql, params![id, kind, spec, next_at])?;
+
+                Ok(())
+            })
+            .await
+    }
+
+    /// Proposes `title` for `job` as drafted against `base_version`, under `code`.
+    pub async fn propose(
+        &self, code: &'static str, job: &'static str, base_version: Option<i64>, title: &'static str, thread: Option<&'static str>,
+    ) -> Result<(), DbError> {
+        self.db
+            .call(move |connection| {
+                let jobs = list_jobs(connection)?;
+                let Some(found) = jobs.into_iter().find(|found| found.id == job) else {
+                    return Err(DbError::UnknownThread(job.to_owned()));
+                };
+
+                let mut definition = found.definition;
+                definition.title = title.to_owned();
+                let change = Change::Propose(Pending {
+                    code: code.to_owned(),
+                    job: job.to_owned(),
+                    base_version,
+                    definition,
+                    deletes: false,
+                    receipt: title.to_owned(),
+                    thread: thread.map(str::to_owned),
+                    created_at: 0,
+                });
+                apply_change(connection, change, None)?;
+
+                Ok(())
+            })
+            .await
+    }
+
+    /// Every run's status, oldest occurrence first.
+    pub async fn statuses(&self) -> Result<Vec<String>, DbError> {
+        self.db
+            .call(|connection| {
+                let mut statement = connection.prepare("SELECT status FROM runs ORDER BY scheduled_for")?;
+                let rows = statement.query_map([], |row| row.get(0))?;
+
+                Ok(rows.collect::<Result<_, _>>()?)
+            })
+            .await
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use rusqlite::params;
-
     use super::{Claim, Schedules};
-    use crate::error::BoxError;
-    use crate::store::db::{Db, DbError};
+    use crate::BoxError;
+    use crate::db::Db;
 
     const HOUR: i64 = 3600;
-
-    impl Schedules {
-        /// A job that may use `now`, due at `next_at`.
-        pub async fn add(&self, id: &str, kind: &'static str, spec: &'static str, next_at: i64) -> Result<(), DbError> {
-            let id = id.to_owned();
-
-            self.db
-                .call(move |connection| {
-                    let sql = "INSERT INTO schedules (id, title, kind, spec, timezone, prompt, caps, next_at)
-                               VALUES (?1, ?1, ?2, ?3, 'Europe/Paris', 'check the weather', '[\"now\"]', ?4)";
-                    connection.execute(sql, params![id, kind, spec, next_at])?;
-
-                    Ok(())
-                })
-                .await
-        }
-
-        /// Proposes `title` for `job` as drafted against `base_version`, under `code`.
-        pub async fn propose(
-            &self, code: &'static str, job: &'static str, base_version: Option<i64>, title: &'static str, thread: Option<&'static str>,
-        ) -> Result<(), DbError> {
-            self.db
-                .call(move |connection| {
-                    let jobs = super::list_jobs(connection)?;
-                    let Some(found) = jobs.into_iter().find(|found| found.id == job) else {
-                        return Err(DbError::UnknownThread(job.to_owned()));
-                    };
-
-                    let mut definition = found.definition;
-                    definition.title = title.to_owned();
-                    let change = super::Change::Propose(super::Pending {
-                        code: code.to_owned(),
-                        job: job.to_owned(),
-                        base_version,
-                        definition,
-                        deletes: false,
-                        receipt: title.to_owned(),
-                        thread: thread.map(str::to_owned),
-                        created_at: 0,
-                    });
-                    super::apply_change(connection, change, None)?;
-
-                    Ok(())
-                })
-                .await
-        }
-
-        /// Every run's status, oldest occurrence first.
-        pub async fn statuses(&self) -> Result<Vec<String>, DbError> {
-            self.db
-                .call(|connection| {
-                    let mut statement = connection.prepare("SELECT status FROM runs ORDER BY scheduled_for")?;
-                    let rows = statement.query_map([], |row| row.get(0))?;
-
-                    Ok(rows.collect::<Result<_, _>>()?)
-                })
-                .await
-        }
-    }
 
     /// A job has at most one running and one queued run: occurrences while
     /// one waits fold into it. Capacity holds queued runs back without losing them.

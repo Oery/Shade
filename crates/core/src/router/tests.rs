@@ -9,17 +9,17 @@ use chrono::{DateTime, TimeDelta, Utc};
 use infinity_agent_core::ThreadId;
 use infinity_agent_core::message::InfinityMessage;
 use infinity_agent_core::traits::ConversationStore;
+use shade_policy::{Cap, Limits};
 use shade_proto::Response;
+use shade_store::conversation::Conversations;
+use shade_store::db::Db;
+use shade_store::inbox::{Inbox, Input};
+use shade_store::roots::{Adapter, Target};
+use shade_store::schedules::Schedules;
 use tokio::sync::mpsc;
 
 use super::{Outbound, REPLY_QUEUE, Router};
 use crate::error::BoxError;
-use crate::policy::{Cap, Limits};
-use crate::store::conversation::Conversations;
-use crate::store::db::Db;
-use crate::store::inbox::Input;
-use crate::store::roots::{Adapter, Target};
-use crate::store::schedules::Schedules;
 use crate::testing::{self, within};
 
 const TEXT: &str = "remember the milk";
@@ -162,8 +162,7 @@ async fn message_delivered_twice_is_accepted_once() -> Result<(), BoxError> {
         assert!(matches!(last(&mut replies[0]).await, Some(Response::Done)));
         assert!(replies[1].recv().await.is_none(), "the duplicate got a reply of its own");
 
-        let accepted: i64 = db.call(|connection| Ok(connection.query_row("SELECT COUNT(*) FROM inbox", [], |row| row.get(0))?)).await?;
-        assert_eq!(accepted, 1);
+        assert_eq!(Inbox::new(db).count().await?, 1);
 
         Ok(())
     })

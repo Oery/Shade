@@ -14,7 +14,7 @@ use infinity_agent_core::traits::StateStore;
 use rap_protocol::{ChoiceId, ToolCallId};
 use rusqlite::{Connection, OptionalExtension, params};
 
-use crate::store::db::{Db, DbError};
+use crate::db::{Db, DbError};
 
 #[derive(Clone)]
 pub struct States {

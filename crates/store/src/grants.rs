@@ -7,9 +7,9 @@
 
 use infinity_agent_core::ThreadId;
 use rusqlite::{Connection, OptionalExtension, params};
+use shade_policy::{Charge, Grant, Limits, Origin, Usage};
 
-use crate::policy::{Charge, Grant, Limits, Origin, Usage};
-use crate::store::db::{Db, DbError};
+use crate::db::{Db, DbError};
 
 /// Why a budget admitted nothing.
 #[derive(Debug, PartialEq)]
@@ -88,7 +88,7 @@ impl Grants {
     }
 }
 
-pub fn insert_grant(connection: &Connection, root: &str, grant: &Grant) -> Result<(), DbError> {
+pub(crate) fn insert_grant(connection: &Connection, root: &str, grant: &Grant) -> Result<(), DbError> {
     let caps = match &grant.caps {
         Some(caps) => Some(serde_json::to_string(caps)?),
         None => None,
@@ -101,7 +101,7 @@ pub fn insert_grant(connection: &Connection, root: &str, grant: &Grant) -> Resul
 }
 
 /// Moves `root` to a fresh budget. Threads spawned later share it.
-pub fn start_budget(connection: &Connection, root: &str) -> Result<(), DbError> {
+pub(crate) fn start_budget(connection: &Connection, root: &str) -> Result<(), DbError> {
     connection.execute("INSERT INTO budgets (root_id) VALUES (?1)", [root])?;
 
     let budget = connection.last_insert_rowid();
@@ -157,13 +157,13 @@ mod tests {
     use infinity_agent_core::ThreadId;
     use infinity_agent_core::traits::{ConversationStore, SpawnContext};
     use rap_protocol::ToolCallId;
+    use shade_policy::{Charge, Limits, Origin};
 
     use super::{Grants, Refusal};
-    use crate::error::BoxError;
-    use crate::policy::{Charge, Limits, Origin};
-    use crate::store::conversation::Conversations;
-    use crate::store::db::Db;
-    use crate::store::roots::{Adapter, Roots};
+    use crate::BoxError;
+    use crate::conversation::Conversations;
+    use crate::db::Db;
+    use crate::roots::{Adapter, Roots};
 
     /// A child shares its turn's budget (notifications and the one failure
     /// notice included), keeps it after the next turn starts, and keeps its
