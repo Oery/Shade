@@ -16,6 +16,7 @@ use tokio::task::LocalSet;
 use crate::authority::{Authority, Metered};
 use crate::config::{Isolation, SandboxConfig};
 use crate::error::BoxError;
+use crate::jobfiles::JobFiles;
 use crate::notify::Notifier;
 use crate::policy::{Cap, Limits, Policy};
 use crate::router::Router;
@@ -26,7 +27,7 @@ use crate::store::db::Db;
 use crate::store::grants::Grants;
 use crate::store::state::States;
 use crate::store::usage::Usages;
-use crate::thread_config::ThreadTools;
+use crate::thread_config::{Services, ThreadTools};
 
 pub type System = LaunchingSystem<Conversations, States, NoRapHttp>;
 
@@ -41,7 +42,19 @@ pub struct Harness {
 pub fn policy(caps: &[Cap], limits: Limits) -> Arc<Policy> {
     let chat = caps.iter().copied().collect();
 
-    Arc::new(Policy { chat, chat_prompt: None, jobs_prompt: None, hooks: Default::default(), limits, timezone: chrono_tz::UTC })
+    let agent_caps = [Cap::Now, Cap::Notify].into_iter().collect();
+    let channels = [("alerts".to_owned(), 42)].into_iter().collect();
+
+    Arc::new(Policy {
+        chat,
+        chat_prompt: None,
+        jobs_prompt: None,
+        agent_caps,
+        channels,
+        hooks: Default::default(),
+        limits,
+        timezone: chrono_tz::UTC,
+    })
 }
 
 /// Runs `test` on a `LocalSet`, failing it after ten seconds instead of hanging.
@@ -60,13 +73,18 @@ pub async fn start(db: &Db) -> Result<Harness, BoxError> {
 }
 
 pub async fn start_with(db: &Db, policy: Arc<Policy>) -> Result<Harness, BoxError> {
-    start_with_tools(db, policy, None, None).await
+    start_with_tools(db, policy, services(None, None)).await
 }
 
-/// A system whose tools can reach `sandbox` and `notifier`.
-pub async fn start_with_tools(
-    db: &Db, policy: Arc<Policy>, sandbox: Option<Arc<Sandbox>>, notifier: Option<Notifier>,
-) -> Result<Harness, BoxError> {
+/// Services reaching `sandbox` and `notifier`, with a job file directory nobody writes.
+pub fn services(sandbox: Option<Arc<Sandbox>>, notifier: Option<Notifier>) -> Services {
+    let job_files = Arc::new(JobFiles::new(std::env::temp_dir().join(format!("shade-test-jobs-{}", uuid::Uuid::new_v4()))));
+
+    Services { sandbox, notifier, job_files }
+}
+
+/// A system whose tools reach `services`.
+pub async fn start_with_tools(db: &Db, policy: Arc<Policy>, services: Services) -> Result<Harness, BoxError> {
     let (mock, model) = mock_model();
     let entry = ModelEntry {
         model_id: "mock".to_owned(),
@@ -79,7 +97,7 @@ pub async fn start_with_tools(
 
     let authority = Authority::new(Grants::new(db.clone()), policy);
     let conversations = Conversations::new(db.clone());
-    let tools = ThreadTools::new(conversations.clone(), authority.clone(), db.clone(), sandbox, notifier);
+    let tools = ThreadTools::new(conversations.clone(), authority.clone(), db.clone(), services);
     let metered = Metered::new(static_model, authority.clone(), Usages::new(db.clone()));
     let builder = AgentSystemBuilder::new_local(conversations.clone(), States::new(db.clone()), metered);
     let system = builder.without_builtin_tools().thread_config(tools).start();
@@ -91,7 +109,7 @@ pub async fn start_with_tools(
 pub async fn router(db: &Db, policy: Arc<Policy>) -> Result<(Router, MockModelController), BoxError> {
     let Harness { system, model, .. } = start_with(db, Arc::clone(&policy)).await?;
 
-    Ok((Router::new(db.clone(), system, policy, None, None), model))
+    Ok((Router::new(db.clone(), system, policy, None, services(None, None)), model))
 }
 
 /// Attaches to a registered thread and waits out the idle its attach-spawned driver emits.

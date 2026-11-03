@@ -20,13 +20,13 @@ use infinity_agent_core::traits::ConversationStore;
 
 use crate::authority::Authority;
 use crate::error::BoxError;
+use crate::jobfiles::JobFiles;
 use crate::notify::Notifier;
 use crate::policy::{Cap, Origin};
 use crate::sandbox::Sandbox;
 use crate::store::conversation::Conversations;
 use crate::store::db::Db;
 use crate::store::operations::Operations;
-use crate::store::schedules::Schedules;
 use crate::tools::notify::Notify;
 use crate::tools::now::Now;
 use crate::tools::schedules::{self, Action, ScheduleTool};
@@ -37,24 +37,27 @@ const JOBS_PROMPT: &str = "You are running a background job for your owner, star
                            replies. If the result needs the owner's attention, send it with the notify tool; otherwise \
                            finish without notifying.";
 
+/// What tools and the router reach besides the database.
+#[derive(Clone)]
+pub struct Services {
+    /// Present whenever some origin holds `shell`.
+    pub sandbox: Option<Arc<Sandbox>>,
+    /// Present when an adapter can reach the owner. `notify` is offered without one and says so.
+    pub notifier: Option<Notifier>,
+    pub job_files: Arc<JobFiles>,
+}
+
 pub struct ThreadTools {
     conversations: Conversations,
     authority: Authority,
     operations: Operations,
-    /// Present whenever some origin holds `shell`.
-    sandbox: Option<Arc<Sandbox>>,
-    /// Present when an adapter can reach the owner. `notify` is offered without one and says so.
-    notifier: Option<Notifier>,
-    schedules: Schedules,
+    services: Services,
+    db: Db,
 }
 
 impl ThreadTools {
-    pub fn new(
-        conversations: Conversations, authority: Authority, db: Db, sandbox: Option<Arc<Sandbox>>, notifier: Option<Notifier>,
-    ) -> Self {
-        let (operations, schedules) = (Operations::new(db.clone()), Schedules::new(db));
-
-        Self { conversations, authority, operations, sandbox, notifier, schedules }
+    pub fn new(conversations: Conversations, authority: Authority, db: Db, services: Services) -> Self {
+        Self { conversations, authority, operations: Operations::new(db.clone()), services, db }
     }
 }
 
@@ -78,13 +81,13 @@ impl ThreadConfigSource<ChannelSender, NoRapHttp> for ThreadTools {
         }
 
         if authorized.caps.contains(&Cap::Notify) {
-            let notify = Notify::new(self.authority.clone(), self.operations.clone(), self.notifier.clone());
+            let notify = Notify::new(self.authority.clone(), self.db.clone(), self.services.notifier.clone());
             config.tools.push(Rc::new(notify));
         }
 
         // Management stays with owner chat even if a grant somehow held it.
         if authorized.caps.contains(&Cap::Schedules) && authorized.origin == Origin::Chat {
-            let work = schedules::Work::new(self.authority.clone(), self.schedules.clone(), self.operations.clone());
+            let work = schedules::Work::new(self.authority.clone(), self.db.clone(), Arc::clone(&self.services.job_files));
 
             for action in Action::ALL {
                 config.tools.push(Rc::new(ScheduleTool::new(action, &work, &authorized.caps)));
@@ -92,7 +95,7 @@ impl ThreadConfigSource<ChannelSender, NoRapHttp> for ThreadTools {
         }
 
         if authorized.caps.contains(&Cap::Shell)
-            && let Some(sandbox) = &self.sandbox
+            && let Some(sandbox) = &self.services.sandbox
         {
             let network = authorized.caps.contains(&Cap::ShellNetwork);
             let shell = Shell::new(Arc::clone(sandbox), self.authority.clone(), self.operations.clone(), network);

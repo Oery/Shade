@@ -16,6 +16,7 @@ use crate::store::grants::start_budget;
 use crate::store::inbox::{self, Input};
 use crate::store::operations;
 use crate::store::roots::{insert_root, new_id};
+use serde::{Deserialize, Serialize};
 
 /// A job whose next occurrence has come.
 pub struct Due {
@@ -57,6 +58,7 @@ pub struct Run {
 pub const MAX_JOBS: i64 = 100;
 
 /// What a job does and when.
+#[derive(Debug, PartialEq, Serialize, Deserialize)]
 pub struct Definition {
     pub title: String,
     /// `cron` or `once`.
@@ -66,8 +68,29 @@ pub struct Definition {
     pub prompt: String,
     /// Delegated to each run.
     pub caps: Vec<String>,
+    /// Where its runs may post: `dm`, channel names, or channel IDs. The first is the default.
+    pub channels: Vec<String>,
+    /// Lives in `jobs/<id>.toml`, which wins over this row at startup.
+    pub file: bool,
     pub enabled: bool,
     pub next_at: Option<i64>,
+}
+
+/// A proposed change still inside its approval window, for listings.
+pub struct Waiting {
+    pub code: String,
+    /// The receipt shown when it applies; its first line names the job.
+    pub receipt: String,
+}
+
+/// A change waiting for the owner's approval.
+pub struct Pending {
+    pub job: String,
+    /// `None` for a new job.
+    pub base_version: Option<i64>,
+    pub definition: Definition,
+    pub receipt: String,
+    pub created_at: i64,
 }
 
 /// A stored job.
@@ -93,6 +116,17 @@ pub enum Change {
     },
     Delete {
         id: String,
+        /// Its file is removed first.
+        file: bool,
+    },
+    /// Waits for the owner: nothing changes until they approve `code`.
+    /// `receipt` is shown when it applies.
+    Propose {
+        code: String,
+        id: String,
+        base_version: Option<i64>,
+        definition: Definition,
+        receipt: String,
     },
 }
 
@@ -233,6 +267,77 @@ impl Schedules {
         Ok(jobs.into_iter().find(|job| job.id == id))
     }
 
+    /// Proposed changes younger than `window` seconds, oldest first.
+    pub async fn waiting(&self, window: i64) -> Result<Vec<Waiting>, DbError> {
+        self.db
+            .call(move |connection| {
+                let sql = "SELECT code, receipt FROM pending_changes WHERE created_at > unixepoch() - ?1 ORDER BY created_at";
+                let mut statement = connection.prepare(sql)?;
+                let rows = statement.query_map([window], |row| Ok(Waiting { code: row.get(0)?, receipt: row.get(1)? }))?;
+
+                Ok(rows.collect::<Result<_, _>>()?)
+            })
+            .await
+    }
+
+    /// Whether a job ever had `id`, deleted ones included.
+    pub async fn exists(&self, id: &str) -> Result<bool, DbError> {
+        let id = id.to_owned();
+
+        self.db
+            .call(move |connection| {
+                Ok(connection.query_row("SELECT 1 FROM schedules WHERE id = ?1", [&id], |_| Ok(())).optional()?.is_some())
+            })
+            .await
+    }
+
+    /// A change waiting for approval.
+    pub async fn pending(&self, code: &str) -> Result<Option<Pending>, DbError> {
+        let code = code.to_owned();
+
+        self.db.call(move |connection| pending_change(connection, &code)).await
+    }
+
+    /// Applies an approved change and forgets it, in one transaction.
+    /// `Some` says why it no longer applies.
+    pub async fn approve(&self, code: &str, change: Change) -> Result<Option<String>, DbError> {
+        let code = code.to_owned();
+
+        self.db
+            .call(move |connection| {
+                let transaction = connection.transaction()?;
+                let refusal = apply_change(&transaction, change, None)?;
+                transaction.execute("DELETE FROM pending_changes WHERE code = ?1", [&code])?;
+                transaction.commit()?;
+
+                Ok(refusal)
+            })
+            .await
+    }
+
+    /// Makes file jobs match the files (see [`sync_files`]).
+    pub async fn sync_files(&self, present: Vec<String>, changed: Vec<(String, Definition)>) -> Result<(), DbError> {
+        self.db.call(move |connection| sync_files(connection, &present, &changed)).await
+    }
+
+    /// The channels of the job whose run `thread` belongs to. `None` outside a scheduled run.
+    pub async fn channels_of(&self, thread: &ThreadId<str>) -> Result<Option<Vec<String>>, DbError> {
+        let thread = thread.as_str().to_owned();
+
+        self.db
+            .call(move |connection| {
+                let sql = "SELECT s.channels FROM threads t JOIN runs r ON r.root_id = t.root_id JOIN schedules s ON s.id = r.schedule_id
+                           WHERE t.id = ?1";
+                let channels: Option<String> = connection.query_row(sql, [&thread], |row| row.get(0)).optional()?;
+
+                match channels {
+                    Some(json) => Ok(Some(serde_json::from_str(&json)?)),
+                    None => Ok(None),
+                }
+            })
+            .await
+    }
+
     /// Applies `change` and records its result as the call's, in one
     /// transaction: a call answered before replays its result instead.
     pub async fn apply(&self, change: Change, receipt: Receipt) -> Result<Applied, DbError> {
@@ -244,7 +349,7 @@ impl Schedules {
                     return Ok(Applied::Replayed(result));
                 }
 
-                let applied = match apply_change(&transaction, change, &receipt.thread)? {
+                let applied = match apply_change(&transaction, change, Some(&receipt.thread))? {
                     Some(refusal) => Applied::Refused(format!("Error: {refusal}")),
                     None => Applied::Done(receipt.text),
                 };
@@ -384,52 +489,75 @@ fn interrupt_runs(connection: &mut Connection, resumed: &[String]) -> Result<Vec
     Ok(interrupted)
 }
 
+const COLUMNS: &str = "title, kind, spec, timezone, prompt, caps, channels, file, enabled, next_at";
+
 fn list_jobs(connection: &mut Connection) -> Result<Vec<Job>, DbError> {
-    let sql =
-        "SELECT s.id, s.version, s.title, s.kind, s.spec, s.timezone, s.prompt, s.caps, s.enabled, s.next_at, r.status, r.scheduled_for
-               FROM schedules s LEFT JOIN runs r ON r.id =
-                   (SELECT id FROM runs WHERE schedule_id = s.id ORDER BY scheduled_for DESC LIMIT 1)
-               WHERE s.deleted_at IS NULL ORDER BY s.enabled DESC, s.next_at, s.created_at";
-    let mut statement = connection.prepare(sql)?;
+    let sql = format!(
+        "SELECT s.id, s.version, {}, r.status, r.scheduled_for
+         FROM schedules s LEFT JOIN runs r ON r.id = (SELECT id FROM runs WHERE schedule_id = s.id ORDER BY scheduled_for DESC LIMIT 1)
+         WHERE s.deleted_at IS NULL ORDER BY s.enabled DESC, s.next_at, s.created_at",
+        "s.title, s.kind, s.spec, s.timezone, s.prompt, s.caps, s.channels, s.file, s.enabled, s.next_at"
+    );
+    let mut statement = connection.prepare(&sql)?;
     let mut rows = statement.query([])?;
     let mut jobs = Vec::new();
 
     while let Some(row) = rows.next()? {
-        let caps: String = row.get(7)?;
-        let status: Option<String> = row.get(10)?;
+        let status: Option<String> = row.get(12)?;
 
         let last_run = match status {
-            Some(status) => Some((status, row.get(11)?)),
+            Some(status) => Some((status, row.get(13)?)),
             None => None,
         };
 
-        let definition = Definition {
-            title: row.get(2)?,
-            kind: row.get(3)?,
-            spec: row.get(4)?,
-            timezone: row.get(5)?,
-            prompt: row.get(6)?,
-            caps: serde_json::from_str(&caps)?,
-            enabled: row.get(8)?,
-            next_at: row.get(9)?,
-        };
-
-        jobs.push(Job { id: row.get(0)?, version: row.get(1)?, definition, last_run });
+        jobs.push(Job { id: row.get(0)?, version: row.get(1)?, definition: definition_at(row, 2)?, last_run });
     }
 
     Ok(jobs)
 }
 
-/// Makes the change, or returns why it cannot be made.
-fn apply_change(connection: &Connection, change: Change, thread: &str) -> Result<Option<String>, DbError> {
+/// The definition in the `COLUMNS` starting at `first`.
+fn definition_at(row: &rusqlite::Row<'_>, first: usize) -> Result<Definition, DbError> {
+    let caps: String = row.get(first + 5)?;
+    let channels: String = row.get(first + 6)?;
+
+    Ok(Definition {
+        title: row.get(first)?,
+        kind: row.get(first + 1)?,
+        spec: row.get(first + 2)?,
+        timezone: row.get(first + 3)?,
+        prompt: row.get(first + 4)?,
+        caps: serde_json::from_str(&caps)?,
+        channels: serde_json::from_str(&channels)?,
+        file: row.get(first + 7)?,
+        enabled: row.get(first + 8)?,
+        next_at: row.get(first + 9)?,
+    })
+}
+
+/// Makes the change, or returns why it cannot be made. `thread` created it, when a tool did.
+fn apply_change(connection: &Connection, change: Change, thread: Option<&str>) -> Result<Option<String>, DbError> {
     match change {
         Change::Create { id, definition } => create_job(connection, &id, &definition, thread),
         Change::Update { id, version, definition } => {
-            let sql = "UPDATE schedules SET title = ?3, kind = ?4, spec = ?5, timezone = ?6, prompt = ?7, caps = ?8, enabled = ?9,
-                       next_at = ?10, version = version + 1 WHERE id = ?1 AND version = ?2 AND deleted_at IS NULL";
-            let d = &definition;
-            let caps = serde_json::to_string(&d.caps)?;
-            let params = params![id, version, d.title, d.kind, d.spec, d.timezone, d.prompt, caps, d.enabled, d.next_at];
+            let sql = "UPDATE schedules SET title = ?3, kind = ?4, spec = ?5, timezone = ?6, prompt = ?7, caps = ?8, channels = ?9,
+                       file = ?10, enabled = ?11, next_at = ?12, version = version + 1 WHERE id = ?1 AND version = ?2 AND deleted_at IS NULL";
+            let new = &definition;
+            let (caps, channels) = (serde_json::to_string(&new.caps)?, serde_json::to_string(&new.channels)?);
+            let params = params![
+                id,
+                version,
+                new.title,
+                new.kind,
+                new.spec,
+                new.timezone,
+                new.prompt,
+                caps,
+                channels,
+                new.file,
+                new.enabled,
+                new.next_at
+            ];
 
             if connection.execute(sql, params)? == 0 {
                 return Ok(Some(format!("job {id} was changed or deleted meanwhile; list it and try again")));
@@ -437,7 +565,7 @@ fn apply_change(connection: &Connection, change: Change, thread: &str) -> Result
 
             Ok(None)
         }
-        Change::Delete { id } => {
+        Change::Delete { id, .. } => {
             let sql = "UPDATE schedules SET enabled = 0, deleted_at = unixepoch() WHERE id = ?1 AND deleted_at IS NULL";
 
             if connection.execute(sql, [&id])? == 0 {
@@ -446,23 +574,96 @@ fn apply_change(connection: &Connection, change: Change, thread: &str) -> Result
 
             Ok(None)
         }
+        Change::Propose { code, id, base_version, definition, receipt } => {
+            let sql = "INSERT INTO pending_changes (code, job_id, base_version, definition, receipt) VALUES (?1, ?2, ?3, ?4, ?5)";
+            connection.execute(sql, params![code, id, base_version, serde_json::to_string(&definition)?, receipt])?;
+
+            Ok(None)
+        }
     }
 }
 
-fn create_job(connection: &Connection, id: &str, definition: &Definition, thread: &str) -> Result<Option<String>, DbError> {
+fn create_job(connection: &Connection, id: &str, definition: &Definition, thread: Option<&str>) -> Result<Option<String>, DbError> {
     let count: i64 = connection.query_row("SELECT COUNT(*) FROM schedules WHERE deleted_at IS NULL", [], |row| row.get(0))?;
 
     if count >= MAX_JOBS {
         return Ok(Some(format!("there are already {MAX_JOBS} jobs; delete one first")));
     }
 
-    let sql = "INSERT INTO schedules (id, title, kind, spec, timezone, prompt, caps, enabled, next_at, creator_root)
-               VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, (SELECT root_id FROM threads WHERE id = ?10))";
-    let d = definition;
-    let caps = serde_json::to_string(&d.caps)?;
-    connection.execute(sql, params![id, d.title, d.kind, d.spec, d.timezone, d.prompt, caps, d.enabled, d.next_at, thread])?;
+    let taken = connection.query_row("SELECT 1 FROM schedules WHERE id = ?1", [id], |_| Ok(())).optional()?;
+
+    if taken.is_some() {
+        return Ok(Some(format!("a job named {id} exists or existed; choose another name")));
+    }
+
+    insert_job(connection, id, definition, thread)?;
 
     Ok(None)
+}
+
+fn insert_job(connection: &Connection, id: &str, definition: &Definition, thread: Option<&str>) -> Result<(), DbError> {
+    let sql = format!(
+        "INSERT INTO schedules (id, {COLUMNS}, creator_root) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, (SELECT root_id FROM threads WHERE id = ?12))"
+    );
+    let new = definition;
+    let (caps, channels) = (serde_json::to_string(&new.caps)?, serde_json::to_string(&new.channels)?);
+    let params =
+        params![id, new.title, new.kind, new.spec, new.timezone, new.prompt, caps, channels, new.file, new.enabled, new.next_at, thread];
+    connection.execute(&sql, params)?;
+
+    Ok(())
+}
+
+fn pending_change(connection: &mut Connection, code: &str) -> Result<Option<Pending>, DbError> {
+    let sql = "SELECT job_id, base_version, definition, receipt, created_at FROM pending_changes WHERE code = ?1";
+    let row: Option<(String, Option<i64>, String, String, i64)> =
+        connection.query_row(sql, [code], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?))).optional()?;
+
+    let Some((job, base_version, definition, receipt, created_at)) = row else {
+        return Ok(None);
+    };
+
+    Ok(Some(Pending {
+        job,
+        base_version,
+        definition: serde_json::from_str(&definition)?,
+        receipt,
+        created_at,
+    }))
+}
+
+/// Brings file jobs in line with their files: each `changed` definition
+/// is written as given (a file whose job was deleted brings it back), and
+/// file jobs not `present` are deleted. Runs and their history stay.
+fn sync_files(connection: &mut Connection, present: &[String], changed: &[(String, Definition)]) -> Result<(), DbError> {
+    let transaction = connection.transaction()?;
+
+    for (id, definition) in changed {
+        let new = definition;
+        let (caps, channels) = (serde_json::to_string(&new.caps)?, serde_json::to_string(&new.channels)?);
+        let sql = format!(
+            "INSERT INTO schedules (id, {COLUMNS}) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 1, ?9, ?10)
+             ON CONFLICT (id) DO UPDATE SET title = ?2, kind = ?3, spec = ?4, timezone = ?5, prompt = ?6, caps = ?7, channels = ?8,
+             file = 1, enabled = ?9, next_at = ?10, deleted_at = NULL, version = version + 1"
+        );
+        transaction.execute(
+            &sql,
+            params![id, new.title, new.kind, new.spec, new.timezone, new.prompt, caps, channels, new.enabled, new.next_at],
+        )?;
+    }
+
+    let mut statement = transaction.prepare("SELECT id FROM schedules WHERE file = 1 AND deleted_at IS NULL")?;
+    let stored: Vec<String> = statement.query_map([], |row| row.get(0))?.collect::<Result<_, _>>()?;
+    drop(statement);
+
+    for id in stored.iter().filter(|id| !present.contains(id)) {
+        tracing::info!(job = %id, "deleting a job whose file is gone");
+        transaction.execute("UPDATE schedules SET enabled = 0, deleted_at = unixepoch() WHERE id = ?1", [id])?;
+    }
+
+    transaction.commit()?;
+
+    Ok(())
 }
 
 #[cfg(test)]
@@ -485,6 +686,33 @@ mod tests {
                     let sql = "INSERT INTO schedules (id, title, kind, spec, timezone, prompt, caps, next_at)
                                VALUES (?1, ?1, ?2, ?3, 'Europe/Paris', 'check the weather', '[\"now\"]', ?4)";
                     connection.execute(sql, params![id, kind, spec, next_at])?;
+
+                    Ok(())
+                })
+                .await
+        }
+
+        /// Proposes `title` for `job` as drafted against `base_version`, under `code`.
+        pub async fn propose(
+            &self, code: &'static str, job: &'static str, base_version: Option<i64>, title: &'static str,
+        ) -> Result<(), DbError> {
+            self.db
+                .call(move |connection| {
+                    let jobs = super::list_jobs(connection)?;
+                    let Some(found) = jobs.into_iter().find(|found| found.id == job) else {
+                        return Err(DbError::UnknownThread(job.to_owned()));
+                    };
+
+                    let mut definition = found.definition;
+                    definition.title = title.to_owned();
+                    let change = super::Change::Propose {
+                        code: code.to_owned(),
+                        id: job.to_owned(),
+                        base_version,
+                        definition,
+                        receipt: title.to_owned(),
+                    };
+                    super::apply_change(connection, change, None)?;
 
                     Ok(())
                 })

@@ -50,14 +50,14 @@ impl Roots {
         Self { db }
     }
 
-    /// The conversation name that currently points at `root`, if any.
-    pub async fn conversation_of(&self, root: &ThreadId<str>) -> Result<Option<(Adapter, String)>, DbError> {
-        let id = root.as_str().to_owned();
+    /// The conversation name that currently points at the root of `thread`, if any.
+    pub async fn conversation_of(&self, thread: &ThreadId<str>) -> Result<Option<(Adapter, String)>, DbError> {
+        let id = thread.as_str().to_owned();
 
         let row: Option<(String, String)> = self
             .db
             .call(move |connection| {
-                let sql = "SELECT adapter, key FROM conversations WHERE root_id = ?1";
+                let sql = "SELECT c.adapter, c.key FROM threads t JOIN conversations c ON c.root_id = t.root_id WHERE t.id = ?1";
 
                 Ok(connection.query_row(sql, [&id], |row| Ok((row.get(0)?, row.get(1)?))).optional()?)
             })

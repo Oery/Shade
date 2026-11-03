@@ -4,6 +4,7 @@ mod adapters;
 mod authority;
 mod config;
 mod error;
+mod jobfiles;
 mod lock;
 mod model;
 mod notify;
@@ -32,12 +33,14 @@ pub use error::Error;
 use crate::adapters::discord::Discord;
 use crate::adapters::socket::ControlSocket;
 use crate::config::Config;
+use crate::jobfiles::JobFiles;
 use crate::model::Model;
 use crate::notify::Notifier;
 use crate::router::{Inbound, Router};
 use crate::secrets::Secrets;
 use crate::store::db::{self, Db};
 use crate::store::grants::Grants;
+use crate::thread_config::Services;
 
 /// Pending input between the control socket and the router.
 const INBOUND_QUEUE: usize = 16;
@@ -55,8 +58,10 @@ pub fn run(config: Option<PathBuf>) -> Result<(), Error> {
 
 async fn serve(config_path: Option<PathBuf>) -> Result<(), Error> {
     let config_path = config::path(config_path)?;
-    let Config { model, timezone, chat, jobs, hooks, limits, sandbox, discord } = config::load(&config_path)?;
-    let policy = config::policy(&config_path, chat, jobs, hooks, limits, timezone)?;
+    let Config { model, timezone, chat, jobs, hooks, limits, sandbox, mut discord } = config::load(&config_path)?;
+    let channels = discord.as_mut().map(|discord| std::mem::take(&mut discord.channels)).unwrap_or_default();
+    let sections = config::Sections { chat, jobs, hooks, limits, timezone, channels };
+    let policy = config::policy(&config_path, sections)?;
     let mut secrets = Secrets::load(secrets::path_for(&config_path))?;
 
     let Some(data_dir) = shade_proto::data_dir() else {
@@ -85,7 +90,15 @@ async fn serve(config_path: Option<PathBuf>) -> Result<(), Error> {
 
     let http = discord.as_ref().map(Discord::http);
     let notifier = discord.as_ref().map(|discord| notifications(discord, &db));
-    let router = Router::start(model, db, Arc::new(policy), sandbox.map(Arc::new), http, notifier);
+    let job_files = Arc::new(JobFiles::new(jobfiles::dir_for(&config_path)));
+    let services = Services { sandbox: sandbox.map(Arc::new), notifier, job_files };
+    let router = Router::start(model, db, Arc::new(policy), services, http);
+
+    // Job files are config: a bad one stops the daemon before it runs anything.
+    if let Err(message) = router.load_job_files(chrono::Utc::now()).await {
+        router.shutdown().await;
+        return Err(Error::JobFiles(message));
+    }
 
     if let Err(source) = router.resume().await {
         router.shutdown().await;

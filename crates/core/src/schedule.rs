@@ -13,7 +13,10 @@ use croner::Cron;
 use croner::parser::{CronParser, Seconds, Year};
 use serde::Deserialize;
 
-use crate::store::schedules::{Definition, Job};
+use crate::store::schedules::{Definition, Job, Waiting};
+
+/// How long a proposed change may wait for approval, in seconds.
+pub const APPROVAL_WINDOW: i64 = 24 * 3600;
 
 /// Candidates examined before deciding a pattern never runs (it only
 /// matches inside DST gaps, or on a date that does not exist).
@@ -167,9 +170,17 @@ pub fn describe(id: &str, definition: &Definition) -> String {
         definition.caps.join(", ")
     };
 
+    let file = if definition.file {
+        format!("\n  file: jobs/{id}.toml")
+    } else {
+        String::new()
+    };
+
     format!(
-        "\"{}\" ({id})\n  trigger: {trigger}\n  next run: {next}\n  caps: {caps}\n  prompt: {}",
-        definition.title, definition.prompt
+        "\"{}\" ({id}){file}\n  trigger: {trigger}\n  next run: {next}\n  caps: {caps}\n  channels: {}\n  prompt: {}",
+        definition.title,
+        definition.channels.join(", "),
+        definition.prompt
     )
 }
 
@@ -191,12 +202,12 @@ pub fn resumed_next(definition: &Definition, now: DateTime<Utc>) -> Result<i64, 
 }
 
 /// Every job, for the owner's CLI and the model's `schedule_list`.
-pub fn list(jobs: &[Job]) -> String {
-    if jobs.is_empty() {
-        return "No scheduled jobs.".to_owned();
-    }
-
+pub fn list(jobs: &[Job], waiting: &[Waiting]) -> String {
     let mut text = String::new();
+
+    if jobs.is_empty() {
+        text.push_str("No scheduled jobs.\n\n");
+    }
 
     for job in jobs {
         let last = match &job.last_run {
@@ -205,6 +216,15 @@ pub fn list(jobs: &[Job]) -> String {
         };
 
         text.push_str(&format!("{}\n  last run: {last}\n\n", describe(&job.id, &job.definition)));
+    }
+
+    if !waiting.is_empty() {
+        text.push_str("Waiting for the owner's approval (`/approve <code>` or `shade schedule approve <code>`):\n");
+    }
+
+    for change in waiting {
+        let summary = change.receipt.lines().next().unwrap_or_default();
+        text.push_str(&format!("  {}  {summary}\n", change.code));
     }
 
     text.truncate(text.trim_end().len());

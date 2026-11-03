@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 /// Sent in the hello of every connection. Client and daemon must match.
-pub const PROTOCOL_VERSION: u32 = 1;
+pub const PROTOCOL_VERSION: u32 = 2;
 
 /// Longest accepted message line in bytes, newline included.
 pub const MAX_LINE_BYTES: u64 = 1 << 20;
@@ -65,9 +65,19 @@ pub enum Request {
 #[serde(rename_all = "snake_case")]
 pub enum Manage {
     List,
-    Pause { id: String },
-    Resume { id: String },
-    Rm { id: String },
+    Pause {
+        id: String,
+    },
+    Resume {
+        id: String,
+    },
+    Rm {
+        id: String,
+    },
+    /// Applies a change owner chat proposed, by its code.
+    Approve {
+        code: String,
+    },
 }
 
 #[derive(Debug, Serialize, Deserialize)]

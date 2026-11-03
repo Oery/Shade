@@ -1,4 +1,8 @@
-//! `notify`: one message to the owner's fixed destination.
+//! `notify`: one message to the owner, in their DMs or a channel.
+//!
+//! Owner chat may post anywhere, by default in its own channel. A scheduled
+//! run may post only in its job's channels. Other origins reach only the
+//! owner's DMs.
 //!
 //! Like `shell`, the call is answered asynchronously and recorded before the
 //! message leaves, so a restart replays a confirmed result instead of
@@ -16,10 +20,13 @@ use serde::Deserialize;
 
 use crate::authority::Authority;
 use crate::error::BoxError;
-use crate::notify::Notifier;
-use crate::policy::Cap;
+use crate::notify::{self, Destination, Notifier};
+use crate::policy::{Cap, Origin};
 use crate::recovery::UNKNOWN_OUTCOME;
+use crate::store::db::Db;
 use crate::store::operations::Operations;
+use crate::store::roots::{Adapter, Roots};
+use crate::store::schedules::Schedules;
 use crate::tools;
 
 /// Longest message, in UTF-16 units, so the notice fits in one Discord message.
@@ -37,6 +44,8 @@ pub struct Notify {
 struct Work {
     authority: Authority,
     operations: Operations,
+    roots: Roots,
+    schedules: Schedules,
     /// `None` when no adapter is configured: every call is a visible error.
     notifier: Option<Notifier>,
 }
@@ -53,18 +62,24 @@ struct Call<M> {
 #[serde(deny_unknown_fields)]
 struct Args {
     message: String,
+    channel: Option<String>,
 }
 
 impl Notify {
-    pub fn new(authority: Authority, operations: Operations, notifier: Option<Notifier>) -> Self {
+    pub fn new(authority: Authority, db: Db, notifier: Option<Notifier>) -> Self {
         let description = format!(
-            "Send a short message to the owner's Discord DMs. In a conversation your reply already reaches the owner; \
-             use this when something needs their attention elsewhere, such as the result of background work. \
-             One turn or run may send at most {}.",
+            "Send a short message to the owner on Discord. In a conversation your reply already reaches the owner; \
+             use this to post elsewhere, or for the result of background work. `channel` is `dm` (the owner's DMs), \
+             a channel ID, a `<#id>` mention, or one of the configured names: {}. In a conversation it defaults to \
+             the conversation's channel; in a scheduled run only the job's channels are allowed, the first by \
+             default. One turn or run may send at most {}.",
+            names(&authority),
             authority.policy().limits.max_notifications
         );
 
-        Self { work: Arc::new(Work { authority, operations, notifier }), description }
+        let (operations, roots, schedules) = (Operations::new(db.clone()), Roots::new(db.clone()), Schedules::new(db));
+
+        Self { work: Arc::new(Work { authority, operations, roots, schedules, notifier }), description }
     }
 }
 
@@ -83,6 +98,7 @@ impl<M: InputSender + 'static> Tool<M> for Notify {
             "type": "object",
             "properties": {
                 "message": { "type": "string", "minLength": 1, "maxLength": MAX_MESSAGE },
+                "channel": { "type": "string", "description": "Where to post; see the description for the default." },
             },
             "required": ["message"],
             "additionalProperties": false,
@@ -116,17 +132,23 @@ impl Work {
     }
 
     async fn run<M>(&self, args: serde_json::Value, call: &Call<M>) -> String {
-        if let Err(denied) = self.authority.admit_tool(&call.thread, Cap::Notify).await {
-            return format!("Error: {denied}");
-        }
+        let origin = match self.authority.admit_tool(&call.thread, Cap::Notify).await {
+            Ok(authorized) => authorized.origin,
+            Err(denied) => return format!("Error: {denied}"),
+        };
 
-        let message = match parse(args) {
-            Ok(message) => message,
+        let (message, channel) = match parse(args) {
+            Ok(parsed) => parsed,
             Err(error) => return format!("Error: {error}"),
         };
 
         let Some(notifier) = &self.notifier else {
             return "Error: notifications have no destination; the owner must add a [discord] section to the config".to_owned();
+        };
+
+        let destination = match self.destination(&call.thread, origin, channel.as_deref()).await {
+            Ok(destination) => destination,
+            Err(error) => return format!("Error: {error}"),
         };
 
         if let Err(denied) = self.authority.admit_notification(&call.thread).await {
@@ -139,7 +161,7 @@ impl Work {
             return answer;
         }
 
-        let text = match notifier.send(format!("{PREFIX}{message}")).await {
+        let text = match notifier.send(destination, format!("{PREFIX}{message}")).await {
             Ok(()) => "Sent to the owner.".to_owned(),
             Err(error) => format!("Error: {error}"),
         };
@@ -153,7 +175,47 @@ impl Work {
     }
 }
 
-fn parse(args: serde_json::Value) -> Result<String, String> {
+impl Work {
+    async fn destination(&self, thread: &ThreadId, origin: Origin, requested: Option<&str>) -> Result<Destination, String> {
+        let names = &self.authority.policy().channels;
+
+        let channels = match origin {
+            Origin::Chat => return self.chat_destination(thread, requested).await,
+            Origin::Schedule => match self.schedules.channels_of(thread).await {
+                Ok(channels) => channels.unwrap_or_default(),
+                Err(error) => return Err(format!("cannot read this job's channels: {error}")),
+            },
+            Origin::Watch | Origin::Webhook => vec!["dm".to_owned()],
+        };
+
+        notify::job_destination(&channels, requested, names)
+    }
+
+    /// Owner chat may post anywhere; by default where it is talking.
+    async fn chat_destination(&self, thread: &ThreadId, requested: Option<&str>) -> Result<Destination, String> {
+        if let Some(written) = requested {
+            return Ok(notify::channel(written, &self.authority.policy().channels)?.1);
+        }
+
+        match self.roots.conversation_of(thread).await {
+            Ok(Some((Adapter::Discord, key))) => Ok(notify::channel(&key, &self.authority.policy().channels)?.1),
+            Ok(_) => Ok(Destination::Owner),
+            Err(error) => Err(format!("cannot find this conversation's channel: {error}")),
+        }
+    }
+}
+
+fn names(authority: &Authority) -> String {
+    let names: Vec<&str> = authority.policy().channels.keys().map(String::as_str).collect();
+
+    if names.is_empty() {
+        "none".to_owned()
+    } else {
+        names.join(", ")
+    }
+}
+
+fn parse(args: serde_json::Value) -> Result<(String, Option<String>), String> {
     let args: Args = match serde_json::from_value(args) {
         Ok(args) => args,
         Err(error) => return Err(format!("invalid arguments: {error}")),
@@ -169,7 +231,7 @@ fn parse(args: serde_json::Value) -> Result<String, String> {
         return Err(format!("message is longer than {MAX_MESSAGE} characters; shorten it"));
     }
 
-    Ok(message.to_owned())
+    Ok((message.to_owned(), args.channel))
 }
 
 #[cfg(test)]
@@ -179,7 +241,7 @@ mod tests {
     use tokio::sync::{mpsc, oneshot};
 
     use crate::error::BoxError;
-    use crate::notify::{Notice, Notifier};
+    use crate::notify::{Destination, Failure, Notice, Notifier};
     use crate::policy::{Cap, Limits};
     use crate::recovery::{self, UNKNOWN_OUTCOME};
     use crate::store::conversation::Conversations;
@@ -190,7 +252,7 @@ mod tests {
     use crate::tools;
 
     /// An acknowledgment the adapter never gave.
-    type Unanswered = Option<oneshot::Sender<Result<(), String>>>;
+    type Unanswered = Option<oneshot::Sender<Result<(), Failure>>>;
 
     fn root() -> ThreadId {
         ThreadId::from("root".to_owned())
@@ -218,7 +280,7 @@ mod tests {
     async fn first_daemon(db: &Db, confirmed: bool) -> Result<(mpsc::Receiver<Notice>, Unanswered), BoxError> {
         let (notifier, mut queue) = Notifier::new(Grants::new(db.clone()));
         let policy = testing::policy(&[Cap::Notify], Limits::default());
-        let mut harness = testing::start_with_tools(db, policy, None, Some(notifier)).await?;
+        let mut harness = testing::start_with_tools(db, policy, testing::services(None, Some(notifier))).await?;
         let handle = attach(&mut harness, &root()).await?;
 
         handle.send(InputMessage::user_text(root(), "tell me"), "input-1").await?;
@@ -226,11 +288,12 @@ mod tests {
         harness.model.send_tool_call("call-1", "notify", serde_json::json!({ "message": "done" }));
         harness.model.finish();
 
-        let Some(Notice { text, ack }) = queue.recv().await else {
+        let Some(Notice { text, destination, ack }) = queue.recv().await else {
             return Err("the notice never reached the adapter".into());
         };
 
-        assert_eq!(text, "🔔 done");
+        // A terminal conversation's notice goes to the owner's DMs.
+        assert_eq!((text.as_str(), destination), ("🔔 done", Destination::Owner));
 
         if !confirmed {
             return Ok((queue, Some(ack)));
@@ -246,7 +309,7 @@ mod tests {
     async fn second_daemon(db: &Db, expected: &str) -> Result<mpsc::Receiver<Notice>, BoxError> {
         let (notifier, queue) = Notifier::new(Grants::new(db.clone()));
         let policy = testing::policy(&[Cap::Notify], Limits::default());
-        let mut harness = testing::start_with_tools(db, policy, None, Some(notifier)).await?;
+        let mut harness = testing::start_with_tools(db, policy, testing::services(None, Some(notifier))).await?;
         let sender = harness.system.sender();
 
         for answer in recovery::answers(&Operations::new(db.clone())).await? {

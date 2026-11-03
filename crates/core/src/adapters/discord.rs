@@ -17,16 +17,16 @@ use std::num::NonZeroU64;
 use std::sync::{Arc, OnceLock};
 
 use serenity::all::{
-    ChannelId, Client, Context, CreateAllowedMentions, CreateMessage, EventHandler, GatewayIntents, Http, Message, MessageId, Ready,
-    ShardManager, Typing, UserId,
+    ChannelId, Client, Context, CreateAllowedMentions, CreateMessage, EventHandler, GatewayIntents, Http, HttpError, Message, MessageId,
+    Ready, ShardManager, Typing, UserId,
 };
 use serenity::async_trait;
-use shade_proto::Response;
+use shade_proto::{Manage, Response};
 use thiserror::Error;
 use tokio::sync::mpsc;
 
 use crate::config::DiscordConfig;
-use crate::notify::Notice;
+use crate::notify::{Destination, Failure, Notice};
 use crate::router::turn::Step;
 use crate::router::{Inbound, Outbound, REPLY_QUEUE};
 use crate::secrets::Secrets;
@@ -41,6 +41,10 @@ const MAX_BUFFER: usize = 16 * 1024;
 
 /// Typed in Discord to start a fresh conversation in the channel.
 const NEW_CONVERSATION: &str = "/new";
+
+/// Typed in Discord, with a code, to apply a change owner chat proposed.
+/// Handled here, so the model can never approve its own change.
+const APPROVE: &str = "/approve ";
 
 #[derive(Debug, Error)]
 pub enum DiscordError {
@@ -146,7 +150,16 @@ impl EventHandler for Handler {
         };
 
         if text == NEW_CONVERSATION {
-            self.new_conversation(&context.http, message.channel_id).await;
+            let (reply, replies) = mpsc::channel(REPLY_QUEUE);
+            let input = Inbound::NewConversation { adapter: Adapter::Discord, key: message.channel_id.to_string(), reply };
+            self.command(&context.http, message.channel_id, input, replies).await;
+            return;
+        }
+
+        if let Some(code) = text.strip_prefix(APPROVE) {
+            let (reply, replies) = mpsc::channel(REPLY_QUEUE);
+            let input = Inbound::Schedule { action: Manage::Approve { code: code.trim().to_owned() }, reply };
+            self.command(&context.http, message.channel_id, input, replies).await;
             return;
         }
 
@@ -184,10 +197,8 @@ impl Handler {
         message.mention_roles.contains(&role.id).then(|| role.id.get())
     }
 
-    async fn new_conversation(&self, http: &Arc<Http>, channel: ChannelId) {
-        let (reply, mut replies) = mpsc::channel(REPLY_QUEUE);
-        let input = Inbound::NewConversation { adapter: Adapter::Discord, key: channel.to_string(), reply };
-
+    /// Runs a command the adapter handles itself and posts its answer.
+    async fn command(&self, http: &Arc<Http>, channel: ChannelId, input: Inbound, mut replies: mpsc::Receiver<Response>) {
         if self.inbound.send(input).await.is_err() {
             return;
         }
@@ -336,15 +347,22 @@ impl Reply {
     }
 }
 
-/// Tells each notice's sender whether Discord accepted it. An error after
-/// the request left may hide a message that did arrive; the sender says so.
+/// Tells each notice's sender whether Discord accepted it. An error
+/// response means nothing was posted; any other error may hide a message
+/// that did arrive, and the sender says so.
 async fn post_notices(http: Arc<Http>, owner: UserId, mut queue: mpsc::Receiver<Notice>) {
-    while let Some(Notice { text, ack }) = queue.recv().await {
+    while let Some(Notice { text, destination, ack }) = queue.recv().await {
         let message = CreateMessage::new().content(text).allowed_mentions(CreateAllowedMentions::new());
 
-        let result = match owner.direct_message(http.as_ref(), message).await {
+        let sent = match destination {
+            Destination::Owner => owner.direct_message(http.as_ref(), message).await,
+            Destination::Channel(id) => ChannelId::from(id).send_message(http.as_ref(), message).await,
+        };
+
+        let result = match sent {
             Ok(_) => Ok(()),
-            Err(error) => Err(error.to_string()),
+            Err(serenity::Error::Http(HttpError::UnsuccessfulRequest(response))) => Err(Failure::Refused(response.error.message)),
+            Err(error) => Err(Failure::Unknown(error.to_string())),
         };
 
         let _ = ack.send(result);

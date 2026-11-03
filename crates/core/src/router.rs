@@ -27,12 +27,12 @@ use tokio::time::MissedTickBehavior;
 use crate::adapters::discord::Reply;
 use crate::authority::{Authority, Metered};
 use crate::error::BoxError;
+use crate::jobfiles::JobFiles;
 use crate::model::Model;
 use crate::notify::Notifier;
 use crate::policy::Policy;
 use crate::recovery;
 use crate::router::turn::{Step, Turn};
-use crate::sandbox::Sandbox;
 use crate::store::conversation::Conversations;
 use crate::store::db::Db;
 use crate::store::grants::Grants;
@@ -42,7 +42,7 @@ use crate::store::roots::{Adapter, Roots, Target};
 use crate::store::schedules::{Run, Schedules};
 use crate::store::state::States;
 use crate::store::usage::Usages;
-use crate::thread_config::ThreadTools;
+use crate::thread_config::{Services, ThreadTools};
 use crate::{tools, usage};
 
 /// Capacity of each reply stream between the router and a socket connection.
@@ -120,31 +120,31 @@ pub struct Router {
     discord: Option<Arc<Http>>,
     /// Reports failed work nobody is watching.
     notifier: Option<Notifier>,
+    job_files: Arc<JobFiles>,
 }
 
 impl Router {
     /// Built-in tools stay off: spawning has no limit hook (see docs/infinity-notes.md).
-    pub fn start(
-        model: Model, db: Db, policy: Arc<Policy>, sandbox: Option<Arc<Sandbox>>, discord: Option<Arc<Http>>, notifier: Option<Notifier>,
-    ) -> Self {
+    pub fn start(model: Model, db: Db, policy: Arc<Policy>, services: Services, discord: Option<Arc<Http>>) -> Self {
         let authority = Authority::new(Grants::new(db.clone()), Arc::clone(&policy));
         let conversations = Conversations::new(db.clone());
-        let tools = ThreadTools::new(conversations.clone(), authority.clone(), db.clone(), sandbox, notifier.clone());
+        let tools = ThreadTools::new(conversations.clone(), authority.clone(), db.clone(), services.clone());
         let model = Metered::new(model, authority, Usages::new(db.clone()));
         let builder = AgentSystemBuilder::new_local(conversations, States::new(db.clone()), model);
         let system = builder.without_builtin_tools().thread_config(tools).start();
 
-        Self::new(db, system, policy, discord, notifier)
+        Self::new(db, system, policy, discord, services)
     }
 
-    pub fn new(db: Db, system: System, policy: Arc<Policy>, discord: Option<Arc<Http>>, notifier: Option<Notifier>) -> Self {
+    pub fn new(db: Db, system: System, policy: Arc<Policy>, discord: Option<Arc<Http>>, services: Services) -> Self {
+        let Services { notifier, job_files, .. } = services;
         let inbox = Inbox::new(db.clone());
         let roots = Roots::new(db.clone());
         let operations = Operations::new(db.clone());
         let usages = Usages::new(db.clone());
         let schedules = Schedules::new(db.clone());
 
-        Self { db, policy, inbox, roots, operations, usages, schedules, system, discord, notifier }
+        Self { db, policy, inbox, roots, operations, usages, schedules, system, discord, notifier, job_files }
     }
 
     /// Handles input and runs due jobs until the channel closes. Must run

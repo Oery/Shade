@@ -72,6 +72,9 @@ pub enum Error {
     #[error("cannot resume work interrupted by the last shutdown: {0}")]
     Recovery(BoxError),
 
+    #[error("invalid job file {0}")]
+    JobFiles(String),
+
     #[error("cannot start the async runtime: {0}")]
     Runtime(std::io::Error),
 

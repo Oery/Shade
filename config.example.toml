@@ -63,15 +63,40 @@ caps = ["now"]
 # Variable holding the bot token, read like model.api_key_env.
 # token_env = "DISCORD_BOT_TOKEN"
 # Discord user IDs allowed to chat (Developer Mode, then "Copy User ID").
-# The first one also receives `notify` messages and failure notices in DMs.
+# The first one is `dm` for notifications, and receives failure notices.
 # owners = [123456789012345678]
+# Channels notifications and jobs can name (right-click, "Copy Channel ID").
+# Owner chat may also post to any channel by ID or #mention; a scheduled run
+# only to its job's channels.
+# [discord.channels]
+# alerts = 123456789012345678
 
 # Background runs started by scheduled jobs. Each run gets only the caps its
 # job was given, never more than [chat] holds, and never schedules/watches.
+#
+# Long-lived jobs can live in files, one per job, in a `jobs/` directory next
+# to this config: jobs/morning-brief.toml becomes job `morning-brief`. They
+# are read at startup (a bad file stops the daemon) and win over earlier
+# edits; run history and pause state are kept. Owner chat can draft and edit
+# them too. For example:
+#
+#   title = "Morning brief"
+#   cron = "0 8 * * 1-5"              # or: at = "2026-12-24T18:00:00+01:00"
+#   timezone = "Europe/Paris"         # optional; defaults to `timezone` above
+#   caps = ["now", "notify"]
+#   channels = ["dm", "alerts"]       # where runs may post; the first is the default
+#   prompt = """
+#   Summarize what the owner should know this morning.
+#   """
+#
 # [jobs]
 # Replaces Shade's default instructions, which tell the model that nobody
 # reads its replies and to use `notify` when the owner should know.
 # prompt = "You are running a background job."
+# Owner chat creates and changes jobs alone while they hold only these caps.
+# A job holding more waits for `/approve <code>` in Discord or
+# `shade schedule approve <code>`. Default:
+# agent_caps = ["now", "notify"]
 
 # Webhook sources. Hooks can never hold `schedules` or `watches`.
 # [hooks.github]

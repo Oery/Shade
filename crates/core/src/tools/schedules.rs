@@ -21,14 +21,19 @@ use serde::de::DeserializeOwned;
 
 use crate::authority::Authority;
 use crate::error::BoxError;
+use crate::jobfiles::{self, JobFiles};
+use crate::notify;
 use crate::policy::{self, Cap, Caps};
 use crate::schedule::{self, TriggerArgs};
+use crate::store::db::Db;
 use crate::store::operations::Operations;
-use crate::store::schedules::{Applied, Change, Definition, Receipt, Schedules};
+use crate::store::roots::{Adapter, Roots};
+use crate::store::schedules::{Applied, Change, Definition, MAX_JOBS, Receipt, Schedules};
 use crate::tools;
 
 const MAX_TITLE: usize = 100;
 const MAX_PROMPT: usize = 4000;
+const MAX_CHANNELS: usize = 10;
 
 #[derive(Clone, Copy, PartialEq)]
 pub enum Action {
@@ -63,6 +68,8 @@ pub struct Work {
     authority: Authority,
     schedules: Schedules,
     operations: Operations,
+    roots: Roots,
+    job_files: Arc<JobFiles>,
 }
 
 /// A call's result, and Shade's receipt for the owner when it changed something.
@@ -86,6 +93,9 @@ struct CreateArgs {
     prompt: String,
     trigger: TriggerArgs,
     caps: Vec<String>,
+    channels: Option<Vec<String>>,
+    /// Keep the job in `jobs/<file>.toml`, under that ID.
+    file: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -96,7 +106,15 @@ struct UpdateArgs {
     prompt: Option<String>,
     trigger: Option<TriggerArgs>,
     caps: Option<Vec<String>>,
+    channels: Option<Vec<String>>,
     paused: Option<bool>,
+}
+
+impl UpdateArgs {
+    /// Only pausing or resuming: the job does nothing new, so it needs no approval.
+    fn only_pausing(&self) -> bool {
+        self.title.is_none() && self.prompt.is_none() && self.trigger.is_none() && self.caps.is_none() && self.channels.is_none()
+    }
 }
 
 #[derive(Deserialize)]
@@ -106,8 +124,10 @@ struct DeleteArgs {
 }
 
 impl Work {
-    pub fn new(authority: Authority, schedules: Schedules, operations: Operations) -> Arc<Self> {
-        Arc::new(Self { authority, schedules, operations })
+    pub fn new(authority: Authority, db: Db, job_files: Arc<JobFiles>) -> Arc<Self> {
+        let (schedules, operations, roots) = (Schedules::new(db.clone()), Operations::new(db.clone()), Roots::new(db));
+
+        Arc::new(Self { authority, schedules, operations, roots, job_files })
     }
 }
 
@@ -183,7 +203,11 @@ impl Work {
             Err(error) => return Err(format!("cannot read earlier results: {error}")),
         }
 
-        let (change, text) = self.change(action, args, &authorized.caps).await?;
+        // Every change is read, written to its file and stored under one lock,
+        // so a job file never disagrees with SQLite while the daemon runs.
+        let _files = self.job_files.lock().await;
+        let (change, text) = self.change(action, args, &authorized.caps, &call.thread).await?;
+        self.write_file(&change)?;
 
         let receipt = Receipt { thread: thread.to_owned(), call: call.id.to_owned(), tool: action.name(), text };
 
@@ -201,11 +225,11 @@ impl Work {
     }
 
     /// The change a call asks for, validated, with its receipt.
-    async fn change(&self, action: Action, args: serde_json::Value, held: &Caps) -> Result<(Change, String), String> {
+    async fn change(&self, action: Action, args: serde_json::Value, held: &Caps, thread: &ThreadId) -> Result<(Change, String), String> {
         let now = Utc::now();
 
         match action {
-            Action::Create => self.create(parse(args)?, held, now),
+            Action::Create => self.create(parse(args)?, held, thread, now).await,
             Action::Update => self.update(parse(args)?, held, now).await,
             Action::Delete => self.delete(parse(args)?).await,
             Action::List => Err("schedule_list changes nothing".to_owned()),
@@ -214,13 +238,34 @@ impl Work {
 
     async fn list(&self) -> Result<String, String> {
         match self.schedules.list().await {
-            Ok(jobs) => Ok(schedule::list(&jobs)),
+            Ok(jobs) => match self.schedules.waiting(schedule::APPROVAL_WINDOW).await {
+                Ok(waiting) => Ok(schedule::list(&jobs, &waiting)),
+                Err(error) => Err(format!("cannot read pending changes: {error}")),
+            },
             Err(error) => Err(format!("cannot read jobs: {error}")),
         }
     }
 
-    fn create(&self, args: CreateArgs, held: &Caps, now: DateTime<Utc>) -> Result<(Change, String), String> {
+    /// A file job is written to its file before SQLite: the files win at startup.
+    fn write_file(&self, change: &Change) -> Result<(), String> {
+        match change {
+            Change::Create { id, definition } | Change::Update { id, definition, .. } if definition.file => {
+                self.job_files.write(id, definition)
+            }
+            Change::Delete { id, file: true } => self.job_files.remove(id),
+            _ => Ok(()),
+        }
+    }
+
+    async fn create(&self, args: CreateArgs, held: &Caps, thread: &ThreadId, now: DateTime<Utc>) -> Result<(Change, String), String> {
         let timing = schedule::timing(args.trigger, self.authority.policy().timezone, now)?;
+
+        let channels = match args.channels {
+            Some(channels) => self.channels(channels)?,
+            None => vec![self.home_channel(thread).await?],
+        };
+
+        let (id, file) = self.new_id(args.file).await?;
 
         let definition = Definition {
             title: bounded("title", args.title, MAX_TITLE)?,
@@ -229,16 +274,98 @@ impl Work {
             timezone: timing.timezone.name().to_owned(),
             prompt: bounded("prompt", args.prompt, MAX_PROMPT)?,
             caps: delegate(args.caps, held)?,
+            channels,
+            file,
             enabled: true,
             next_at: Some(timing.next_at.timestamp()),
         };
 
-        let mut id = uuid::Uuid::new_v4().simple().to_string();
-        id.truncate(8);
-
         let text = format!("📅 Created scheduled job {}", schedule::describe(&id, &definition));
 
-        Ok((Change::Create { id, definition }, text))
+        Ok(self.gate(id, None, definition, text))
+    }
+
+    /// A short random ID, or the job file name, which must be new.
+    async fn new_id(&self, file: Option<String>) -> Result<(String, bool), String> {
+        let count = match self.schedules.list().await {
+            Ok(jobs) => jobs.len(),
+            Err(error) => return Err(format!("cannot read jobs: {error}")),
+        };
+
+        if count >= usize::try_from(MAX_JOBS).unwrap_or(usize::MAX) {
+            return Err(format!("there are already {MAX_JOBS} jobs; delete one first"));
+        }
+
+        let Some(name) = file else {
+            let mut id = uuid::Uuid::new_v4().simple().to_string();
+            id.truncate(8);
+
+            return Ok((id, false));
+        };
+
+        jobfiles::check_name(&name)?;
+
+        match self.schedules.exists(&name).await {
+            Ok(false) => Ok((name, true)),
+            Ok(true) => Err(format!("a job named {name} exists or existed; choose another file name")),
+            Err(error) => Err(format!("cannot read jobs: {error}")),
+        }
+    }
+
+    /// A job holding caps beyond `[jobs] agent_caps` changes only when the
+    /// owner approves: Shade shows what would change and a code for it.
+    fn gate(&self, id: String, base_version: Option<i64>, definition: Definition, receipt: String) -> (Change, String) {
+        let agent_caps = &self.authority.policy().agent_caps;
+        let beyond: Vec<&str> =
+            definition.caps.iter().map(String::as_str).filter(|name| !agent_caps.iter().any(|cap| cap.name() == *name)).collect();
+
+        if beyond.is_empty() {
+            let change = match base_version {
+                Some(version) => Change::Update { id, version, definition },
+                None => Change::Create { id, definition },
+            };
+
+            return (change, receipt);
+        }
+
+        let mut code = uuid::Uuid::new_v4().simple().to_string();
+        code.truncate(6);
+
+        let text = format!(
+            "⏳ This change needs the owner's approval because the job would hold {} (beyond [jobs] agent_caps). \
+             Approve with `/approve {code}` in Discord or `shade schedule approve {code}` within 24 hours.\n{receipt}",
+            beyond.join(", ")
+        );
+
+        (Change::Propose { code, id, base_version, definition, receipt }, text)
+    }
+
+    /// The channel of the conversation `thread` belongs to, or the owner's DMs.
+    async fn home_channel(&self, thread: &ThreadId) -> Result<String, String> {
+        match self.roots.conversation_of(thread).await {
+            Ok(Some((Adapter::Discord, key))) => Ok(notify::channel(&key, &self.authority.policy().channels)?.0),
+            Ok(_) => Ok("dm".to_owned()),
+            Err(error) => Err(format!("cannot find this conversation's channel: {error}")),
+        }
+    }
+
+    /// Owner chat may give a job any channel; each is checked and stored in one spelling.
+    fn channels(&self, written: Vec<String>) -> Result<Vec<String>, String> {
+        if written.is_empty() || written.len() > MAX_CHANNELS {
+            return Err(format!("give between 1 and {MAX_CHANNELS} channels"));
+        }
+
+        let mut channels = Vec::new();
+
+        for channel in written {
+            let (stored, _) = notify::channel(&channel, &self.authority.policy().channels)?;
+
+            if !channels.contains(&stored) {
+                channels.push(stored);
+            }
+        }
+
+        Ok(channels)
     }
 
     /// Changes only what is given. A new trigger counts from now and
@@ -250,7 +377,12 @@ impl Work {
             Err(error) => return Err(format!("cannot read job {}: {error}", args.id)),
         };
 
+        let only_pausing = args.only_pausing();
         let mut definition = job.definition;
+
+        if let Some(channels) = args.channels {
+            definition.channels = self.channels(channels)?;
+        }
 
         if let Some(title) = args.title {
             definition.title = bounded("title", title, MAX_TITLE)?;
@@ -281,7 +413,11 @@ impl Work {
 
         let text = format!("📅 Updated scheduled job {}", schedule::describe(&job.id, &definition));
 
-        Ok((Change::Update { id: job.id, version: job.version, definition }, text))
+        if only_pausing {
+            return Ok((Change::Update { id: job.id, version: job.version, definition }, text));
+        }
+
+        Ok(self.gate(job.id, Some(job.version), definition, text))
     }
 
     async fn delete(&self, args: DeleteArgs) -> Result<(Change, String), String> {
@@ -296,7 +432,7 @@ impl Work {
             job.definition.title, job.id
         );
 
-        Ok((Change::Delete { id: job.id }, text))
+        Ok((Change::Delete { id: job.id, file: job.definition.file }, text))
     }
 }
 
@@ -357,12 +493,14 @@ fn describe(action: Action) -> String {
         Action::Create => {
             "Create a scheduled job: at each trigger, a fresh background run gets `prompt` and only `caps`. The run does \
              not see this conversation, so write a self-contained prompt; it reaches the owner only through notify, so \
-             reminders need the notify cap. The owner is shown a receipt."
+             reminders need the notify cap. A job holding caps beyond the owner's agent_caps waits for their approval. \
+             The owner is shown a receipt."
         }
         Action::List => "List scheduled jobs with their triggers, next runs, caps, prompts, and last runs.",
         Action::Update => {
             "Change a scheduled job; omitted fields stay as they are. A new trigger counts from now and resumes the job. \
-             paused stops or resumes runs. Runs already started keep their old definition. The owner is shown a receipt."
+             paused stops or resumes runs. Runs already started keep their old definition. A change leaving the job \
+             with caps beyond the owner's agent_caps waits for their approval. The owner is shown a receipt."
         }
         Action::Delete => "Delete a scheduled job. Its run history is kept. The owner is shown a receipt.",
     };
@@ -381,6 +519,12 @@ fn parameters(action: Action, delegable: &Caps, timezone: &str) -> serde_json::V
                 "prompt": { "type": "string", "maxLength": MAX_PROMPT, "description": "What each run should do, self-contained." },
                 "trigger": trigger(timezone),
                 "caps": caps(delegable),
+                "channels": channels(),
+                "file": {
+                    "type": "string",
+                    "description": "Keep a long-lived job in the owner's job files as jobs/<file>.toml, under this ID \
+                                    (lowercase letters, digits, - and _). Omit for reminders and short-lived jobs.",
+                },
             },
             "required": ["title", "prompt", "trigger", "caps"],
             "additionalProperties": false,
@@ -394,6 +538,7 @@ fn parameters(action: Action, delegable: &Caps, timezone: &str) -> serde_json::V
                 "prompt": { "type": "string", "maxLength": MAX_PROMPT },
                 "trigger": trigger(timezone),
                 "caps": caps(delegable),
+                "channels": channels(),
                 "paused": { "type": "boolean" },
             },
             "required": ["id"],
@@ -443,6 +588,15 @@ fn trigger(timezone: &str) -> serde_json::Value {
     })
 }
 
+fn channels() -> serde_json::Value {
+    serde_json::json!({
+        "type": "array",
+        "items": { "type": "string" },
+        "description": "Where runs may notify, the first by default: `dm` (the owner's DMs), a configured channel \
+                        name, a channel ID, or a `<#id>` mention the owner wrote. Defaults to this conversation.",
+    })
+}
+
 fn caps(delegable: &Caps) -> serde_json::Value {
     let names: Vec<&str> = delegable.iter().map(|cap| cap.name()).collect();
     let described: Vec<String> = delegable.iter().map(|cap| format!("{}: {}", cap.name(), cap.description())).collect();
@@ -471,31 +625,37 @@ mod tests {
     use super::{Action, Answer, Call, Work};
     use crate::authority::Authority;
     use crate::error::BoxError;
+    use crate::jobfiles::JobFiles;
     use crate::policy::{Cap, Limits};
     use crate::store::conversation::Conversations;
     use crate::store::db::Db;
     use crate::store::grants::Grants;
-    use crate::store::operations::Operations;
     use crate::store::schedules::Schedules;
-    use crate::testing;
+    use crate::testing::{self, Dirs};
 
     struct Setup {
         work: Arc<Work>,
         schedules: Schedules,
         grants: Grants,
+        job_files: Arc<JobFiles>,
+        _dirs: Dirs,
     }
 
-    async fn setup() -> Result<Setup, BoxError> {
+    /// Owner chat holding `caps` and `schedules`; `[jobs] agent_caps` is `now` and `notify`.
+    async fn setup(caps: &[Cap]) -> Result<Setup, BoxError> {
         let db = Db::in_memory()?;
         Conversations::new(db.clone()).register_root(&ThreadId::from("chat".to_owned())).await?;
 
-        let grants = Grants::new(db.clone());
-        let policy = testing::policy(&[Cap::Now, Cap::Notify, Cap::Schedules], Limits::default());
-        let authority = Authority::new(grants.clone(), policy);
-        let schedules = Schedules::new(db.clone());
-        let work = Work::new(authority, schedules.clone(), Operations::new(db));
+        let mut caps = caps.to_vec();
+        caps.push(Cap::Schedules);
 
-        Ok(Setup { work, schedules, grants })
+        let grants = Grants::new(db.clone());
+        let authority = Authority::new(grants.clone(), testing::policy(&caps, Limits::default()));
+        let dirs = Dirs::new();
+        let job_files = Arc::new(JobFiles::new(dirs.root.join("jobs")));
+        let work = Work::new(authority, db.clone(), Arc::clone(&job_files));
+
+        Ok(Setup { work, schedules: Schedules::new(db), grants, job_files, _dirs: dirs })
     }
 
     async fn call(work: &Work, thread: &str, action: Action, id: &str, args: serde_json::Value) -> Result<Answer, String> {
@@ -526,7 +686,7 @@ mod tests {
     /// job exactly as it was. A scheduled run cannot manage jobs at all.
     #[tokio::test]
     async fn repeated_and_refused_calls_change_nothing() -> Result<(), BoxError> {
-        let Setup { work, schedules, .. } = setup().await?;
+        let Setup { work, schedules, .. } = setup(&[Cap::Now, Cap::Notify]).await?;
 
         let Ok(Answer { text: receipt, shown: Some(_) }) = call(&work, "chat", Action::Create, "call-1", create_args()).await else {
             return Err("the job was not created".into());
@@ -566,7 +726,7 @@ mod tests {
     /// New caps reach runs started after the update, never one already running.
     #[tokio::test]
     async fn updated_caps_reach_only_later_runs() -> Result<(), BoxError> {
-        let Setup { work, schedules, grants } = setup().await?;
+        let Setup { work, schedules, grants, .. } = setup(&[Cap::Now, Cap::Notify]).await?;
         call(&work, "chat", Action::Create, "call-1", create_args()).await?;
         let id = schedules.list().await?.into_iter().map(|job| job.id).next().unwrap_or_default();
 
@@ -584,6 +744,32 @@ mod tests {
             let caps = grants.of(&root).await?.and_then(|grant| grant.caps);
             assert_eq!(caps, Some(vec![expected.to_owned()]));
         }
+
+        Ok(())
+    }
+
+    /// Owner chat changes a job alone while it stays within `[jobs]
+    /// agent_caps`; beyond them nothing changes until the owner approves.
+    /// A job file is written only for a change that applied.
+    #[tokio::test]
+    async fn powerful_jobs_wait_for_approval() -> Result<(), BoxError> {
+        let Setup { work, schedules, job_files, .. } = setup(&[Cap::Now, Cap::Notify, Cap::Shell]).await?;
+        let file_job = |caps: &[&str], name: &str| json!({ "title": "Brief", "prompt": "Summarize.", "trigger": { "kind": "cron", "expression": "0 8 * * *" }, "caps": caps, "file": name });
+
+        let within = call(&work, "chat", Action::Create, "call-1", file_job(&["now", "notify"], "light")).await?;
+        assert!(within.shown.is_some_and(|text| text.starts_with("📅")));
+        assert!(job_files.path("light").exists(), "the job file was not written");
+
+        let beyond = call(&work, "chat", Action::Create, "call-2", file_job(&["now", "shell"], "heavy")).await?;
+        assert!(beyond.text.contains("needs the owner's approval"), "{}", beyond.text);
+        assert!(schedules.get("heavy").await?.is_none(), "a job beyond agent_caps was created without approval");
+        assert!(!job_files.path("heavy").exists(), "a waiting change wrote its file");
+
+        // Widening a job past agent_caps waits too, and leaves it as it was.
+        let widen = call(&work, "chat", Action::Update, "call-3", json!({ "id": "light", "caps": ["shell"] })).await?;
+        assert!(widen.text.contains("needs the owner's approval"));
+        let caps = schedules.get("light").await?.map(|job| job.definition.caps);
+        assert_eq!(caps, Some(vec!["now".to_owned(), "notify".to_owned()]));
 
         Ok(())
     }

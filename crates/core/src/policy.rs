@@ -169,6 +169,11 @@ pub struct Policy {
     pub chat_prompt: Option<String>,
     /// Replaces the default system prompt addition of background runs.
     pub jobs_prompt: Option<String>,
+    /// Owner chat changes a job alone only while the job stays within
+    /// these; beyond them the owner approves each change.
+    pub agent_caps: Caps,
+    /// Named Discord channels, for notifications.
+    pub channels: BTreeMap<String, u64>,
     pub hooks: BTreeMap<String, Caps>,
     pub limits: Limits,
     pub timezone: Tz,
@@ -178,6 +183,14 @@ impl Policy {
     /// Checks the rules config parsing cannot express.
     pub fn validate(&self) -> Result<(), String> {
         check_caps("[chat]", &self.chat)?;
+
+        if let Some(cap) = self.agent_caps.iter().find(|cap| cap.is_management()) {
+            return Err(format!("[jobs] agent_caps: `{}` belongs to owner chat and cannot be given to a job", cap.name()));
+        }
+
+        for (name, id) in &self.channels {
+            check_channel(name, *id)?;
+        }
 
         for (name, caps) in &self.hooks {
             let section = format!("[hooks.{name}]");
@@ -234,6 +247,23 @@ pub fn delegable(caps: &Caps) -> Caps {
     caps.iter().copied().filter(|cap| !cap.is_management()).collect()
 }
 
+/// Channel names are short words that cannot be mistaken for `dm` or an ID.
+fn check_channel(name: &str, id: u64) -> Result<(), String> {
+    let word = name.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '_');
+
+    if name == "dm" || name.is_empty() || name.len() > 32 || !word || name.chars().all(|c| c.is_ascii_digit()) {
+        return Err(format!(
+            "[discord.channels]: `{name}` must be a short lowercase word other than `dm`, not only digits"
+        ));
+    }
+
+    if id == 0 {
+        return Err(format!("[discord.channels]: `{name}` has no channel ID"));
+    }
+
+    Ok(())
+}
+
 fn check_caps(section: &str, caps: &Caps) -> Result<(), String> {
     if caps.contains(&Cap::ShellNetwork) && !caps.contains(&Cap::Shell) {
         return Err(format!("{section}: `shell_network` requires `shell`"));
@@ -257,7 +287,16 @@ mod tests {
     fn policy(chat: &[Cap], hooks: Hooks<'_>) -> Policy {
         let hooks = hooks.iter().map(|(name, list)| ((*name).to_owned(), caps(list))).collect::<BTreeMap<_, _>>();
 
-        Policy { chat: caps(chat), chat_prompt: None, jobs_prompt: None, hooks, limits: Limits::default(), timezone: chrono_tz::UTC }
+        Policy {
+            chat: caps(chat),
+            chat_prompt: None,
+            jobs_prompt: None,
+            agent_caps: Caps::new(),
+            channels: BTreeMap::new(),
+            hooks,
+            limits: Limits::default(),
+            timezone: chrono_tz::UTC,
+        }
     }
 
     fn grant(origin: Origin, source: &str, requested: Option<&[&str]>) -> Grant {

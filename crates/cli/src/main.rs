@@ -55,6 +55,8 @@ enum Manage {
     Resume { id: String },
     /// Delete a definition.
     Rm { id: String },
+    /// Apply a change owner chat proposed, by the code in its receipt.
+    Approve { code: String },
 }
 
 #[derive(Subcommand)]
@@ -70,6 +72,7 @@ impl From<Manage> for shade_proto::Manage {
             Manage::Pause { id } => Self::Pause { id },
             Manage::Resume { id } => Self::Resume { id },
             Manage::Rm { id } => Self::Rm { id },
+            Manage::Approve { code } => Self::Approve { code },
         }
     }
 }

@@ -10,9 +10,10 @@ use tokio::sync::mpsc;
 use super::{Outbound, Router, SUPERSEDED};
 use crate::notify::Notifier;
 use crate::router::turn::Step;
+use crate::schedule::APPROVAL_WINDOW;
 use crate::schedule::{self, Trigger};
 use crate::store::db::DbError;
-use crate::store::schedules::{Due, Run, Schedules};
+use crate::store::schedules::{Change, Definition, Due, Run, Schedules};
 
 impl Router {
     /// Claims every due occurrence, then starts queued runs while capacity allows.
@@ -67,6 +68,90 @@ impl Router {
         Ok(())
     }
 
+    /// Makes the jobs table match the job files. Runs at startup; the error names a bad file.
+    pub async fn load_job_files(&self, now: DateTime<Utc>) -> Result<(), String> {
+        let stored = match self.schedules.list().await {
+            Ok(jobs) => jobs,
+            Err(error) => return Err(format!("cannot read jobs: {error}")),
+        };
+
+        let files = self.job_files.load(&self.policy, &stored, now)?;
+        let present: Vec<String> = files.iter().map(|(id, _)| id.to_owned()).collect();
+
+        let changed: Vec<(String, Definition)> =
+            files.into_iter().filter(|(id, definition)| !stored.iter().any(|job| &job.id == id && &job.definition == definition)).collect();
+
+        tracing::info!(files = present.len(), changed = changed.len(), "loaded job files");
+
+        match self.schedules.sync_files(present, changed).await {
+            Ok(()) => Ok(()),
+            Err(error) => Err(format!("cannot store job files: {error}")),
+        }
+    }
+
+    /// Applies a change owner chat proposed, if it is recent and the job has
+    /// not changed since. A cron job's next run counts from now; a one-shot
+    /// job whose time has passed is refused rather than run late.
+    pub(super) async fn approve(&self, code: String, now: DateTime<Utc>) -> Result<String, String> {
+        let _files = self.job_files.lock().await;
+
+        let mut pending = match self.schedules.pending(&code).await {
+            Ok(Some(pending)) => pending,
+            Ok(None) => return Err(format!("no change waits under code {code}")),
+            Err(error) => return Err(format!("cannot read pending changes: {error}")),
+        };
+
+        if now.timestamp() - pending.created_at > APPROVAL_WINDOW {
+            return Err(format!("change {code} expired; ask for it again"));
+        }
+
+        self.still_current(&pending.job, pending.base_version).await?;
+
+        if pending.definition.enabled {
+            let next = schedule::resumed_next(&pending.definition, now)?;
+
+            if next <= now.timestamp() {
+                return Err(format!("the time of change {code} has passed; ask for it again"));
+            }
+
+            pending.definition.next_at = Some(next);
+        }
+
+        if pending.definition.file {
+            self.job_files.write(&pending.job, &pending.definition)?;
+        }
+
+        let change = match pending.base_version {
+            Some(version) => Change::Update { id: pending.job, version, definition: pending.definition },
+            None => Change::Create { id: pending.job, definition: pending.definition },
+        };
+
+        match self.schedules.approve(&code, change).await {
+            Ok(None) => Ok(pending.receipt),
+            Ok(Some(refusal)) => Err(refusal),
+            Err(error) => Err(format!("cannot apply change {code}: {error}")),
+        }
+    }
+
+    /// Refuses a change drafted against a job that has changed since, or a new job whose name was taken.
+    async fn still_current(&self, id: &str, base_version: Option<i64>) -> Result<(), String> {
+        let current = match self.schedules.get(id).await {
+            Ok(job) => job.map(|job| job.version),
+            Err(error) => return Err(format!("cannot read job {id}: {error}")),
+        };
+
+        let taken = match base_version {
+            Some(_) => false,
+            None => matches!(self.schedules.exists(id).await, Ok(true)),
+        };
+
+        if current != base_version || taken {
+            return Err(format!("job {id} changed since this change was drafted; ask for it again"));
+        }
+
+        Ok(())
+    }
+
     pub(super) fn run_outbound(&self, run: Run) -> Outbound {
         Outbound::Run { run, schedules: self.schedules.clone(), notifier: self.notifier.clone() }
     }
@@ -95,6 +180,7 @@ impl Router {
             Manage::Pause { id } => self.pause_job(id).await,
             Manage::Resume { id } => self.resume_job(id, Utc::now()).await,
             Manage::Rm { id } => self.delete_job(id).await,
+            Manage::Approve { code } => self.approve(code, Utc::now()).await,
         };
 
         let text = match result {
@@ -112,7 +198,10 @@ impl Router {
 
     async fn list_jobs(&self) -> Result<String, String> {
         match self.schedules.list().await {
-            Ok(jobs) => Ok(schedule::list(&jobs)),
+            Ok(jobs) => match self.schedules.waiting(APPROVAL_WINDOW).await {
+                Ok(waiting) => Ok(schedule::list(&jobs, &waiting)),
+                Err(error) => Err(format!("cannot read pending changes: {error}")),
+            },
             Err(error) => Err(format!("cannot read jobs: {error}")),
         }
     }
@@ -125,7 +214,16 @@ impl Router {
         }
     }
 
+    /// A file job loses its file too, or it would come back at the next start.
     async fn delete_job(&self, id: String) -> Result<String, String> {
+        let _files = self.job_files.lock().await;
+
+        if let Ok(Some(job)) = self.schedules.get(&id).await
+            && job.definition.file
+        {
+            self.job_files.remove(&id)?;
+        }
+
         match self.schedules.delete(id.to_owned()).await {
             Ok(true) => Ok(format!("Deleted {id}. Its run history is kept; a run already queued or running still finishes.")),
             Ok(false) => Err(format!("no job {id}")),

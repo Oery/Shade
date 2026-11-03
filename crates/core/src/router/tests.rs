@@ -5,7 +5,7 @@
 
 use std::time::Duration;
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, TimeDelta, Utc};
 use infinity_agent_core::ThreadId;
 use infinity_agent_core::message::InfinityMessage;
 use infinity_agent_core::traits::ConversationStore;
@@ -230,4 +230,90 @@ async fn second_scheduler(db: &Db, now: DateTime<Utc>) -> Result<(), BoxError> {
     }
 
     Ok(())
+}
+
+/// An approved change applies once and only while fresh: a change drafted
+/// before another one applied, or older than a day, does nothing.
+#[tokio::test(flavor = "current_thread")]
+async fn approvals_apply_only_fresh_changes() -> Result<(), BoxError> {
+    within(async {
+        let db = Db::in_memory()?;
+        let (router, _model) = testing::router(&db, testing::policy(&[Cap::Now], Limits::default())).await?;
+        let schedules = Schedules::new(db.clone());
+        let now = Utc::now();
+        schedules.add("tea", "cron", "0 16 * * *", now.timestamp() + 3600).await?;
+
+        schedules.propose("first", "tea", Some(1), "Green tea").await?;
+        schedules.propose("second", "tea", Some(1), "Black tea").await?;
+
+        assert!(router.approve("first".to_owned(), now).await.is_ok());
+        assert!(router.approve("first".to_owned(), now).await.is_err(), "a change applied twice");
+        assert!(
+            router.approve("second".to_owned(), now).await.is_err(),
+            "a change drafted against an old version applied"
+        );
+
+        schedules.propose("late", "tea", Some(2), "Mint tea").await?;
+        let tomorrow = now + TimeDelta::hours(25);
+        assert!(router.approve("late".to_owned(), tomorrow).await.is_err(), "an expired change applied");
+
+        let job = schedules.get("tea").await?.map(|job| (job.version, job.definition.title));
+        assert_eq!(job, Some((2, "Green tea".to_owned())));
+
+        Ok(())
+    })
+    .await
+}
+
+/// Job files win at startup without losing what SQLite keeps: runs and
+/// pause state survive, changed timing counts from now, and a removed
+/// file deletes its job.
+#[tokio::test(flavor = "current_thread")]
+async fn job_files_sync_at_startup() -> Result<(), BoxError> {
+    within(async {
+        let db = Db::in_memory()?;
+        let (router, _model) = testing::router(&db, testing::policy(&[Cap::Now], Limits::default())).await?;
+        let schedules = Schedules::new(db.clone());
+        let path = router.job_files.path("brief");
+        let now: DateTime<Utc> = "2026-11-03T12:00:00Z".parse()?;
+        let file = |hour: u32| {
+            format!("title = \"Brief\"\ncron = \"0 {hour} * * *\"\ntimezone = \"Europe/Paris\"\ncaps = [\"now\"]\nprompt = \"Hi\"\n")
+        };
+
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
+
+        std::fs::write(&path, file(8))?;
+        router.load_job_files(now).await?;
+
+        let next = schedules.get("brief").await?.and_then(|job| job.definition.next_at);
+        assert_eq!(next, Some("2026-11-04T07:00:00Z".parse::<DateTime<Utc>>()?.timestamp()));
+        schedules.claim("brief".to_owned(), next.unwrap_or_default(), next.map(|next| next + 86_400)).await?;
+        schedules.pause("brief".to_owned()).await?;
+
+        // Unchanged file: nothing moves.
+        router.load_job_files(now).await?;
+        let job = schedules.get("brief").await?.map(|job| (job.version, job.definition.enabled));
+        assert_eq!(job, Some((1, false)));
+
+        // New timing counts from now and stays paused.
+        std::fs::write(&path, file(9))?;
+        router.load_job_files(now).await?;
+        let job = schedules.get("brief").await?.map(|job| (job.version, job.definition.enabled, job.definition.next_at));
+        let nine = "2026-11-04T08:00:00Z".parse::<DateTime<Utc>>()?.timestamp();
+        assert_eq!(job, Some((2, false, Some(nine))));
+
+        std::fs::remove_file(&path)?;
+        router.load_job_files(now).await?;
+        assert!(schedules.get("brief").await?.is_none(), "a job outlived its file");
+        assert_eq!(schedules.statuses().await?, ["queued"], "the job's runs were lost");
+
+        if let Some(dir) = path.parent() {
+            std::fs::remove_dir_all(dir)?;
+        }
+
+        Ok(())
+    })
+    .await
 }
