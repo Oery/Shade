@@ -92,6 +92,11 @@ impl Authority {
         Ok(authorized)
     }
 
+    /// Admits one message to the owner. The `notify` call was admitted first.
+    pub async fn admit_notification(&self, thread: &ThreadId<str>) -> Result<(), Denied> {
+        self.charge(thread, Charge::Notification).await
+    }
+
     /// Admits one request to the model provider.
     pub async fn admit_completion(&self, thread: &ThreadId<str>) -> Result<(), Denied> {
         self.authorize(thread).await?;

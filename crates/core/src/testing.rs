@@ -16,6 +16,7 @@ use tokio::task::LocalSet;
 use crate::authority::{Authority, Metered};
 use crate::config::{Isolation, SandboxConfig};
 use crate::error::BoxError;
+use crate::notify::Notifier;
 use crate::policy::{Cap, Limits, Policy};
 use crate::router::Router;
 use crate::sandbox::paths::Protected;
@@ -60,10 +61,13 @@ pub async fn start(db: &Db) -> Result<Harness, BoxError> {
 }
 
 pub async fn start_with(db: &Db, policy: Arc<Policy>) -> Result<Harness, BoxError> {
-    start_sandboxed(db, policy, None).await
+    start_with_tools(db, policy, None, None).await
 }
 
-pub async fn start_sandboxed(db: &Db, policy: Arc<Policy>, sandbox: Option<Arc<Sandbox>>) -> Result<Harness, BoxError> {
+/// A system whose tools can reach `sandbox` and `notifier`.
+pub async fn start_with_tools(
+    db: &Db, policy: Arc<Policy>, sandbox: Option<Arc<Sandbox>>, notifier: Option<Notifier>,
+) -> Result<Harness, BoxError> {
     let (mock, model) = mock_model();
     let entry = ModelEntry {
         model_id: "mock".to_owned(),
@@ -76,7 +80,7 @@ pub async fn start_sandboxed(db: &Db, policy: Arc<Policy>, sandbox: Option<Arc<S
 
     let authority = Authority::new(Grants::new(db.clone()), policy);
     let conversations = Conversations::new(db.clone());
-    let tools = ThreadTools::new(conversations.clone(), authority.clone(), Operations::new(db.clone()), sandbox);
+    let tools = ThreadTools::new(conversations.clone(), authority.clone(), Operations::new(db.clone()), sandbox, notifier);
     let metered = Metered::new(static_model, authority.clone(), Usages::new(db.clone()));
     let builder = AgentSystemBuilder::new_local(conversations.clone(), States::new(db.clone()), metered);
     let system = builder.without_builtin_tools().thread_config(tools).start();
@@ -88,7 +92,7 @@ pub async fn start_sandboxed(db: &Db, policy: Arc<Policy>, sandbox: Option<Arc<S
 pub async fn router(db: &Db, policy: Arc<Policy>) -> Result<(Router, MockModelController), BoxError> {
     let Harness { system, model, .. } = start_with(db, policy).await?;
 
-    Ok((Router::new(db.clone(), system, None), model))
+    Ok((Router::new(db.clone(), system, None, None), model))
 }
 
 /// Attaches to a registered thread and waits out the idle its attach-spawned driver emits.

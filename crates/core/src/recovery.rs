@@ -102,7 +102,7 @@ mod tests {
 
     async fn first_daemon(db: &Db, dirs: &Dirs, command: &str, wait_for_result: bool) -> Result<(), BoxError> {
         let policy = testing::policy(&[Cap::Shell], Limits::default());
-        let mut harness = testing::start_sandboxed(db, policy, Some(Arc::new(dirs.bubblewrap()))).await?;
+        let mut harness = testing::start_with_tools(db, policy, Some(Arc::new(dirs.bubblewrap())), None).await?;
         let handle = attach(&mut harness, &root()).await?;
 
         handle.send(InputMessage::user_text(root(), "run it"), "input-1").await?;

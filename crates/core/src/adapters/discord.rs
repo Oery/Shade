@@ -5,6 +5,9 @@
 //! channel are visible to everyone who can read it, so private work belongs
 //! in DMs. The bot never pings anyone: replies allow no mentions.
 //!
+//! Notifications go to the first owner's DMs, which are also that owner's
+//! DM conversation with the bot.
+//!
 //! Discord gives a bot a role with its own name, and "@Shade" in autocomplete
 //! may pick that role instead of the bot. A mention of the bot's role counts
 //! as a mention of the bot. Discord withholds the text of such messages
@@ -15,7 +18,7 @@ use std::sync::{Arc, OnceLock};
 
 use serenity::all::{
     ChannelId, Client, Context, CreateAllowedMentions, CreateMessage, EventHandler, GatewayIntents, Http, Message, MessageId, Ready,
-    ShardManager, Typing,
+    ShardManager, Typing, UserId,
 };
 use serenity::async_trait;
 use shade_proto::Response;
@@ -23,6 +26,7 @@ use thiserror::Error;
 use tokio::sync::mpsc;
 
 use crate::config::DiscordConfig;
+use crate::notify::Notice;
 use crate::router::turn::Step;
 use crate::router::{Inbound, Outbound, REPLY_QUEUE};
 use crate::secrets::Secrets;
@@ -43,6 +47,9 @@ pub enum DiscordError {
     #[error("[discord] owners is empty; list the Discord user IDs allowed to chat")]
     NoOwners,
 
+    #[error("[discord] owners starts with 0, which is not a Discord user ID; the first owner receives notifications")]
+    InvalidOwner,
+
     #[error("{0} ([discord] token_env) is not set in the environment or the .env file next to the config")]
     MissingToken(String),
 
@@ -53,13 +60,19 @@ pub enum DiscordError {
 /// A connected client, not yet listening.
 pub struct Discord {
     client: Client,
+    /// Receives notifications.
+    owner: UserId,
 }
 
 impl Discord {
     pub async fn connect(config: DiscordConfig, secrets: &mut Secrets, inbound: mpsc::Sender<Inbound>) -> Result<Self, DiscordError> {
-        if config.owners.is_empty() {
+        let Some(&first) = config.owners.first() else {
             return Err(DiscordError::NoOwners);
-        }
+        };
+
+        let Some(owner) = NonZeroU64::new(first) else {
+            return Err(DiscordError::InvalidOwner);
+        };
 
         let Some(token) = secrets.take(&config.token_env) else {
             return Err(DiscordError::MissingToken(config.token_env));
@@ -68,7 +81,7 @@ impl Discord {
         let handler = Handler { inbound, owners: config.owners, bot: OnceLock::new() };
         let intents = GatewayIntents::DIRECT_MESSAGES | GatewayIntents::GUILD_MESSAGES | GatewayIntents::MESSAGE_CONTENT;
         match Client::builder(&token, intents).event_handler(handler).await {
-            Ok(client) => Ok(Self { client }),
+            Ok(client) => Ok(Self { client, owner: UserId::from(owner) }),
             Err(source) => Err(DiscordError::Client(Box::new(source))),
         }
     }
@@ -76,6 +89,12 @@ impl Discord {
     /// For posting replies to resumed work before the gateway is up.
     pub fn http(&self) -> Arc<Http> {
         Arc::clone(&self.client.http)
+    }
+
+    /// Posts each notice to the owner's DMs until every notifier is gone.
+    /// Works before the gateway is up, like replies to resumed work.
+    pub fn notices(&self, queue: mpsc::Receiver<Notice>) -> impl Future<Output = ()> + Send + 'static {
+        post_notices(self.http(), self.owner, queue)
     }
 
     pub fn shards(&self) -> Arc<ShardManager> {
@@ -307,6 +326,21 @@ impl Reply {
         }
 
         self.buffer.clear();
+    }
+}
+
+/// Tells each notice's sender whether Discord accepted it. An error after
+/// the request left may hide a message that did arrive; the sender says so.
+async fn post_notices(http: Arc<Http>, owner: UserId, mut queue: mpsc::Receiver<Notice>) {
+    while let Some(Notice { text, ack }) = queue.recv().await {
+        let message = CreateMessage::new().content(text).allowed_mentions(CreateAllowedMentions::new());
+
+        let result = match owner.direct_message(http.as_ref(), message).await {
+            Ok(_) => Ok(()),
+            Err(error) => Err(error.to_string()),
+        };
+
+        let _ = ack.send(result);
     }
 }
 

@@ -71,6 +71,21 @@ impl Grants {
 
         self.db.call(move |connection| charge_budget(connection, &id, charge, limits)).await
     }
+
+    /// Takes the one runtime failure notice of `thread`'s budget. `false`
+    /// when it was taken before, or the thread has no budget.
+    pub async fn claim_failure_notice(&self, thread: &ThreadId<str>) -> Result<bool, DbError> {
+        let id = thread.as_str().to_owned();
+
+        self.db
+            .call(move |connection| {
+                let sql = "UPDATE budgets SET failure_noticed = 1
+                           WHERE failure_noticed = 0 AND id = (SELECT budget_id FROM threads WHERE id = ?1)";
+
+                Ok(connection.execute(sql, [&id])? == 1)
+            })
+            .await
+    }
 }
 
 pub fn insert_grant(connection: &Connection, root: &str, grant: &Grant) -> Result<(), DbError> {
@@ -98,13 +113,14 @@ pub fn start_budget(connection: &Connection, root: &str) -> Result<(), DbError> 
 fn charge_budget(connection: &mut Connection, thread: &str, charge: Charge, limits: Limits) -> Result<Option<Refusal>, DbError> {
     let transaction = connection.transaction()?;
 
-    let sql = "SELECT b.id, b.completions, b.tool_calls, unixepoch() - b.started_at, b.exceeded
+    let sql = "SELECT b.id, b.completions, b.tool_calls, b.notifications, unixepoch() - b.started_at, b.exceeded
                FROM threads t JOIN budgets b ON b.id = t.budget_id WHERE t.id = ?1";
     let row = transaction
         .query_row(sql, [thread], |row| {
-            let usage = Usage { completions: row.get(1)?, tool_calls: row.get(2)?, elapsed_seconds: row.get(3)? };
+            let usage =
+                Usage { completions: row.get(1)?, tool_calls: row.get(2)?, notifications: row.get(3)?, elapsed_seconds: row.get(4)? };
 
-            Ok((row.get::<_, i64>(0)?, usage, row.get::<_, Option<String>>(4)?))
+            Ok((row.get::<_, i64>(0)?, usage, row.get::<_, Option<String>>(5)?))
         })
         .optional()?;
 
@@ -127,6 +143,7 @@ fn charge_budget(connection: &mut Connection, thread: &str, charge: Charge, limi
     let sql = match charge {
         Charge::Completion => "UPDATE budgets SET completions = completions + 1 WHERE id = ?1",
         Charge::ToolCall => "UPDATE budgets SET tool_calls = tool_calls + 1 WHERE id = ?1",
+        Charge::Notification => "UPDATE budgets SET notifications = notifications + 1 WHERE id = ?1",
     };
 
     transaction.execute(sql, [budget])?;
@@ -148,33 +165,44 @@ mod tests {
     use crate::store::db::Db;
     use crate::store::roots::{Adapter, Roots};
 
-    /// A child shares its turn's budget, keeps it after the next turn starts,
-    /// and keeps its root's grant across a Fresh-context boundary.
+    /// A child shares its turn's budget (notifications and the one failure
+    /// notice included), keeps it after the next turn starts, and keeps its
+    /// root's grant across a Fresh-context boundary.
     #[tokio::test]
     async fn children_share_their_turns_budget() -> Result<(), BoxError> {
         let db = Db::in_memory()?;
+        let conversations = Conversations::new(db.clone());
         let grants = Grants::new(db.clone());
-        let roots = Roots::new(db.clone());
-        let limits = Limits { max_tool_calls: 1, ..Limits::default() };
+        let roots = Roots::new(db);
+        let limits = Limits { max_tool_calls: 1, max_notifications: 1, ..Limits::default() };
 
         let root = roots.turn(Adapter::Terminal, "default".to_owned()).await?;
-        let call = ToolCallId::from("call-1".to_owned());
-        let child: ThreadId = Conversations::new(db).spawn_thread(&root, &call, false, SpawnContext::Fresh).await?;
+        let child: ThreadId = conversations.spawn_thread(&root, &ToolCallId::from("call-1".to_owned()), false, SpawnContext::Fresh).await?;
 
         let owner = grants.of(&child).await?;
         assert_eq!(owner.map(|grant| grant.origin), Some(Origin::Chat));
 
-        // The child's call uses up the turn, so the root is refused too.
-        assert_eq!(grants.charge(&child, Charge::ToolCall, limits).await?, None);
-        let refused = Some(Refusal::Limit("max_tool_calls".to_owned()));
-        assert_eq!(grants.charge(&root, Charge::ToolCall, limits).await?, refused);
+        // The child's notification uses up the turn's allowance, so the root is refused too.
+        assert_eq!(grants.charge(&child, Charge::Notification, limits).await?, None);
+        let notified = Some(Refusal::Limit("max_notifications".to_owned()));
+        assert_eq!(grants.charge(&root, Charge::Notification, limits).await?, notified);
         // A refusal is final, whatever is asked next.
-        assert_eq!(grants.charge(&root, Charge::Completion, limits).await?, refused);
+        assert_eq!(grants.charge(&root, Charge::ToolCall, limits).await?, notified);
+
+        assert!(grants.claim_failure_notice(&child).await?);
+        assert!(!grants.claim_failure_notice(&root).await?, "one turn sent two failure notices");
 
         // A new turn frees the root but not work left over from the old one.
         roots.turn(Adapter::Terminal, "default".to_owned()).await?;
-        assert_eq!(grants.charge(&root, Charge::ToolCall, limits).await?, None);
-        assert_eq!(grants.charge(&child, Charge::Completion, limits).await?, refused);
+        let second: ThreadId =
+            conversations.spawn_thread(&root, &ToolCallId::from("call-2".to_owned()), false, SpawnContext::Fresh).await?;
+        assert_eq!(grants.charge(&second, Charge::ToolCall, limits).await?, None);
+        let refused = Some(Refusal::Limit("max_tool_calls".to_owned()));
+        assert_eq!(grants.charge(&root, Charge::ToolCall, limits).await?, refused);
+        assert_eq!(grants.charge(&child, Charge::Completion, limits).await?, notified);
+
+        assert!(grants.claim_failure_notice(&root).await?);
+        assert!(!grants.claim_failure_notice(&child).await?);
 
         Ok(())
     }

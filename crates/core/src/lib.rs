@@ -6,6 +6,7 @@ mod config;
 mod error;
 mod lock;
 mod model;
+mod notify;
 mod policy;
 mod recovery;
 mod router;
@@ -31,9 +32,11 @@ use crate::adapters::discord::Discord;
 use crate::adapters::socket::ControlSocket;
 use crate::config::Config;
 use crate::model::Model;
+use crate::notify::Notifier;
 use crate::router::{Inbound, Router};
 use crate::secrets::Secrets;
 use crate::store::db::{self, Db};
+use crate::store::grants::Grants;
 
 /// Pending input between the control socket and the router.
 const INBOUND_QUEUE: usize = 16;
@@ -80,7 +83,8 @@ async fn serve(config_path: Option<PathBuf>) -> Result<(), Error> {
     tracing::info!(path = %socket.path().display(), model = %model.id(), "listening");
 
     let http = discord.as_ref().map(Discord::http);
-    let router = Router::start(model, db, Arc::new(policy), sandbox.map(Arc::new), http);
+    let notifier = discord.as_ref().map(|discord| notifications(discord, &db));
+    let router = Router::start(model, db, Arc::new(policy), sandbox.map(Arc::new), http, notifier);
 
     if let Err(source) = router.resume().await {
         router.shutdown().await;
@@ -91,6 +95,15 @@ async fn serve(config_path: Option<PathBuf>) -> Result<(), Error> {
     router.shutdown().await;
 
     result
+}
+
+/// Notifications go to Discord, the one adapter that can reach the owner
+/// anywhere. Started before resumed work, which may report a failure.
+fn notifications(discord: &Discord, db: &Db) -> Notifier {
+    let (notifier, queue) = Notifier::new(Grants::new(db.clone()));
+    tokio::spawn(discord.notices(queue));
+
+    notifier
 }
 
 /// Serves new input until a shutdown signal. The Discord gateway starts

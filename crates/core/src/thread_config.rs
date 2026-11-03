@@ -20,10 +20,12 @@ use infinity_agent_core::traits::ConversationStore;
 
 use crate::authority::Authority;
 use crate::error::BoxError;
+use crate::notify::Notifier;
 use crate::policy::{Cap, Origin};
 use crate::sandbox::Sandbox;
 use crate::store::conversation::Conversations;
 use crate::store::operations::Operations;
+use crate::tools::notify::Notify;
 use crate::tools::now::Now;
 use crate::tools::shell::Shell;
 
@@ -33,11 +35,16 @@ pub struct ThreadTools {
     operations: Operations,
     /// Present whenever some origin holds `shell`.
     sandbox: Option<Arc<Sandbox>>,
+    /// Present when an adapter can reach the owner. `notify` is offered without one and says so.
+    notifier: Option<Notifier>,
 }
 
 impl ThreadTools {
-    pub fn new(conversations: Conversations, authority: Authority, operations: Operations, sandbox: Option<Arc<Sandbox>>) -> Self {
-        Self { conversations, authority, operations, sandbox }
+    pub fn new(
+        conversations: Conversations, authority: Authority, operations: Operations, sandbox: Option<Arc<Sandbox>>,
+        notifier: Option<Notifier>,
+    ) -> Self {
+        Self { conversations, authority, operations, sandbox, notifier }
     }
 }
 
@@ -58,6 +65,11 @@ impl ThreadConfigSource<ChannelSender, NoRapHttp> for ThreadTools {
 
         if authorized.caps.contains(&Cap::Now) {
             config.tools.push(Rc::new(Now::new(self.authority.clone(), policy.timezone)));
+        }
+
+        if authorized.caps.contains(&Cap::Notify) {
+            let notify = Notify::new(self.authority.clone(), self.operations.clone(), self.notifier.clone());
+            config.tools.push(Rc::new(notify));
         }
 
         if authorized.caps.contains(&Cap::Shell)

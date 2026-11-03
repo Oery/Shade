@@ -100,11 +100,13 @@ pub struct Limits {
     pub max_completion_rounds: u32,
     pub max_tool_calls: u32,
     pub max_run_seconds: u32,
+    /// Messages the model may send the owner with `notify`.
+    pub max_notifications: u32,
 }
 
 impl Default for Limits {
     fn default() -> Self {
-        Self { max_completion_rounds: 40, max_tool_calls: 100, max_run_seconds: 900 }
+        Self { max_completion_rounds: 40, max_tool_calls: 100, max_run_seconds: 900, max_notifications: 10 }
     }
 }
 
@@ -114,12 +116,15 @@ pub enum Charge {
     /// One request to the model provider, retries included.
     Completion,
     ToolCall,
+    /// One message to the owner, on top of the `notify` call's own charge.
+    Notification,
 }
 
 /// A budget's counters so far.
 pub struct Usage {
     pub completions: i64,
     pub tool_calls: i64,
+    pub notifications: i64,
     pub elapsed_seconds: i64,
 }
 
@@ -133,6 +138,7 @@ impl Limits {
         match charge {
             Charge::Completion if usage.completions >= i64::from(self.max_completion_rounds) => Some("max_completion_rounds"),
             Charge::ToolCall if usage.tool_calls >= i64::from(self.max_tool_calls) => Some("max_tool_calls"),
+            Charge::Notification if usage.notifications >= i64::from(self.max_notifications) => Some("max_notifications"),
             _ => None,
         }
     }
@@ -289,15 +295,19 @@ mod tests {
 
     #[test]
     fn limits_refuse_at_the_boundary() {
-        let limits = Limits { max_completion_rounds: 2, max_tool_calls: 1, max_run_seconds: 60 };
-        let usage = |completions, tool_calls, elapsed_seconds| Usage { completions, tool_calls, elapsed_seconds };
+        let limits = Limits { max_completion_rounds: 2, max_tool_calls: 1, max_run_seconds: 60, max_notifications: 1 };
+        let usage =
+            |completions, tool_calls, notifications, elapsed_seconds| Usage { completions, tool_calls, notifications, elapsed_seconds };
 
         let cases = [
-            (usage(1, 0, 59), Charge::Completion, None),
-            (usage(2, 0, 0), Charge::Completion, Some("max_completion_rounds")),
-            (usage(0, 1, 0), Charge::ToolCall, Some("max_tool_calls")),
+            (usage(1, 0, 0, 59), Charge::Completion, None),
+            (usage(2, 0, 0, 0), Charge::Completion, Some("max_completion_rounds")),
+            (usage(0, 1, 0, 0), Charge::ToolCall, Some("max_tool_calls")),
+            (usage(0, 0, 1, 0), Charge::Notification, Some("max_notifications")),
+            // Each counter refuses only its own work.
+            (usage(0, 0, 1, 0), Charge::ToolCall, None),
             // The deadline wins even with counters to spare.
-            (usage(0, 0, 60), Charge::ToolCall, Some("max_run_seconds")),
+            (usage(0, 0, 0, 60), Charge::ToolCall, Some("max_run_seconds")),
         ];
 
         for (usage, charge, expected) in cases {

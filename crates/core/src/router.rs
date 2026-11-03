@@ -24,6 +24,7 @@ use crate::adapters::discord::Reply;
 use crate::authority::{Authority, Metered};
 use crate::error::BoxError;
 use crate::model::Model;
+use crate::notify::Notifier;
 use crate::policy::Policy;
 use crate::recovery;
 use crate::router::turn::{Step, Turn};
@@ -67,8 +68,9 @@ pub enum Outbound {
     Client(mpsc::Sender<Response>),
     /// A Discord channel.
     Discord(Reply),
-    /// Nobody: resumed work in a conversation no adapter listens to. The outcome is logged.
-    Detached,
+    /// Nobody: resumed work in a conversation no adapter listens to. The
+    /// outcome is logged, and a failure is sent to the owner when possible.
+    Detached(Option<Notifier>),
 }
 
 impl Outbound {
@@ -80,7 +82,13 @@ impl Outbound {
                 }
             }
             Self::Discord(reply) => reply.send(step).await,
-            Self::Detached => log_detached(thread, &step),
+            Self::Detached(notifier) => {
+                log_detached(thread, &step);
+
+                if let (Step::Failed(message), Some(notifier)) = (&step, notifier) {
+                    notifier.failure(&ThreadId::from(thread.to_owned()), message).await;
+                }
+            }
         }
     }
 }
@@ -94,28 +102,33 @@ pub struct Router {
     system: System,
     /// For replies to resumed work in Discord conversations.
     discord: Option<Arc<Http>>,
+    /// Reports failed work nobody is watching.
+    notifier: Option<Notifier>,
 }
 
 impl Router {
     /// Built-in tools stay off: spawning has no limit hook (see docs/infinity-notes.md).
-    pub fn start(model: Model, db: Db, policy: Arc<Policy>, sandbox: Option<Arc<Sandbox>>, discord: Option<Arc<Http>>) -> Self {
+    pub fn start(
+        model: Model, db: Db, policy: Arc<Policy>, sandbox: Option<Arc<Sandbox>>, discord: Option<Arc<Http>>, notifier: Option<Notifier>,
+    ) -> Self {
         let authority = Authority::new(Grants::new(db.clone()), policy);
         let conversations = Conversations::new(db.clone());
-        let tools = ThreadTools::new(conversations.clone(), authority.clone(), Operations::new(db.clone()), sandbox);
+        let operations = Operations::new(db.clone());
+        let tools = ThreadTools::new(conversations.clone(), authority.clone(), operations, sandbox, notifier.clone());
         let model = Metered::new(model, authority, Usages::new(db.clone()));
         let builder = AgentSystemBuilder::new_local(conversations, States::new(db.clone()), model);
         let system = builder.without_builtin_tools().thread_config(tools).start();
 
-        Self::new(db, system, discord)
+        Self::new(db, system, discord, notifier)
     }
 
-    pub fn new(db: Db, system: System, discord: Option<Arc<Http>>) -> Self {
+    pub fn new(db: Db, system: System, discord: Option<Arc<Http>>, notifier: Option<Notifier>) -> Self {
         let inbox = Inbox::new(db.clone());
         let roots = Roots::new(db.clone());
         let operations = Operations::new(db.clone());
         let usages = Usages::new(db.clone());
 
-        Self { db, inbox, roots, operations, usages, system, discord }
+        Self { db, inbox, roots, operations, usages, system, discord, notifier }
     }
 
     /// Handles input until the channel closes. Must run inside a `LocalSet`.
@@ -196,22 +209,24 @@ impl Router {
 
     /// Where resumed work in `thread` reports: its Discord channel, if it is one.
     async fn outbound_for(&self, thread: &ThreadId<str>) -> Outbound {
+        let detached = Outbound::Detached(self.notifier.clone());
+
         let Some(http) = &self.discord else {
-            return Outbound::Detached;
+            return detached;
         };
 
         let key = match self.roots.conversation_of(thread).await {
             Ok(Some((Adapter::Discord, key))) => key,
-            Ok(_) => return Outbound::Detached,
+            Ok(_) => return detached,
             Err(error) => {
                 tracing::warn!(%error, %thread, "cannot find where resumed work reports");
-                return Outbound::Detached;
+                return detached;
             }
         };
 
         match Reply::to_channel(Arc::clone(http), &key) {
             Some(reply) => Outbound::Discord(reply),
-            None => Outbound::Detached,
+            None => detached,
         }
     }
 

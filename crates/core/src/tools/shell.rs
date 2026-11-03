@@ -21,7 +21,7 @@ use crate::error::BoxError;
 use crate::policy::Cap;
 use crate::recovery::UNKNOWN_OUTCOME;
 use crate::sandbox::{Access, Exit, Finished, Sandbox};
-use crate::store::operations::{Operations, Started};
+use crate::store::operations::Operations;
 use crate::tools;
 
 /// Used when the call does not ask for a timeout.
@@ -136,7 +136,7 @@ impl Work {
 
         let thread = call.thread.as_str();
 
-        if let Err(answer) = self.record(thread, &call.id).await {
+        if let Err(answer) = tools::record(&self.operations, thread, &call.id, Cap::Shell.name()).await {
             return answer;
         }
 
@@ -151,20 +151,6 @@ impl Work {
         }
 
         text
-    }
-
-    /// Records the call before it runs. A call recorded before never runs
-    /// again: the error carries its answer instead.
-    async fn record(&self, thread: &str, call: &str) -> Result<(), String> {
-        match self.operations.start(thread, call, Cap::Shell.name()).await {
-            Ok(Started::New) => Ok(()),
-            Ok(Started::Again(Some(result))) => Err(result),
-            Ok(Started::Again(None)) => Err(UNKNOWN_OUTCOME.to_owned()),
-            Err(error) => {
-                tracing::error!(%error, %thread, "cannot record a shell call");
-                Err(format!("Error: the command was not run because it could not be recorded: {error}"))
-            }
-        }
     }
 
     fn timeout(&self, requested: Option<u64>) -> Result<Duration, String> {
