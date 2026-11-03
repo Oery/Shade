@@ -5,8 +5,10 @@
 //! channel are visible to everyone who can read it, so private work belongs
 //! in DMs. The bot never pings anyone: replies allow no mentions.
 //!
-//! Discord gives a bot the content of DMs and of messages that mention it
-//! without the privileged Message Content intent, so the bot does not ask for it.
+//! Discord gives a bot a role with its own name, and "@Shade" in autocomplete
+//! may pick that role instead of the bot. A mention of the bot's role counts
+//! as a mention of the bot. Discord withholds the text of such messages
+//! unless the bot holds the privileged Message Content intent, so it does.
 
 use std::num::NonZeroU64;
 use std::sync::{Arc, OnceLock};
@@ -64,7 +66,7 @@ impl Discord {
         };
 
         let handler = Handler { inbound, owners: config.owners, bot: OnceLock::new() };
-        let intents = GatewayIntents::DIRECT_MESSAGES | GatewayIntents::GUILD_MESSAGES;
+        let intents = GatewayIntents::DIRECT_MESSAGES | GatewayIntents::GUILD_MESSAGES | GatewayIntents::MESSAGE_CONTENT;
         match Client::builder(&token, intents).event_handler(handler).await {
             Ok(client) => Ok(Self { client }),
             Err(source) => Err(DiscordError::Client(Box::new(source))),
@@ -83,7 +85,7 @@ impl Discord {
     /// Listens until the shards shut down. Serenity reconnects on its own.
     pub async fn run(mut self) {
         if let Err(error) = self.client.start().await {
-            tracing::error!(%error, "the Discord adapter stopped");
+            tracing::error!(%error, "the Discord adapter stopped; if Discord refused its intents, enable Message Content for the bot");
         }
     }
 }
@@ -107,16 +109,20 @@ impl EventHandler for Handler {
             return;
         };
 
+        let bot_role = self.mentioned_bot_role(&context.http, &message, bot).await;
+
         let incoming = Incoming {
             author: message.author.id.get(),
             from_bot: message.author.bot,
             in_guild: message.guild_id.is_some(),
-            mentions_bot: message.mentions_user_id(bot),
+            mentions_bot: message.mentions_user_id(bot) || bot_role.is_some(),
+            bot_role,
             content: &message.content,
             attachments: message.attachments.iter().map(|attachment| attachment.url.as_str()).collect(),
         };
 
         let Some(text) = admit(&incoming, bot, &self.owners) else {
+            ignored(&message, incoming.mentions_bot);
             return;
         };
 
@@ -138,6 +144,27 @@ impl EventHandler for Handler {
 }
 
 impl Handler {
+    /// The bot's own role, when an owner's message mentions it.
+    async fn mentioned_bot_role(&self, http: &Http, message: &Message, bot: u64) -> Option<u64> {
+        let guild = message.guild_id?;
+
+        if message.mention_roles.is_empty() || !self.owners.contains(&message.author.id.get()) {
+            return None;
+        }
+
+        let roles = match guild.roles(http).await {
+            Ok(roles) => roles,
+            Err(error) => {
+                tracing::warn!(%error, %guild, "cannot look up the bot's role");
+                return None;
+            }
+        };
+
+        let role = roles.values().find(|role| role.tags.bot_id.is_some_and(|id| id.get() == bot))?;
+
+        message.mention_roles.contains(&role.id).then(|| role.id.get())
+    }
+
     async fn new_conversation(&self, http: &Arc<Http>, channel: ChannelId) {
         let (reply, mut replies) = mpsc::channel(REPLY_QUEUE);
         let input = Inbound::NewConversation { adapter: Adapter::Discord, key: channel.to_string(), reply };
@@ -158,12 +185,29 @@ impl Handler {
     }
 }
 
+/// Says why nothing answered, without logging what was said.
+fn ignored(message: &Message, mentions_bot: bool) {
+    tracing::debug!(
+        author = %message.author.id,
+        channel = %message.channel_id,
+        from_bot = message.author.bot,
+        in_guild = message.guild_id.is_some(),
+        mentions_bot,
+        mentions_roles = message.mention_roles.len(),
+        mentions_everyone = message.mention_everyone,
+        length = message.content.len(),
+        "ignoring a Discord message",
+    );
+}
+
 /// A Discord message, reduced to what decides whether it is heard.
 struct Incoming<'a> {
     author: u64,
     from_bot: bool,
     in_guild: bool,
     mentions_bot: bool,
+    /// The bot's role, when the message mentions it.
+    bot_role: Option<u64>,
     content: &'a str,
     attachments: Vec<&'a str>,
 }
@@ -180,7 +224,12 @@ fn admit(incoming: &Incoming<'_>, bot: u64, owners: &[u64]) -> Option<String> {
         return None;
     }
 
-    let content = incoming.content.replace(&format!("<@{bot}>"), "").replace(&format!("<@!{bot}>"), "");
+    let mut content = incoming.content.replace(&format!("<@{bot}>"), "").replace(&format!("<@!{bot}>"), "");
+
+    if let Some(role) = incoming.bot_role {
+        content = content.replace(&format!("<@&{role}>"), "");
+    }
+
     let mut text = content.trim().to_owned();
 
     for url in &incoming.attachments {
@@ -341,6 +390,7 @@ mod tests {
             from_bot,
             in_guild,
             mentions_bot,
+            bot_role: None,
             content,
             attachments: Vec::new(),
         };
@@ -359,6 +409,10 @@ mod tests {
         for (incoming, expected) in cases {
             assert_eq!(admit(&incoming, BOT, &[OWNER]).as_deref(), expected, "{:?}", incoming.content);
         }
+
+        // "@Shade" may resolve to the bot's role; it is stripped like the bot's own mention.
+        let by_role = Incoming { bot_role: Some(5), ..message(OWNER, false, true, true, "<@&5> hi <@&6>") };
+        assert_eq!(admit(&by_role, BOT, &[OWNER]).as_deref(), Some("hi <@&6>"));
 
         let with_file = Incoming { attachments: vec!["https://cdn/x.png"], ..message(OWNER, false, true, true, "<@9>") };
         assert_eq!(admit(&with_file, BOT, &[OWNER]).as_deref(), Some("https://cdn/x.png"));
