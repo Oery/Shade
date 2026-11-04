@@ -140,9 +140,15 @@ impl Work {
             return answer;
         }
 
-        let text = match self.sandbox.run(&args.command, access, timeout).await {
-            Ok(finished) => render(&finished, timeout),
-            Err(error) => format!("Error: {error}"),
+        let deadline = match self.authority.deadline(&call.thread).await {
+            Ok(deadline) => deadline,
+            Err(error) => return format!("Error: {error}"),
+        };
+
+        let text = match deadline.run(self.sandbox.run(&args.command, access, timeout)).await {
+            Ok(Ok(finished)) => render(&finished, timeout),
+            Ok(Err(error)) => format!("Error: {error}"),
+            Err(error) => format!("Error: {error}. {UNKNOWN_OUTCOME}"),
         };
         let text = self.authority.redact(text);
 

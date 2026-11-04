@@ -15,6 +15,8 @@ use crate::grants::{insert_grant, start_budget};
 pub enum Target {
     /// A new root reachable by no name (`shade ask`).
     Fresh,
+    /// An existing owner root, addressed by a stable API ID.
+    Existing(String),
     /// A named conversation, created on first use.
     Named(String),
     /// A named conversation that is the owner's direct messages.
@@ -33,6 +35,7 @@ pub struct Conversation {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Adapter {
     Terminal,
+    Api,
     /// Keys are channel IDs.
     Discord,
     /// Non-owner Discord chat, with separate history and authority.
@@ -40,16 +43,17 @@ pub enum Adapter {
 }
 
 impl Adapter {
-    fn name(self) -> &'static str {
+    pub fn name(self) -> &'static str {
         match self {
             Self::Terminal => "terminal",
+            Self::Api => "api",
             Self::Discord => "discord",
             Self::DiscordGuest => "discord_guest",
         }
     }
 
     fn parse(name: &str) -> Option<Self> {
-        [Self::Terminal, Self::Discord, Self::DiscordGuest].into_iter().find(|adapter| adapter.name() == name)
+        [Self::Terminal, Self::Api, Self::Discord, Self::DiscordGuest].into_iter().find(|adapter| adapter.name() == name)
     }
 }
 
@@ -106,7 +110,24 @@ impl Roots {
 /// Starts a turn in `target`'s root, creating it on first use. Each turn
 /// gets its own budget. Runs inside the caller's transaction.
 pub(crate) fn turn(connection: &Connection, adapter: Adapter, target: &Target) -> Result<String, DbError> {
+    let id = resolve(connection, adapter, target)?;
+    start_budget(connection, &id)?;
+
+    Ok(id)
+}
+
+/// Resolves or registers a root without starting work.
+pub(crate) fn resolve(connection: &Connection, adapter: Adapter, target: &Target) -> Result<String, DbError> {
     let id = match target {
+        Target::Existing(id) => {
+            let sql = "SELECT root_id FROM grants WHERE root_id = ?1 AND origin = 'chat'";
+            let root: Option<String> = connection.query_row(sql, [id], |row| row.get(0)).optional()?;
+
+            match root {
+                Some(root) => root,
+                None => return Err(DbError::UnknownThread(id.to_owned())),
+            }
+        }
         Target::Fresh => {
             let id = new_id();
             register(connection, &id, adapter)?;
@@ -120,8 +141,6 @@ pub(crate) fn turn(connection: &Connection, adapter: Adapter, target: &Target) -
             id
         }
     };
-
-    start_budget(connection, &id)?;
 
     Ok(id)
 }
@@ -141,7 +160,7 @@ fn named(connection: &Connection, adapter: Adapter, key: &str) -> Result<String,
 pub(crate) fn register(connection: &Connection, id: &str, adapter: Adapter) -> Result<(), DbError> {
     let origin = match adapter {
         Adapter::DiscordGuest => Origin::Guest,
-        Adapter::Terminal | Adapter::Discord => Origin::Chat,
+        Adapter::Terminal | Adapter::Api | Adapter::Discord => Origin::Chat,
     };
     let grant = Grant { origin, source: adapter.name().to_owned(), caps: None };
 

@@ -1,6 +1,6 @@
 # Shade — Architecture & Milestone Plan
 
-Status: implementation plan, not a record of completed work. Updated 2026-11-02.
+Status: implementation plan, not a record of completed work. Updated 2026-11-04.
 
 Shade is a personal agent harness built in Rust on Infinity. You can chat with it from a terminal or Discord; scheduled jobs, webhooks, and observed MCP resource changes can start background runs. Tools and permissions come from a human-controlled configuration file.
 
@@ -95,8 +95,16 @@ crates/
       main.rs               argument parsing and rendering
       client.rs             blocking socket connection
       error.rs
-  daemon/                   shade-daemon: the `shaded` binary
-    src/main.rs             --config, logging, signals, calls shade_core::run
+  daemon/                   shade-daemon: the `shaded` binary and composition root
+    src/main.rs             arguments and logging
+    src/config.rs           TOML file parsing and transport settings
+    src/daemon.rs           runtime, HTTP startup, signals, and shutdown
+    src/http.rs             transport secret resolution and listener wiring
+  http/                     shade-http: personal API and webhook transport
+    src/lib.rs              bound server, address and token validation
+    src/api.rs              routes, JSON decoding, and HTTP error mapping
+    src/api/events.rs       SSE encoding and subscriber disconnects
+    src/webhook.rs          shared HTTP listener and webhook requests
   policy/                   shade-policy: capabilities, origins, ceilings, limit checks
     src/
       lib.rs
@@ -128,13 +136,15 @@ crates/
       lib.rs
       error.rs              typed errors
       lock.rs               data directory creation and execution lock
-      config.rs             TOML parsing and policy validation
+      config.rs             runtime settings and policy validation
       secrets.rs            optional private .env next to the config
       thread_config.rs      per-thread tools (close_thread for compaction threads)
       authority.rs          grant/budget admission for config, provider requests, tools
       model.rs              provider and completion-budget enforcement
       router.rs             durable ingress, routing, output pumps, resume, shutdown
       router/turn.rs        what a turn's sender sees
+      client.rs             typed runtime handle and domain errors
+      client/history.rs     public history projection
       runs.rs               run lifecycle, shared limits, cancellation (M11)
       scheduler.rs          schedule claims and overlap handling
       condition.rs          pure typed comparisons and watch transitions
@@ -151,7 +161,6 @@ crates/
       adapters/
         socket.rs           control socket server
         discord.rs          owner chat, chunked replies, typing, safe mentions
-        webhook.rs
 ```
 
 The project is a Cargo workspace. Shared versions, metadata, and lints live in the root `Cargo.toml`.
@@ -781,6 +790,15 @@ Each milestone is one reviewable PR. `Check` is a manual demonstration; `Tests` 
 - M18 validates combined behavior; it does not defer known correctness/security requirements.
 - M19 was done before M17 and M18 (owner's order: deployment first). Its tools let Shade run unattended, so M18's fault checks come before relying on that.
 
+### M20 — Personal client API and owner-chat queue
+
+- **Done:** versioned HTTP JSON and SSE on the existing loopback/Tailscale listener, enabled by `[api] token_env`. One trusted owner token uses existing secret loading and redaction. API-only startup works; hooks retain their separate authentication. See [docs/api.md](docs/api.md) for the public contract and script examples.
+- **Crate boundary:** `shade-http` owns API/webhook routing, authentication, request decoding, JSON/SSE encoding, and HTTP error mapping. `shade-core::Client` provides typed operations, reads, subscriptions, and domain errors; the router never imports transport types. History projection stays in core. The daemon parses the full config, resolves transport secrets before core builds its redactor, binds HTTP before recovery, and owns signals and shutdown. HTTP uses core through this handle; store and Infinity dependencies are confined to its test fixtures.
+- **Interface:** create/list owner roots, browse persisted history and turn status, submit idempotent messages, subscribe to current-state snapshots and live text/tool summaries, and approve/reject conversation-scoped proposals. Guest and background roots stay outside this interface. Public types live in `shade-proto::api`; the Unix protocol stays version 3.
+- **Queue:** owner messages from API, terminal, Discord, and approval continuations share durable FIFO dispatch per root. Migration 0017 adds `chat_turns` beside the inbox; waiting starts no budget. Defaults: 32 waiting inputs per root and 256 globally. One root runs one turn through its tool rounds; different roots share the existing provider concurrency limit. API submissions preserve their API delivery destination on recovery, including when continuing a Discord root.
+- **Recovery:** processed inputs are never resent; a running turn continues only through recoverable tools, otherwise becomes interrupted. Already terminal turns are not reopened by an outstanding result. Legacy pending tools retain their queue position during migration. Provider retries keep the original deadline. SSE is bounded and ephemeral; reconnecting clients reload saved history/status rather than replay event chunks.
+- **Verification:** mock-provider HTTP and runtime tests cover shared-client FIFO, identical successive messages, concurrent roots, deadlines, idempotency and queue limits, disconnects and slow subscribers, scoped approvals, hidden reasoning/tool bodies, API-only startup and secret validation, legacy migration, and restart boundaries.
+
 ## 5. Non-goals and limits
 
 - Multi-user tenancy, a web UI, plugin marketplace, RAP/Lambda deployment, and a custom model provider are out of scope.
@@ -789,7 +807,7 @@ Each milestone is one reviewable PR. `Check` is a manual demonstration; `Tests` 
 - No exactly-once guarantee for arbitrary external side effects. Prefer idempotent operations and reconciliation.
 - No hot policy reload initially. Restart applies config changes; job-definition edits affect future runs.
 - No promise of a full filesystem or network policy from a capability name alone. MCP roots, credentials, shell mounts, sockets, and trusted executable locations are part of the boundary.
-- The control socket is local and single-owner: no remote access, multi-user authentication, or stable public API. Every client command requires a running daemon.
+- The control socket is local, single-owner, and internal. Remote personal clients use the versioned HTTP API; multi-user authentication remains outside scope. Every client command requires a running daemon.
 - Per-job model overrides, semantic memory search, and advanced resource quotas wait for demonstrated need.
 
 ## 6. Risks and open implementation questions

@@ -11,9 +11,25 @@ path = "src/main.rs"
 
 [dependencies]
 shade-core.workspace = true
+shade-http.workspace = true
+shade-proto.workspace = true
+shade-condition.workspace = true
+shade-policy.workspace = true
+shade-sandbox.workspace = true
+shade-mcp.workspace = true
+serde.workspace = true
+toml.workspace = true
+tokio.workspace = true
+tracing.workspace = true
 clap.workspace = true
 thiserror.workspace = true
 tracing-subscriber.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
+shade-core = { workspace = true, features = ["testing"] }
+shade-store = { workspace = true, features = ["testing"] }
+uuid.workspace = true
 
 [lints]
 workspace = true

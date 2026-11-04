@@ -242,3 +242,20 @@ Both adjustments are pure functions over `(pattern, tz, instant)`; test them in 
   streamed a reply. Anthropic directly is verified up to authentication.
 - Reasoning round trip through rig's Chat Completions client (above).
 - Thinking-block round trip and compaction against Claude Opus 5.5 (above).
+
+### Owner-chat queue and client events
+
+Infinity has one completion in flight per thread, and user text can interrupt it
+(`system/local/driver.rs`). Shade withholds queued owner inputs until the prior
+turn, including asynchronous tool rounds, ends. Distinct roots can still run
+concurrently. The probe `sequential_turns_with_identical_text_remain_distinct`
+checks that sequential, equal-text inputs preserve separate responses; router
+queue tests check that dispatch is withheld through tools and retry deadlines.
+
+`AgentEvent::ToolCall` names the tool but carries no call ID;
+`AgentEvent::ToolResult` carries display segments without a call ID. The client
+API reports start names and result arrivals without inventing a pairing.
+`CompletionFinished` remains the history-sync boundary, not the end of a turn
+that is waiting for an asynchronous tool. Provider retries now retain the
+budget deadline resolved for that completion, rather than borrowing a later
+turn's deadline.

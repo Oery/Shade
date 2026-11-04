@@ -1,9 +1,12 @@
-//! Shade runtime. The `shaded` binary is a thin wrapper around [`run`].
+//! Shade runtime and typed client access. The daemon owns process startup and HTTP.
 
 mod adapters;
 mod audit;
 mod authority;
+mod chat;
+mod client;
 mod config;
+mod deadline;
 mod error;
 mod lock;
 mod memory;
@@ -24,15 +27,20 @@ mod tools;
 mod usage;
 
 use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 
 use shade_sandbox::Sandbox;
-use tokio::signal::unix::{SignalKind, signal};
 use tokio::sync::mpsc;
-use tokio::task::LocalSet;
 
+pub use client::{Client, ClientError, HookAccepted, HookAdmission, Subscription};
+pub use config::{ChatConfig, Config, DiscordConfig, JobsConfig, ModelConfig};
 pub use error::Error;
+pub use memory::Config as MemoryConfig;
+pub use secrets::{Secrets, path_for as secrets_path};
+
+#[cfg(any(test, feature = "testing"))]
+pub mod test_support;
 
 use shade_policy::{Cap, Policy};
 use shade_schedule::jobfiles::{self, JobFiles};
@@ -41,94 +49,113 @@ use shade_store::grants::Grants;
 
 use crate::adapters::discord::Discord;
 use crate::adapters::socket::ControlSocket;
-use crate::adapters::webhook::{Hook, MIN_TOKEN, Webhooks, listen_address};
-use crate::config::Config;
-use crate::config::{HookConfig, HttpConfig};
 use crate::memory::Memory;
 use crate::model::Model;
 use crate::notify::Notifier;
 use crate::router::{Inbound, Router};
-use crate::secrets::Secrets;
 use crate::thread_config::Services;
 use shade_mcp::{Server, Servers};
-use shade_store::hooks::{Admission, HookEvents};
-use tokio::net::TcpListener;
 
 /// Pending input between the control socket and the router.
 const INBOUND_QUEUE: usize = 16;
 
-/// Runs the daemon until SIGINT or SIGTERM.
-pub fn run(config: Option<PathBuf>) -> Result<(), Error> {
-    let runtime = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
-        Ok(runtime) => runtime,
-        Err(source) => return Err(Error::Runtime(source)),
-    };
-
-    // Infinity's local agents are `!Send`, so they live on a `LocalSet`.
-    runtime.block_on(LocalSet::new().run_until(serve(config)))
+/// A prepared local runtime, created and served inside a Tokio LocalSet.
+/// Call `resume` before serving any adapter input.
+/// The daemon runs its `serve` future alongside the HTTP server and signals.
+pub struct Runtime {
+    socket: ControlSocket,
+    router: Router,
+    inbound: Option<mpsc::Receiver<Inbound>>,
+    client: Client,
+    discord: Option<Discord>,
+    shards: Option<Arc<serenity::all::ShardManager>>,
+    // Struct fields drop in order: the socket must disappear before the lock.
+    _lock: lock::ExecutionLock,
 }
 
-async fn serve(config_path: Option<PathBuf>) -> Result<(), Error> {
-    let config_path = config::path(config_path)?;
-    let Config { model, timezone, chat, jobs, hooks, http: http_config, limits, sandbox, mut discord, mcp, memory } =
-        config::load(&config_path)?;
-    let hook_caps = hooks.iter().map(|(name, hook)| (name.to_owned(), hook.caps.clone())).collect();
-    let channels = discord.as_mut().map(|discord| std::mem::take(&mut discord.channels)).unwrap_or_default();
-    let discord_guests = discord.as_mut().map(|discord| std::mem::take(&mut discord.guests.caps)).unwrap_or_default();
-    let servers = mcp.iter().map(|(name, server)| (name.to_owned(), server.description.to_owned())).collect();
-    let memory = start_memory(memory, &mcp, &config_path)?;
-    let sections = config::Sections { chat, discord_guests, jobs, hooks: hook_caps, limits, timezone, channels, servers };
-    let policy = config::policy(&config_path, sections)?;
-    let mut secrets = Secrets::load(secrets::path_for(&config_path))?;
+impl Runtime {
+    pub async fn start(config: Config, config_path: &Path, mut secrets: Secrets) -> Result<Self, Error> {
+        let Config { model, timezone, chat, jobs, hooks, limits, sandbox, mut discord, mcp, memory } = config;
+        let channels = discord.as_mut().map(|discord| std::mem::take(&mut discord.channels)).unwrap_or_default();
+        let discord_guests = discord.as_mut().map(|discord| std::mem::take(&mut discord.guests.caps)).unwrap_or_default();
+        let servers = mcp.iter().map(|(name, server)| (name.to_owned(), server.description.to_owned())).collect();
+        let memory = start_memory(memory, &mcp, config_path)?;
+        let sections = config::Sections { chat, discord_guests, jobs, hooks, limits, timezone, channels, servers };
+        let policy = config::policy(config_path, sections)?;
 
-    let Some(data_dir) = shade_proto::data_dir() else {
-        return Err(Error::NoDataDir);
-    };
+        let Some(data_dir) = shade_proto::data_dir() else {
+            return Err(Error::NoDataDir);
+        };
 
-    lock::create_data_dir(&data_dir)?;
+        lock::create_data_dir(&data_dir)?;
 
-    // Declared before the socket so the socket file is removed while the lock is still held.
-    let _lock = lock::acquire(&data_dir)?;
+        // Declared before the socket so the socket file is removed while the lock is still held.
+        let _lock = lock::acquire(&data_dir)?;
 
-    // Probed now, so a broken sandbox stops the daemon before it accepts work.
-    let sandbox = start_sandbox(sandbox, &policy, &data_dir, &config_path).await?;
-    let model = Model::new(model, &mut secrets)?;
-    let mcp = start_mcp(mcp, &mut secrets).await?;
-    let db = Db::open(&data_dir.join(db::DB_FILE))?;
+        // Probed now, so a broken sandbox stops the daemon before it accepts work.
+        let sandbox = start_sandbox(sandbox, &policy, &data_dir, config_path).await?;
+        let model = Model::new(model, &mut secrets)?;
+        let mcp = start_mcp(mcp, &mut secrets).await?;
+        let db = Db::open(&data_dir.join(db::DB_FILE))?;
 
-    let (inbound, inbound_queue) = mpsc::channel(INBOUND_QUEUE);
+        let (inbound, inbound_queue) = mpsc::channel(INBOUND_QUEUE);
 
-    let discord = match discord {
-        Some(config) => Some(Discord::connect(config, &mut secrets, inbound.clone()).await?),
-        None => None,
-    };
+        let discord = match discord {
+            Some(config) => Some(Discord::connect(config, &mut secrets, inbound.clone()).await?),
+            None => None,
+        };
 
-    let webhooks = start_webhooks(hooks, http_config, &mut secrets, &db, inbound.clone(), &config_path).await?;
-    let socket = ControlSocket::bind(shade_proto::socket_path(&data_dir), inbound)?;
-    tracing::info!(path = %socket.path().display(), model = %model.id(), "listening");
+        let client = Client::new(inbound.clone(), shade_store::chat::Chats::new(db.clone()));
+        let socket = ControlSocket::bind(shade_proto::socket_path(&data_dir), inbound)?;
+        tracing::info!(path = %socket.path().display(), model = %model.id(), "listening");
+        let http = discord.as_ref().map(Discord::http);
+        let shards = discord.as_ref().map(Discord::shards);
+        let notifier = discord.as_ref().map(|discord| notifications(discord, &db));
+        let job_files = Arc::new(JobFiles::new(jobfiles::dir_for(config_path)));
+        let redactor = Arc::new(secrets.into_redactor());
+        let services = Services { sandbox: sandbox.map(Arc::new), notifier, job_files, mcp, memory, redactor };
+        let router = Router::start(model, db, Arc::new(policy), services, http);
 
-    let http = discord.as_ref().map(Discord::http);
-    let notifier = discord.as_ref().map(|discord| notifications(discord, &db));
-    let job_files = Arc::new(JobFiles::new(jobfiles::dir_for(&config_path)));
-    let redactor = Arc::new(secrets.into_redactor());
-    let services = Services { sandbox: sandbox.map(Arc::new), notifier, job_files, mcp, memory, redactor };
-    let router = Router::start(model, db, Arc::new(policy), services, http);
-
-    // Job files are config: a bad one stops the daemon before it runs anything.
-    if let Err(message) = router.load_job_files(chrono::Utc::now()).await {
-        router.shutdown().await;
-        return Err(Error::JobFiles(message));
+        Ok(Self { socket, router, inbound: Some(inbound_queue), client, discord, shards, _lock })
     }
 
-    if let Err(source) = router.resume().await {
-        router.shutdown().await;
-        return Err(Error::Recovery(source));
+    pub fn client(&self) -> Client {
+        self.client.clone()
     }
 
-    let result = listen(&socket, &router, inbound_queue, discord, webhooks).await;
-    router.shutdown().await;
+    pub async fn resume(&self) -> Result<(), Error> {
+        if let Err(message) = self.router.load_job_files(chrono::Utc::now()).await {
+            return Err(Error::JobFiles(message));
+        }
 
-    result
+        match self.router.resume().await {
+            Ok(()) => Ok(()),
+            Err(error) => Err(Error::Recovery(error)),
+        }
+    }
+
+    pub async fn serve(&mut self) {
+        let Some(inbound) = self.inbound.take() else {
+            return;
+        };
+
+        if let Some(discord) = self.discord.take() {
+            tokio::spawn(discord.run());
+        }
+
+        tokio::select! {
+            () = self.socket.serve() => {},
+            () = self.router.serve(inbound) => {},
+        }
+    }
+
+    pub async fn shutdown(self) {
+        if let Some(shards) = self.shards {
+            shards.shutdown_all().await;
+        }
+
+        self.router.shutdown().await;
+    }
 }
 
 /// The sandbox for shell commands, or `None` when no origin holds `shell`.
@@ -149,57 +176,6 @@ async fn start_sandbox(
     let sandbox = shade_sandbox::start(config, data_dir, config_path).await?;
 
     Ok(Some(sandbox))
-}
-
-/// The webhook server and its bound listener.
-type Served = (Arc<Webhooks>, TcpListener);
-
-/// Prepares every hook and binds the listener, or `None` with no hooks. A
-/// missing token, an invalid condition, or a taken address stops startup.
-async fn start_webhooks(
-    hooks: BTreeMap<String, HookConfig>, http: HttpConfig, secrets: &mut Secrets, db: &Db, inbound: mpsc::Sender<Inbound>, path: &Path,
-) -> Result<Option<Served>, Error> {
-    if hooks.is_empty() {
-        return Ok(None);
-    }
-
-    let mut served = BTreeMap::new();
-
-    for (name, hook) in hooks {
-        let token = match secrets.take(&hook.token_env) {
-            Some(token) if token.len() >= MIN_TOKEN => token,
-            _ => return Err(Error::HookToken { hook: name, name: hook.token_env }),
-        };
-
-        if let Some(Err(message)) = hook.condition.as_ref().map(shade_condition::Condition::validate) {
-            return Err(Error::ConfigInvalid { path: path.to_owned(), message: format!("[hooks.{name}] condition: {message}") });
-        }
-
-        let admission = Admission { queued: hook.max_queued, per_minute: hook.max_per_minute };
-        let hook = Hook { token, template: hook.template, condition: hook.condition, delivery_header: hook.delivery_header, admission };
-        served.insert(name, hook);
-    }
-
-    let address = match listen_address(&http.listen) {
-        Ok(address) => address,
-        Err(message) => return Err(Error::ConfigInvalid { path: path.to_owned(), message }),
-    };
-
-    let listener = match TcpListener::bind(address).await {
-        Ok(listener) => listener,
-        Err(source) => return Err(Error::Webhooks { listen: http.listen, source }),
-    };
-
-    tracing::info!(listen = %http.listen, hooks = served.len(), "serving webhooks");
-
-    Ok(Some((Arc::new(Webhooks::new(served, HookEvents::new(db.clone()), inbound)), listener)))
-}
-
-async fn serve_webhooks(webhooks: Option<Served>) {
-    match webhooks {
-        Some((webhooks, listener)) => webhooks.serve(listener).await,
-        None => std::future::pending().await,
-    }
 }
 
 /// Checks `[memory]` against the configured servers. A bad section stops startup.
@@ -255,50 +231,4 @@ fn notifications(discord: &Discord, db: &Db) -> Notifier {
     tokio::spawn(discord.notices(queue));
 
     notifier
-}
-
-/// Serves new input until a shutdown signal. The Discord gateway starts
-/// here, after resumed work, so a new message cannot overtake it.
-async fn listen(
-    socket: &ControlSocket, router: &Router, inbound: mpsc::Receiver<Inbound>, discord: Option<Discord>, webhooks: Option<Served>,
-) -> Result<(), Error> {
-    let shards = discord.as_ref().map(Discord::shards);
-
-    if let Some(discord) = discord {
-        tokio::spawn(discord.run());
-    }
-
-    let result = tokio::select! {
-        () = socket.serve() => Ok(()),
-        () = router.serve(inbound) => Ok(()),
-        () = serve_webhooks(webhooks) => Ok(()),
-        result = shutdown_signal() => result,
-    };
-
-    if let Some(shards) = shards {
-        shards.shutdown_all().await;
-    }
-
-    result
-}
-
-async fn shutdown_signal() -> Result<(), Error> {
-    let mut terminate = match signal(SignalKind::terminate()) {
-        Ok(stream) => stream,
-        Err(source) => return Err(Error::Signal(source)),
-    };
-
-    let mut interrupt = match signal(SignalKind::interrupt()) {
-        Ok(stream) => stream,
-        Err(source) => return Err(Error::Signal(source)),
-    };
-
-    tokio::select! {
-        _ = terminate.recv() => {}
-        _ = interrupt.recv() => {}
-    }
-
-    tracing::info!("shutting down");
-
-    Ok(())
 }

@@ -11,6 +11,7 @@ testing = []
 
 [dependencies]
 shade-policy.workspace = true
+shade-proto.workspace = true
 async-trait.workspace = true
 infinity-agent-core.workspace = true
 infinity-provider-protocol.workspace = true

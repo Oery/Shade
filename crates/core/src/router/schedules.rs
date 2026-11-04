@@ -114,10 +114,14 @@ impl Router {
     /// Applies a change owner chat proposed, then tells the conversation
     /// that proposed it, which answers the owner.
     pub(super) async fn approve(&self, code: String, now: DateTime<Utc>) -> Result<String, String> {
+        self.approve_to(code, now, false).await
+    }
+
+    pub(super) async fn approve_to(&self, code: String, now: DateTime<Utc>, api: bool) -> Result<String, String> {
         let (receipt, thread) = self.apply_approved(&code, now).await?;
 
         let note = format!("[Shade] The owner approved the change you proposed; it is in effect now:\n{receipt}");
-        self.tell_proposer(thread, &code, note).await;
+        self.tell_proposer(thread, &code, note, api).await;
 
         Ok(receipt)
     }
@@ -139,6 +143,7 @@ impl Router {
             return Err(format!("change {code} expired; ask for it again"));
         }
 
+        self.followup_capacity(pending.thread.as_deref()).await?;
         self.still_current(&pending.job, pending.base_version).await?;
 
         let Pending { job, base_version, mut definition, deletes, receipt, thread, .. } = pending;
@@ -170,11 +175,17 @@ impl Router {
     }
 
     async fn reject(&self, code: String) -> Result<String, String> {
+        self.reject_to(code, false).await
+    }
+
+    pub(super) async fn reject_to(&self, code: String, api: bool) -> Result<String, String> {
         let pending = match self.schedules.pending(&code).await {
             Ok(Some(pending)) => pending,
             Ok(None) => return Err(format!("no change waits under code {code}")),
             Err(error) => return Err(format!("cannot read pending changes: {error}")),
         };
+
+        self.followup_capacity(pending.thread.as_deref()).await?;
 
         if let Err(error) = self.schedules.reject(&code).await {
             return Err(format!("cannot drop change {code}: {error}"));
@@ -184,26 +195,57 @@ impl Router {
             "[Shade] The owner rejected the change you proposed to \"{}\"; nothing was changed.",
             pending.definition.title
         );
-        self.tell_proposer(pending.thread, &code, note).await;
+        self.tell_proposer(pending.thread, &code, note, api).await;
 
         Ok(format!("Dropped change {code}; nothing was changed."))
     }
 
+    async fn followup_capacity(&self, thread: Option<&str>) -> Result<(), String> {
+        let Some(thread) = thread else {
+            return Ok(());
+        };
+        let root = match self.chat.store.owner_root(thread.to_owned()).await {
+            Ok(root) => root,
+            Err(error) => return Err(format!("cannot find the proposing conversation: {error}")),
+        };
+        let limits = self.policy.limits;
+        let capacity = self.chat.store.has_capacity(root, limits.max_queued_chat_messages, limits.max_queued_chat_messages_total).await;
+
+        match capacity {
+            Ok(true) => Ok(()),
+            Ok(false) => Err("the conversation queue is full; retry the decision later".to_owned()),
+            Err(error) => Err(format!("cannot check the conversation queue: {error}")),
+        }
+    }
+
     /// Starts a turn in the conversation that proposed a change, so the
     /// model speaks once the owner has decided. Recorded like any input.
-    async fn tell_proposer(&self, thread: Option<String>, code: &str, note: String) {
+    async fn tell_proposer(&self, thread: Option<String>, code: &str, note: String, api: bool) {
         let Some(thread) = thread else {
             return;
         };
 
-        match self.inbox.accept_for_thread(thread, note, format!("decision:{code}")).await {
-            Ok(Some(input)) => {
-                let outbound = self.outbound_for(&input.root).await;
-                self.dispatch(input, outbound).await;
+        let root = match self.chat.store.owner_root(thread).await {
+            Ok(root) => root,
+            Err(error) => {
+                tracing::warn!(%error, "cannot find the proposing conversation");
+                return;
             }
-            Ok(None) => {}
-            Err(error) => tracing::warn!(%error, "cannot tell the proposing conversation about the owner's decision"),
-        }
+        };
+        let outbound = if api {
+            Outbound::Detached(None)
+        } else {
+            self.outbound_for(&ThreadId::from(root.to_owned())).await
+        };
+        let delivery = if api { "api".to_owned() } else { outbound.delivery() };
+        let request = self.chat_request(
+            shade_store::roots::Adapter::Api,
+            shade_store::roots::Target::Existing(root),
+            note,
+            Some(format!("decision:{code}")),
+            delivery,
+        );
+        self.accept_chat(request, outbound).await;
     }
 
     /// Refuses a change drafted against a job that has changed since, or a new job whose name was taken.

@@ -141,6 +141,80 @@ async fn failed_input_is_settled_before_its_sender_hears() -> Result<(), BoxErro
     .await
 }
 
+/// Deadlines also end stalled streams and Infinity's own retry sleeps. Once
+/// reported, these failed inputs must stay settled across a restart.
+#[tokio::test(flavor = "current_thread")]
+async fn expired_turns_are_reported_and_never_replayed() -> Result<(), BoxError> {
+    for retry in [false, true] {
+        let db = Db::in_memory()?;
+
+        within(async {
+            let limits = Limits { max_run_seconds: 2, ..Limits::default() };
+            let (router, mut model) = testing::router(&db, testing::policy(&[], limits)).await?;
+            let (reply, mut replies) = mpsc::channel(REPLY_QUEUE);
+            router.dispatch(accept(&router).await?, Outbound::Client(reply)).await;
+            model.next_request().await;
+
+            if retry {
+                let error =
+                    infinity_provider_protocol::CompletionError::provider(infinity_provider_protocol::ErrorClass::Throttled, "wait");
+                model.send_error(error);
+            }
+
+            let result = tokio::time::timeout(Duration::from_secs(3), last(&mut replies)).await?;
+            assert!(matches!(result, Some(Response::Error { message }) if message.contains("max_run_seconds")));
+            assert!(router.inbox.unsettled().await?.is_empty());
+            router.shutdown().await;
+
+            Ok(())
+        })
+        .await?;
+
+        within(async {
+            let (router, mut model) = testing::router(&db, testing::policy(&[], Limits::default())).await?;
+            router.resume().await?;
+            assert!(model.try_next_request().is_none());
+
+            Ok(())
+        })
+        .await?;
+    }
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn an_expired_background_run_releases_its_capacity() -> Result<(), BoxError> {
+    within(async {
+        let db = Db::in_memory()?;
+        let limits = Limits { max_run_seconds: 2, max_concurrent_background_runs: 1, ..Limits::default() };
+        let (router, mut model) = testing::router(&db, testing::policy(&[], limits)).await?;
+        let events = HookEvents::new(db);
+        let admission = Admission { queued: 5, per_minute: 10 };
+        events.accept("ci".to_owned(), None, "first".to_owned(), admission).await?;
+        events.accept("ci".to_owned(), None, "second".to_owned(), admission).await?;
+
+        router.start_background(Utc::now()).await;
+        model.next_request().await;
+
+        while events.statuses().await? != ["limit_exceeded", "queued"] {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        router.start_background(Utc::now()).await;
+        model.next_request().await;
+        model.send_text("done");
+        model.finish();
+
+        while events.statuses().await? != ["limit_exceeded", "completed"] {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        Ok(())
+    })
+    .await
+}
+
 /// Discord may deliver a message twice: one input, one turn, one reply.
 #[tokio::test(flavor = "current_thread")]
 async fn message_delivered_twice_is_accepted_once() -> Result<(), BoxError> {

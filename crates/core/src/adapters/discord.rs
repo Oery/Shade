@@ -283,6 +283,10 @@ pub struct Reply {
 }
 
 impl Reply {
+    pub fn channel_key(&self) -> String {
+        format!("discord:{}", self.channel)
+    }
+
     pub fn new(http: Arc<Http>, channel: ChannelId, answering: Option<MessageId>) -> Self {
         let typing = Some(channel.start_typing(&http));
 
@@ -360,6 +364,10 @@ impl Reply {
 /// that did arrive, and the sender says so.
 async fn post_notices(http: Arc<Http>, owner: UserId, mut queue: mpsc::Receiver<Notice>) {
     while let Some(Notice { text, destination, ack }) = queue.recv().await {
+        if ack.is_closed() {
+            continue;
+        }
+
         let message = CreateMessage::new().content(text).allowed_mentions(CreateAllowedMentions::new());
 
         let sent = match destination {

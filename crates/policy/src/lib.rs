@@ -138,8 +138,13 @@ pub struct Limits {
     pub max_run_seconds: u32,
     /// Messages the model may send the owner with `notify`.
     pub max_notifications: u32,
+    /// Provider requests in flight, including their response streams, across all origins.
+    pub max_concurrent_completions: u16,
     /// Scheduled runs running at once. Others wait, durably, in the queue.
     pub max_concurrent_background_runs: u32,
+    /// Waiting owner inputs per conversation and across the daemon.
+    pub max_queued_chat_messages: u32,
+    pub max_queued_chat_messages_total: u32,
 }
 
 impl Default for Limits {
@@ -149,7 +154,10 @@ impl Default for Limits {
             max_tool_calls: 100,
             max_run_seconds: 900,
             max_notifications: 10,
+            max_concurrent_completions: 8,
             max_concurrent_background_runs: 4,
+            max_queued_chat_messages: 32,
+            max_queued_chat_messages_total: 256,
         }
     }
 }
@@ -207,6 +215,10 @@ pub struct Policy {
 impl Policy {
     /// Checks the rules config parsing cannot express.
     pub fn validate(&self) -> Result<(), String> {
+        if self.limits.max_concurrent_completions == 0 {
+            return Err("[limits] max_concurrent_completions must be at least 1".to_owned());
+        }
+
         for name in self.servers.keys() {
             check_server(name)?;
         }
@@ -361,6 +373,19 @@ mod tests {
             limits: Limits::default(),
             timezone: chrono_tz::UTC,
         }
+    }
+
+    #[test]
+    fn model_capacity_defaults_and_validation() {
+        let limits = Limits::default();
+        assert_eq!(limits.max_concurrent_completions, 8);
+
+        let mut policy = policy(&[], &[]);
+        policy.limits.max_concurrent_completions = 0;
+        assert!(policy.validate().is_err());
+
+        policy.limits.max_concurrent_completions = 1;
+        assert!(policy.validate().is_ok());
     }
 
     fn grant(origin: Origin, source: &str, requested: Option<&[&str]>) -> Grant {

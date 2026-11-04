@@ -1,0 +1,33 @@
+[package]
+name = "shade-http"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+shade-core.workspace = true
+shade-proto.workspace = true
+shade-condition.workspace = true
+bytes.workspace = true
+futures-util.workspace = true
+http.workspace = true
+http-body-util.workspace = true
+hyper.workspace = true
+hyper-util.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+subtle.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+shade-core = { workspace = true, features = ["testing"] }
+shade-store = { workspace = true, features = ["testing"] }
+shade-policy.workspace = true
+chrono.workspace = true
+infinity-agent-core.workspace = true
+
+[lints]
+workspace = true

@@ -136,4 +136,38 @@ mod tests {
 
         Ok(())
     }
+
+    /// The run deadline cancels a shell command even when its own timeout is
+    /// longer. Partial side effects remain ambiguous and must not be retried.
+    #[tokio::test(flavor = "current_thread")]
+    async fn the_run_deadline_kills_shell_descendants_and_records_uncertainty() -> Result<(), BoxError> {
+        within(async {
+            let dirs = Dirs::new();
+            let db = Db::in_memory()?;
+            Conversations::new(db.clone()).register_root(&root()).await?;
+            let limits = Limits { max_run_seconds: 2, ..Limits::default() };
+            let services = testing::services(Some(Arc::new(dirs.bubblewrap())), None);
+            let mut harness = testing::start_with_tools(&db, testing::policy(&[Cap::Shell], limits), services).await?;
+            let mut handle = attach(&mut harness, &root()).await?;
+
+            handle.send(InputMessage::user_text(root(), "run it"), "input-1").await?;
+            harness.model.next_request().await;
+            harness.model.send_tool_call("call-1", "shell", serde_json::json!({ "command": "touch started; sleep 3; touch escaped" }));
+            harness.model.finish();
+            testing::until(
+                &mut handle,
+                |event| matches!(event, infinity_agent_core::system::AgentEvent::Info { text } if text.contains("max_run_seconds")),
+            )
+            .await;
+
+            let result = Operations::new(db).captured("root", "call-1").await?.ok_or("missing shell outcome")?;
+            assert!(result.contains("max_run_seconds") && result.contains("may have completed"), "{result}");
+            assert!(dirs.workspace.join("started").exists());
+            tokio::time::sleep(Duration::from_secs(3)).await;
+            assert!(!dirs.workspace.join("escaped").exists());
+
+            Ok(())
+        })
+        .await
+    }
 }

@@ -11,6 +11,7 @@ publish = false
 [workspace.dependencies]
 shade-condition = { path = "crates/condition" }
 shade-core = { path = "crates/core" }
+shade-http = { path = "crates/http" }
 shade-mcp = { path = "crates/mcp" }
 shade-policy = { path = "crates/policy" }
 shade-proto = { path = "crates/proto" }

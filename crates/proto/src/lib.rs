@@ -6,6 +6,8 @@
 //! chat opens one connection per line, so the daemon keeps no session state. This crate must stay free of runtime dependencies so the
 //! client builds without Infinity, SQLite, or Tokio.
 
+pub mod api;
+
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 

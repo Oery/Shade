@@ -198,3 +198,31 @@ async fn repeated_input_id_is_processed_once() -> Result<(), BoxError> {
         })
         .await
 }
+
+/// Shade withholds queued input until the prior turn finishes. Equal text
+/// in successive turns must still produce two distinct model responses.
+#[tokio::test(flavor = "current_thread")]
+async fn sequential_turns_with_identical_text_remain_distinct() -> Result<(), BoxError> {
+    LocalSet::new()
+        .run_until(async {
+            let mut harness = start().await?;
+            let (thread, mut handle) = register(&mut harness, "root", true).await?;
+            handle.send(InputMessage::user_text(thread.to_owned(), "same"), "first").await?;
+            harness.model.next_request().await;
+            harness.model.send_text("first answer");
+            harness.model.finish();
+            until_finished(&mut handle).await;
+            until_idle(&mut harness.system, &thread).await;
+            handle.send(InputMessage::user_text(thread.to_owned(), "same"), "second").await?;
+            let second = harness.model.next_request().await;
+            let history = format!("{:?}", second.chat_history);
+            assert!(history.contains("first answer"));
+            assert_eq!(history.matches("same").count(), 2);
+            harness.model.send_text("second answer");
+            harness.model.finish();
+            until_finished(&mut handle).await;
+
+            Ok(())
+        })
+        .await
+}

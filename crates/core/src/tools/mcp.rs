@@ -119,11 +119,17 @@ impl Work {
             return answer;
         }
 
-        let text = match self.server.call(&self.remote, args).await {
-            Ok(Answer::Done(text)) => text,
-            Ok(Answer::Failed(text)) => format!("Error: {text}"),
-            Err(error @ CallError::Unavailable(..)) => format!("Error: {error}"),
-            Err(error @ CallError::Unknown(..)) => format!("Error: {error}. Check its state before retrying a change."),
+        let deadline = match self.authority.deadline(&call.thread).await {
+            Ok(deadline) => deadline,
+            Err(error) => return format!("Error: {error}"),
+        };
+
+        let text = match deadline.run(self.server.call(&self.remote, args)).await {
+            Ok(Ok(Answer::Done(text))) => text,
+            Ok(Ok(Answer::Failed(text))) => format!("Error: {text}"),
+            Ok(Err(error @ CallError::Unavailable(..))) => format!("Error: {error}"),
+            Ok(Err(error @ CallError::Unknown(..))) => format!("Error: {error}. Check its state before retrying a change."),
+            Err(error) => format!("Error: {error}. {UNKNOWN_OUTCOME}"),
         };
         let text = self.authority.redact(text);
 
@@ -205,6 +211,10 @@ mod tests {
 
     /// The `echo` server's tools for owner chat holding `caps`, and its call counter.
     async fn tools(caps: &[Cap]) -> Result<(Vec<McpTool>, Arc<AtomicUsize>), BoxError> {
+        tools_with(caps, Limits::default(), Duration::from_millis(300)).await
+    }
+
+    async fn tools_with(caps: &[Cap], limits: Limits, timeout: Duration) -> Result<(Vec<McpTool>, Arc<AtomicUsize>), BoxError> {
         let (client, server) = tokio::io::duplex(64 * 1024);
         let calls = Arc::new(AtomicUsize::new(0));
         let echo = Echo { calls: Arc::clone(&calls) };
@@ -215,12 +225,12 @@ mod tests {
             }
         });
 
-        let server = Arc::new(Server::connected("echo", client, Duration::from_millis(300)).await?);
+        let server = Arc::new(Server::connected("echo", client, timeout).await?);
         let db = Db::in_memory()?;
         Conversations::new(db.clone()).register_root(&ThreadId::from("chat".to_owned())).await?;
 
         let redactor = Arc::new(Redactor::new(["private-test-key-123456".to_owned()]));
-        let authority = Authority::new(Grants::new(db.clone()), testing::policy(caps, Limits::default())).with_redactor(redactor);
+        let authority = Authority::new(Grants::new(db.clone()), testing::policy(caps, limits)).with_redactor(redactor);
         let operations = Operations::new(db);
         let tools = server.tools().await.into_iter();
 
@@ -286,6 +296,21 @@ mod tests {
         assert_eq!(text, "token=[redacted: one of Shade's secrets]");
         assert_eq!(stored.as_deref(), Some(text.as_str()));
         assert_eq!(call(tool, "call-secret").await, text);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn the_run_deadline_bounds_mcp_calls_and_preserves_unknown_outcomes() -> Result<(), BoxError> {
+        let limits = Limits { max_run_seconds: 2, ..Limits::default() };
+        let (tools, calls) = tools_with(&[Cap::Server("echo".to_owned())], limits, Duration::from_secs(10)).await?;
+        let slow = named(&tools, "echo_slow")?;
+
+        let text = call(slow, "call-1").await;
+        assert!(text.contains("max_run_seconds") && text.contains("may have completed"), "{text}");
+        assert_eq!(slow.work.operations.captured("chat", "call-1").await?.as_deref(), Some(text.as_str()));
+        let _ = call(slow, "call-1").await;
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
 
         Ok(())
     }

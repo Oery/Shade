@@ -20,6 +20,12 @@ pub enum Refusal {
     Limit(String),
 }
 
+/// One persisted work budget. Its identity stays stable when a new chat turn starts.
+pub struct Budget {
+    pub id: i64,
+    pub started_at: i64,
+}
+
 #[derive(Clone)]
 pub struct Grants {
     db: Db,
@@ -70,6 +76,30 @@ impl Grants {
         let id = thread.as_str().to_owned();
 
         self.db.call(move |connection| charge_budget(connection, &id, charge, limits)).await
+    }
+
+    pub async fn budget(&self, thread: &ThreadId<str>) -> Result<Option<Budget>, DbError> {
+        let id = thread.as_str().to_owned();
+
+        self.db
+            .call(move |connection| {
+                let sql = "SELECT b.id, b.started_at FROM threads t JOIN budgets b ON b.id = t.budget_id WHERE t.id = ?1";
+
+                Ok(connection.query_row(sql, [id], |row| Ok(Budget { id: row.get(0)?, started_at: row.get(1)? })).optional()?)
+            })
+            .await
+    }
+
+    /// Expires this budget only; a newer turn of the same root is unaffected.
+    pub async fn expire(&self, budget: i64) -> Result<(), DbError> {
+        self.db
+            .call(move |connection| {
+                let sql = "UPDATE budgets SET exceeded = COALESCE(exceeded, 'max_run_seconds') WHERE id = ?1";
+                connection.execute(sql, [budget])?;
+
+                Ok(())
+            })
+            .await
     }
 
     /// Takes the one runtime failure notice of `thread`'s budget. `false`

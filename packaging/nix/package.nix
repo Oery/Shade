@@ -24,6 +24,7 @@ rustPlatform.buildRustPackage {
       (root + "/deploy")
       (root + "/config.example.toml")
       (root + "/README.md")
+      (root + "/docs/api.md")
     ];
   };
 
@@ -38,6 +39,7 @@ rustPlatform.buildRustPackage {
     install -Dm644 deploy/*.service deploy/*.timer -t $out/lib/systemd/user
     substituteInPlace $out/lib/systemd/user/*.service --replace-fail /usr/bin/ $out/bin/
     install -Dm644 README.md config.example.toml -t $out/share/doc/shade
+    install -Dm644 docs/api.md $out/share/doc/shade/docs/api.md
   '';
 
   meta = {

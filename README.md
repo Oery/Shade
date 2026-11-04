@@ -1,6 +1,6 @@
 # Shade
 
-A personal agent that runs on your own machine. You talk to it in the terminal or on Discord; it can also run scheduled jobs and react to webhooks. What it may do is decided by a config file you write, not by the model: each conversation, job and webhook gets only the capabilities you grant it.
+A personal agent that runs on your own machine. You talk to it in the terminal, on Discord, or through the [client API](docs/api.md); it can also run scheduled jobs and react to webhooks. What it may do is decided by a config file you write, not by the model: each conversation, job and webhook gets only the capabilities you grant it.
 
 - One daemon (`shaded`) and a thin client (`shade`), in Rust, on [Infinity](https://infinity.hydro.run/docs/infinity-runtime/overview/).
 - State in one SQLite database: conversations, jobs, runs, and every tool call's outcome. Work accepted before a crash is finished or reported after it, never silently dropped or repeated.
@@ -87,6 +87,7 @@ touch ~/.config/shade/.env && chmod 600 ~/.config/shade/.env
 | `[mcp.<name>]` | An MCP server over stdio; its name becomes a capability. |
 | `[memory]` | Memories in the vault of one MCP server. |
 | `jobs/*.toml` | Long-lived scheduled jobs, next to the config. Owner chat can draft them; you approve each change. |
+| `[api]`, `[http]` | Personal HTTP JSON/SSE API for native clients and scripts; see [the API guide](docs/api.md). |
 | `[hooks.<name>]`, `[http]` | Webhooks, for this machine and your tailnet. |
 | `[limits]` | Bounds on every turn and run, and on background work. |
 
@@ -139,6 +140,11 @@ print credentials to stderr.
 Optional `[model.prices]` rates add estimated USD, saved per request; see the
 example config. A dash means some usage had no price. These are estimates based
 on reported tokens, not bills; rig 0.31 currently omits cached streaming counts.
+
+Owner-chat messages queue in order within each conversation across all clients;
+separate conversations run concurrently. API clients can browse saved owner
+histories, stream replies and tool activity, and approve proposed changes.
+Enable `[api] token_env = "SHADE_API_TOKEN"` and follow [the client API guide](docs/api.md).
 
 ### As a systemd user service
 
@@ -199,6 +205,7 @@ XDG_DATA_HOME=/tmp/restore shade usage
 
 ## Operating limits
 
+- **Run deadlines and model capacity.** `max_run_seconds` bounds provider requests, response streams and shell/MCP/notification waits, including time waiting for a model slot. Expired runs report a limit failure; interrupted writes may already have taken effect. `max_concurrent_completions` (8 by default) limits active provider requests and streams across all chats and background runs. Background runs also have their own concurrency limit.
 - **Owner control.** The control socket trusts the local user who runs `shaded`. Discord owners use `[chat]`; other users' server mentions use `[discord.guests]`, with separate history and no tools by default.
 - **No exactly-once side effects.** A tool call interrupted before its result was recorded is reported as possibly done, never retried blindly. Notifications and MCP writes can therefore be missed or, if the model retries after checking, done once more.
 - **Grants limit, they do not judge.** A conversation, job or webhook can only use what it was granted, but whatever writes to it (a webhook sender, a web page the shell fetches, a note in the vault) can steer what it does within those caps. Grant narrowly.

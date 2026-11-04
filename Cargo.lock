@@ -2416,17 +2416,14 @@ dependencies = [
  "serde",
  "serde_json",
  "serenity",
- "shade-condition",
  "shade-mcp",
  "shade-policy",
  "shade-proto",
  "shade-sandbox",
  "shade-schedule",
  "shade-store",
- "subtle",
  "thiserror 2.0.21",
  "tokio",
- "toml",
  "tracing",
  "uuid",
 ]
@@ -2436,9 +2433,47 @@ name = "shade-daemon"
 version = "0.1.0"
 dependencies = [
  "clap",
+ "serde",
+ "serde_json",
+ "shade-condition",
  "shade-core",
+ "shade-http",
+ "shade-mcp",
+ "shade-policy",
+ "shade-proto",
+ "shade-sandbox",
+ "shade-store",
  "thiserror 2.0.21",
+ "tokio",
+ "toml",
+ "tracing",
  "tracing-subscriber",
+ "uuid",
+]
+
+[[package]]
+name = "shade-http"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "chrono",
+ "futures-util",
+ "http",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
+ "infinity-agent-core",
+ "serde",
+ "serde_json",
+ "shade-condition",
+ "shade-core",
+ "shade-policy",
+ "shade-proto",
+ "shade-store",
+ "subtle",
+ "thiserror 2.0.21",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -2507,6 +2542,7 @@ dependencies = [
  "serde",
  "serde_json",
  "shade-policy",
+ "shade-proto",
  "thiserror 2.0.21",
  "tokio",
  "tracing",

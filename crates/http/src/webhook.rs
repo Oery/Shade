@@ -23,18 +23,17 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use http::{Method, Request, Response, StatusCode, header};
+use http_body_util::combinators::UnsyncBoxBody;
 use http_body_util::{BodyExt, Full, Limited};
 use hyper::body::Incoming;
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper_util::rt::{TokioIo, TokioTimer};
 use shade_condition::Condition;
-use shade_store::hooks::{Accepted, Admission, HookEvents};
+use shade_core::{Client, HookAccepted as Accepted, HookAdmission as Admission};
 use subtle::ConstantTimeEq;
 use tokio::net::TcpListener;
-use tokio::sync::{Semaphore, mpsc};
-
-use crate::router::Inbound;
+use tokio::sync::Semaphore;
 
 /// Largest body accepted.
 const MAX_BODY: usize = 64 * 1024;
@@ -62,20 +61,25 @@ pub struct Hook {
 }
 
 pub struct Webhooks {
+    api: Option<super::api::Api>,
     hooks: BTreeMap<String, Hook>,
-    events: HookEvents,
-    /// Tells the router a new event can start.
-    inbound: mpsc::Sender<Inbound>,
+    client: Client,
     header_timeout: Duration,
     body_timeout: Duration,
 }
 
 /// An answer: a status and a small JSON body.
-type Answer = Response<Full<Bytes>>;
+pub(crate) type Answer = Response<UnsyncBoxBody<Bytes, Infallible>>;
 
 impl Webhooks {
-    pub fn new(hooks: BTreeMap<String, Hook>, events: HookEvents, inbound: mpsc::Sender<Inbound>) -> Self {
-        Self { hooks, events, inbound, header_timeout: HEADER_TIMEOUT, body_timeout: BODY_TIMEOUT }
+    pub fn new(hooks: BTreeMap<String, Hook>, client: Client) -> Self {
+        Self { api: None, hooks, client, header_timeout: HEADER_TIMEOUT, body_timeout: BODY_TIMEOUT }
+    }
+
+    pub fn with_api(mut self, api: Option<super::api::Api>) -> Self {
+        self.api = api;
+
+        self
     }
 
     /// Serves requests until the task is dropped, at most `MAX_CONNECTIONS` at a time.
@@ -116,6 +120,16 @@ impl Webhooks {
     }
 
     async fn handle(&self, request: Request<Incoming>) -> Answer {
+        if request.uri().path() == "/v1" || request.uri().path().starts_with("/v1/") {
+            return match &self.api {
+                Some(api) => api.handle(request).await,
+                None => answer(
+                    StatusCode::NOT_FOUND,
+                    serde_json::json!({"error": {"code": "not_found", "message": "API is disabled"}}),
+                ),
+            };
+        }
+
         let Some(name) = request.uri().path().strip_prefix("/hook/").filter(|_| request.method() == Method::POST) else {
             return answer(StatusCode::NOT_FOUND, serde_json::json!({ "error": "only POST /hook/<name> is served" }));
         };
@@ -160,12 +174,8 @@ impl Webhooks {
 
     /// Recorded before it is answered, so `202` always means durable.
     async fn accept(&self, name: &str, delivery: Option<String>, input: String, admission: Admission) -> Answer {
-        match self.events.accept(name.to_owned(), delivery, input, admission).await {
-            Ok(Accepted::New(event)) => {
-                // The router also starts it on its next tick if this nudge is lost.
-                let _ = self.inbound.try_send(Inbound::StartBackground);
-                answer(StatusCode::ACCEPTED, serde_json::json!({ "accepted": true, "event": event }))
-            }
+        match self.client.accept_hook(name.to_owned(), delivery, input, admission).await {
+            Ok(Accepted::New(event)) => answer(StatusCode::ACCEPTED, serde_json::json!({ "accepted": true, "event": event })),
             Ok(Accepted::Repeated(event)) => {
                 answer(StatusCode::ACCEPTED, serde_json::json!({ "accepted": true, "event": event, "repeated": true }))
             }
@@ -189,7 +199,7 @@ pub fn listen_address(listen: &str) -> Result<SocketAddr, String> {
 
     if !loopback_or_tailnet(address.ip()) {
         return Err(format!(
-            "[http] listen `{listen}` would serve webhooks beyond this machine and your tailnet; \
+            "[http] listen `{listen}` would serve HTTP beyond this machine and your tailnet; \
              use 127.0.0.1 (with `tailscale serve` in front) or this machine's Tailscale address"
         ));
     }
@@ -205,7 +215,7 @@ fn loopback_or_tailnet(ip: IpAddr) -> bool {
 }
 
 /// The hook's token as `Authorization: Bearer <token>`, compared in constant time.
-fn authorized(request: &Request<Incoming>, token: &str) -> bool {
+pub(super) fn authorized(request: &Request<Incoming>, token: &str) -> bool {
     let Some(sent) = request.headers().get(header::AUTHORIZATION).and_then(|value| value.to_str().ok()) else {
         return false;
     };
@@ -218,7 +228,7 @@ fn authorized(request: &Request<Incoming>, token: &str) -> bool {
 }
 
 /// The body as text, at most `MAX_BODY` bytes.
-async fn read(request: Request<Incoming>) -> Result<String, StatusCode> {
+pub(super) async fn read(request: Request<Incoming>) -> Result<String, StatusCode> {
     let body = match Limited::new(request.into_body(), MAX_BODY).collect().await {
         Ok(collected) => collected.to_bytes(),
         Err(_) => return Err(StatusCode::PAYLOAD_TOO_LARGE),
@@ -259,8 +269,8 @@ fn filter(condition: Option<&Condition>, body: &str) -> Option<Answer> {
     }
 }
 
-fn answer(status: StatusCode, body: serde_json::Value) -> Answer {
-    let mut response = Response::new(Full::new(Bytes::from(body.to_string())));
+pub(super) fn answer(status: StatusCode, body: serde_json::Value) -> Answer {
+    let mut response = Response::new(Full::new(Bytes::from(body.to_string())).boxed_unsync());
     *response.status_mut() = status;
     response.headers_mut().insert(header::CONTENT_TYPE, header::HeaderValue::from_static("application/json"));
 
@@ -282,14 +292,14 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
 
+    use shade_core::HookAdmission as Admission;
     use shade_store::db::Db;
-    use shade_store::hooks::{Admission, HookEvents};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::{TcpListener, TcpStream};
-    use tokio::sync::mpsc;
 
     use super::{Hook, MAX_BODY, Webhooks, listen_address};
-    use crate::error::BoxError;
+    use shade_core::test_support::{self as testing, BoxError, within};
+    use shade_store::hooks::HookEvents;
 
     async fn serve(webhooks: Webhooks) -> Result<SocketAddr, BoxError> {
         let listener = TcpListener::bind("127.0.0.1:0").await?;
@@ -302,18 +312,22 @@ mod tests {
     /// A client that connects and never sends its request is dropped.
     #[tokio::test]
     async fn silent_clients_are_dropped() -> Result<(), BoxError> {
-        let (inbound, _queue) = mpsc::channel(4);
-        let mut webhooks = Webhooks::new(BTreeMap::new(), HookEvents::new(Db::in_memory()?), inbound);
-        webhooks.header_timeout = Duration::from_millis(200);
-        let address = serve(webhooks).await?;
+        within(async {
+            let db = Db::in_memory()?;
+            let (client, _model) = testing::client(&db, testing::policy(&[], Default::default())).await?;
+            let mut webhooks = Webhooks::new(BTreeMap::new(), client);
+            webhooks.header_timeout = Duration::from_millis(200);
+            let address = serve(webhooks).await?;
 
-        let mut stream = TcpStream::connect(address).await?;
-        let mut rest = Vec::new();
-        let closed = tokio::time::timeout(Duration::from_secs(5), stream.read_to_end(&mut rest)).await;
+            let mut stream = TcpStream::connect(address).await?;
+            let mut rest = Vec::new();
+            let closed = tokio::time::timeout(Duration::from_secs(5), stream.read_to_end(&mut rest)).await;
 
-        assert!(closed.is_ok(), "a silent connection was kept open");
+            assert!(closed.is_ok(), "a silent connection was kept open");
 
-        Ok(())
+            Ok(())
+        })
+        .await
     }
 
     /// Only loopback and Tailscale addresses are served.
@@ -372,45 +386,50 @@ mod tests {
     /// recorded before `202`, once per delivery ID; anything else is not recorded.
     #[tokio::test]
     async fn requests_are_answered_as_documented() -> Result<(), BoxError> {
-        let events = HookEvents::new(Db::in_memory()?);
-        let condition = serde_json::from_value(serde_json::json!({ "pointer": "/conclusion", "op": "==", "value": "failure" }))?;
-        let hook = Hook {
-            token: "secret".to_owned(),
-            template: "{body}".to_owned(),
-            condition: Some(condition),
-            delivery_header: Some("X-Delivery".to_owned()),
-            admission: Admission { queued: 10, per_minute: 10 },
-        };
+        within(async {
+            let db = Db::in_memory()?;
+            let events = HookEvents::new(db.clone());
+            let condition = serde_json::from_value(serde_json::json!({ "pointer": "/conclusion", "op": "==", "value": "failure" }))?;
+            let hook = Hook {
+                token: "secret".to_owned(),
+                template: "{body}".to_owned(),
+                condition: Some(condition),
+                delivery_header: Some("X-Delivery".to_owned()),
+                admission: Admission { queued: 10, per_minute: 10 },
+            };
 
-        let (inbound, _queue) = mpsc::channel(4);
-        let webhooks = Webhooks::new(BTreeMap::from([("ci".to_owned(), hook)]), events.clone(), inbound);
-        let address = serve(webhooks).await?;
+            let limits = shade_policy::Limits { max_concurrent_background_runs: 0, ..Default::default() };
+            let (client, _model) = testing::client(&db, testing::policy(&[], limits)).await?;
+            let webhooks = Webhooks::new(BTreeMap::from([("ci".to_owned(), hook)]), client);
+            let address = serve(webhooks).await?;
 
-        let failure = r#"{"conclusion": "failure"}"#;
-        let too_large = "x".repeat(MAX_BODY + 1);
+            let failure = r#"{"conclusion": "failure"}"#;
+            let too_large = "x".repeat(MAX_BODY + 1);
 
-        let cases: [Case<'_>; 10] = [
-            ("/other", Some("secret"), None, failure, 404),
-            // An unknown hook looks exactly like a wrong token.
-            ("/hook/other", Some("secret"), None, failure, 401),
-            ("/hook/ci", None, None, failure, 401),
-            ("/hook/ci", Some("secreT"), None, failure, 401),
-            ("/hook/ci", Some("secret"), None, &too_large, 413),
-            ("/hook/ci", Some("secret"), None, "not json", 400),
-            ("/hook/ci", Some("secret"), None, r#"{"conclusion": 3}"#, 422),
-            ("/hook/ci", Some("secret"), None, r#"{"conclusion": "success"}"#, 202),
-            ("/hook/ci", Some("secret"), Some("d1"), failure, 202),
-            ("/hook/ci", Some("secret"), Some("d1"), failure, 202),
-        ];
+            let cases: [Case<'_>; 10] = [
+                ("/other", Some("secret"), None, failure, 404),
+                // An unknown hook looks exactly like a wrong token.
+                ("/hook/other", Some("secret"), None, failure, 401),
+                ("/hook/ci", None, None, failure, 401),
+                ("/hook/ci", Some("secreT"), None, failure, 401),
+                ("/hook/ci", Some("secret"), None, &too_large, 413),
+                ("/hook/ci", Some("secret"), None, "not json", 400),
+                ("/hook/ci", Some("secret"), None, r#"{"conclusion": 3}"#, 422),
+                ("/hook/ci", Some("secret"), None, r#"{"conclusion": "success"}"#, 202),
+                ("/hook/ci", Some("secret"), Some("d1"), failure, 202),
+                ("/hook/ci", Some("secret"), Some("d1"), failure, 202),
+            ];
 
-        for (path, token, delivery, body, expected) in cases {
-            let status = post(address, path, token, delivery, body).await?;
-            assert_eq!(status, expected, "{path} token={token:?} delivery={delivery:?} body={:.40}", body);
-        }
+            for (path, token, delivery, body, expected) in cases {
+                let status = post(address, path, token, delivery, body).await?;
+                assert_eq!(status, expected, "{path} token={token:?} delivery={delivery:?} body={:.40}", body);
+            }
 
-        // Only the matching event is recorded, once, and it was there when `202` came back.
-        assert_eq!(events.startable(10).await?.len(), 1);
+            // Only the matching event is recorded, once, and it was there when `202` came back.
+            assert_eq!(events.startable(10).await?.len(), 1);
 
-        Ok(())
+            Ok(())
+        })
+        .await
     }
 }

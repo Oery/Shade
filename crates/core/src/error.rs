@@ -25,15 +25,6 @@ pub enum Error {
     #[error("cannot set up control socket {path}: {source}")]
     Socket { path: PathBuf, source: std::io::Error },
 
-    #[error("cannot locate the config file: set XDG_CONFIG_HOME or HOME to an absolute path, or pass --config")]
-    NoConfigDir,
-
-    #[error("cannot read config {path}: {source}")]
-    ConfigRead { path: PathBuf, source: std::io::Error },
-
-    #[error("invalid config {path}: {source}")]
-    ConfigParse { path: PathBuf, source: toml::de::Error },
-
     #[error("invalid config {path}: {message}")]
     ConfigInvalid { path: PathBuf, message: String },
 
@@ -78,19 +69,4 @@ pub enum Error {
 
     #[error("{0}")]
     McpServer(String),
-
-    #[error(
-        "{name} ([hooks.{hook}] token_env) is not set in the environment or the .env file next to the config, or is shorter \
-         than 32 characters; generate one with `openssl rand -hex 32`"
-    )]
-    HookToken { hook: String, name: String },
-
-    #[error("cannot serve webhooks on {listen} ([http] listen): {source}")]
-    Webhooks { listen: String, source: std::io::Error },
-
-    #[error("cannot start the async runtime: {0}")]
-    Runtime(std::io::Error),
-
-    #[error("cannot listen for shutdown signals: {0}")]
-    Signal(std::io::Error),
 }

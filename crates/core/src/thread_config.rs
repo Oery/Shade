@@ -105,6 +105,12 @@ impl ThreadTools {
 
     /// Where a chat conversation takes place, so the model knows who can read it.
     async fn place(&self, thread: &ThreadId<str>) -> Result<&'static str, BoxError> {
+        let grant = shade_store::grants::Grants::new(self.db.clone()).of(thread).await?;
+
+        if grant.is_some_and(|grant| grant.source == "api") {
+            return Ok("This is the owner's personal chat through Shade's client API; notifications reach them on Discord.");
+        }
+
         let place = match Roots::new(self.db.clone()).conversation_of(thread).await? {
             Some(Conversation { adapter: Adapter::Discord, direct: true, .. }) => {
                 "This conversation is the owner's Discord DMs: only they read it, and `dm` is this place."

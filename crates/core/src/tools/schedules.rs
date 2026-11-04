@@ -195,6 +195,18 @@ impl Work {
     }
 
     async fn run<M>(&self, action: Action, args: serde_json::Value, call: &Call<M>) -> Result<Answer, String> {
+        let deadline = match self.authority.deadline(&call.thread).await {
+            Ok(deadline) => deadline,
+            Err(error) => return Err(error.to_string()),
+        };
+
+        match deadline.run(self.apply(action, args, call)).await {
+            Ok(result) => result,
+            Err(error) => Err(format!("{error}. {}", crate::recovery::UNKNOWN_OUTCOME)),
+        }
+    }
+
+    async fn apply<M>(&self, action: Action, args: serde_json::Value, call: &Call<M>) -> Result<Answer, String> {
         let authorized = match self.authority.admit_management(&call.thread, &Cap::Schedules).await {
             Ok(authorized) => authorized,
             Err(denied) => return Err(denied.to_string()),

@@ -5,6 +5,7 @@
 
 pub mod audit;
 pub mod backup;
+pub mod chat;
 pub mod conversation;
 pub mod db;
 pub mod grants;

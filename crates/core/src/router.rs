@@ -5,14 +5,22 @@
 //! its turn to the end. A pump outlives its client, so a turn's outcome is
 //! always settled. Work interrupted by a restart re-enters the same path.
 
+mod chat;
+mod client;
 mod hooks;
+mod resume;
 mod schedules;
 pub mod turn;
 
 #[cfg(test)]
 mod tests;
 
+#[cfg(test)]
+mod chat_tests;
+
+use std::cell::RefCell;
 use std::path::PathBuf;
+use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -41,6 +49,8 @@ use tokio::time::MissedTickBehavior;
 
 use crate::adapters::discord::Reply;
 use crate::authority::{Authority, Metered};
+use crate::chat::ChatRuntime;
+use crate::deadline::Deadline;
 use crate::error::BoxError;
 use crate::model::Model;
 use crate::notify::Notifier;
@@ -49,7 +59,8 @@ use crate::router::turn::{Step, Turn};
 use crate::telemetry::Telemetry;
 use crate::thread_config::{Services, ThreadTools};
 use crate::tools::Shown;
-use crate::{tools, usage};
+use crate::usage;
+use shade_store::chat::Chats;
 
 /// Capacity of each reply stream between the router and a socket connection.
 pub const REPLY_QUEUE: usize = 64;
@@ -61,6 +72,10 @@ pub type System = LaunchingSystem<Conversations, States, NoRapHttp>;
 
 /// Input from an adapter.
 pub enum Inbound {
+    Client {
+        command: crate::client::Command,
+        reply: tokio::sync::oneshot::Sender<Result<crate::client::Reply, crate::client::ClientError>>,
+    },
     /// User text for a conversation.
     Prompt {
         adapter: Adapter,
@@ -115,11 +130,24 @@ pub enum Outbound {
 }
 
 impl Outbound {
+    fn delivery(&self) -> String {
+        match self {
+            Self::Discord(reply) => reply.channel_key(),
+            _ => "terminal".to_owned(),
+        }
+    }
+
     async fn send(&mut self, thread: &str, step: Step) {
         match self {
             Self::Client(reply) => {
                 if let Some(response) = response_for(step) {
-                    let _ = reply.send(response).await;
+                    // Give a healthy socket writer time to drain a burst, but
+                    // detach a stalled client so the turn can still settle.
+                    let sent = tokio::time::timeout(Duration::from_secs(1), reply.send(response)).await;
+
+                    if !matches!(sent, Ok(Ok(()))) {
+                        *self = Self::Detached(None);
+                    }
                 }
             }
             Self::Discord(reply) => reply.send(step).await,
@@ -153,6 +181,8 @@ pub struct Router {
     /// Reports failed work nobody is watching.
     notifier: Option<Notifier>,
     job_files: Arc<JobFiles>,
+    chat: Rc<ChatRuntime>,
+    completed: RefCell<Option<mpsc::Receiver<()>>>,
 }
 
 impl Router {
@@ -179,13 +209,36 @@ impl Router {
         let schedules = Schedules::new(db.clone());
         let hooks = HookEvents::new(db.clone());
 
-        Self { db, policy, inbox, roots, operations, usages, telemetry, schedules, hooks, system, discord, notifier, job_files }
+        let (wakeup, completed) = mpsc::channel(1);
+        let chat = Rc::new(ChatRuntime::new(Chats::new(db.clone()), wakeup));
+
+        Self {
+            db,
+            policy,
+            inbox,
+            roots,
+            operations,
+            usages,
+            telemetry,
+            schedules,
+            hooks,
+            system,
+            discord,
+            notifier,
+            job_files,
+            chat,
+            completed: RefCell::new(Some(completed)),
+        }
     }
 
     /// Handles input and runs due jobs until the channel closes. Must run
     /// inside a `LocalSet`. The first tick is immediate, so jobs missed
     /// while the daemon was down run at startup.
     pub async fn serve(&self, mut inbound: mpsc::Receiver<Inbound>) {
+        let Some(mut completed) = self.completed.borrow_mut().take() else {
+            return;
+        };
+
         let mut ticks = tokio::time::interval(SCHEDULE_TICK);
         ticks.set_missed_tick_behavior(MissedTickBehavior::Delay);
 
@@ -195,13 +248,21 @@ impl Router {
                     Some(input) => self.handle(input).await,
                     None => return,
                 },
-                _ = ticks.tick() => self.schedule(Utc::now()).await,
+                _ = completed.recv() => self.start_chats().await,
+                _ = ticks.tick() => {
+                    self.start_chats().await;
+                    self.schedule(Utc::now()).await;
+                },
             }
         }
     }
 
     async fn handle(&self, input: Inbound) {
         match input {
+            Inbound::Client { command, reply } => {
+                let result = self.client_command(command).await;
+                let _ = reply.send(result);
+            }
             Inbound::Prompt { adapter, target, text, source_key, outbound } => {
                 self.prompt(adapter, target, text, source_key, outbound).await;
             }
@@ -219,24 +280,16 @@ impl Router {
     /// before any new input is accepted.
     pub async fn resume(&self) -> Result<(), BoxError> {
         let mut resumed = Vec::new();
+        let answers = recovery::answers(&self.operations).await?;
+        let continuing = answers.iter().map(|answer| answer.thread.as_str().to_owned()).collect();
+        self.chat.store.recover(continuing).await?;
 
-        for answer in recovery::answers(&self.operations).await? {
-            let handle = self.attach(&answer.thread).await?;
-            let outbound = self.outbound_for(&answer.thread).await;
-            resumed.push(answer.thread.as_str().to_owned());
-            tools::deliver(&self.system.sender(), answer.thread, answer.id, answer.call_id, answer.text).await?;
-            tokio::task::spawn_local(pump(handle, Turn::continuing(), outbound, None, self.telemetry.clone()));
-        }
-
-        for input in self.inbox.unsettled().await? {
-            tracing::info!(root = %input.root, input = %input.id, "resending an input accepted before the restart");
-            let outbound = self.outbound_for(&input.root).await;
-            resumed.push(input.root.as_str().to_owned());
-            self.dispatch(input, outbound).await;
-        }
+        self.resume_tools(answers, &mut resumed).await?;
+        self.resume_inputs(&mut resumed).await?;
 
         self.interrupt_hook_events(resumed.to_owned()).await?;
         self.interrupt_runs(resumed).await?;
+        self.start_chats().await;
 
         Ok(())
     }
@@ -253,6 +306,11 @@ impl Router {
     }
 
     async fn prompt(&self, adapter: Adapter, target: Target, text: String, source_key: Option<String>, mut outbound: Outbound) {
+        if adapter != Adapter::DiscordGuest {
+            self.enqueue_chat(adapter, target, text, source_key, outbound).await;
+            return;
+        }
+
         match self.inbox.accept(adapter, target, text, source_key).await {
             Ok(Some(input)) => self.dispatch(input, outbound).await,
             Ok(None) => tracing::debug!("ignoring a message delivered twice"),
@@ -268,6 +326,7 @@ impl Router {
             Ok(handle) => handle,
             Err(message) => {
                 settle(&self.inbox, &id, &message).await;
+                self.finish_chat(root.as_str(), &id, &Step::Failed(message.to_owned())).await;
                 outbound.send(root.as_str(), Step::Failed(message)).await;
                 return;
             }
@@ -282,7 +341,43 @@ impl Router {
             return;
         }
 
-        tokio::task::spawn_local(pump(handle, turn, outbound, Some((self.inbox.clone(), id)), self.telemetry.clone()));
+        self.follow(handle, turn, outbound, Some((self.inbox.clone(), id))).await;
+    }
+
+    /// A deadline also ends the outward turn during Infinity's retry backoff.
+    async fn follow(&self, handle: ThreadHandle, turn: Turn, mut outbound: Outbound, input: Option<(Inbox, String)>) {
+        let grants = Grants::new(self.db.clone());
+        let deadline = match Deadline::for_thread(grants, handle.thread_id(), self.policy.limits.max_run_seconds).await {
+            Ok(deadline) => deadline,
+            Err(error) => {
+                let message = error.to_string();
+
+                if let Some((inbox, id)) = &input {
+                    settle(inbox, id, &message).await;
+                }
+
+                if let Some((_, id)) = &input {
+                    self.finish_chat(handle.thread_id().as_str(), id, &Step::Failed(message.to_owned())).await;
+                }
+
+                outbound.send(handle.thread_id().as_str(), Step::Failed(message)).await;
+                return;
+            }
+        };
+
+        let tracked = match &input {
+            Some((_, id)) => Some(id.to_owned()),
+            None => match self.chat.store.running(handle.thread_id().as_str()).await {
+                Ok(Some(turn)) => Some(turn.id),
+                _ => None,
+            },
+        };
+        let tracked = match tracked {
+            Some(id) if self.chat.tracks(handle.thread_id().as_str(), &id) => Some((Rc::clone(&self.chat), id)),
+            _ => None,
+        };
+
+        tokio::task::spawn_local(pump(handle, turn, outbound, input, self.telemetry.clone(), deadline, tracked));
     }
 
     /// Where resumed work in `thread` reports: its run's record, or its Discord channel, if it is one.
@@ -440,12 +535,27 @@ impl Router {
 /// turn fails is settled before its sender hears of it, so it is never run
 /// again after a restart. A pump cut short by shutdown leaves its input to
 /// be resent.
-async fn pump(mut handle: ThreadHandle, mut turn: Turn, mut outbound: Outbound, input: Option<(Inbox, String)>, telemetry: Telemetry) {
-    while let Some(event) = handle.recv().await {
-        telemetry.observe(handle.thread_id().as_str(), &event);
+async fn pump(
+    mut handle: ThreadHandle, mut turn: Turn, mut outbound: Outbound, input: Option<(Inbox, String)>, telemetry: Telemetry,
+    deadline: Deadline, tracked: Option<(Rc<ChatRuntime>, String)>,
+) {
+    loop {
+        let step = match deadline.run(handle.recv()).await {
+            Ok(Some(event)) => {
+                telemetry.observe(handle.thread_id().as_str(), &event);
 
-        let Some(step) = turn.on_event(event) else {
-            continue;
+                if let Some((chat, id)) = &tracked {
+                    chat.observe(handle.thread_id().as_str(), id, &event);
+                }
+
+                let Some(step) = turn.on_event(event) else {
+                    continue;
+                };
+
+                step
+            }
+            Ok(None) => return,
+            Err(error) => Step::Failed(error.to_string()),
         };
 
         let step = match step {
@@ -468,12 +578,28 @@ async fn pump(mut handle: ThreadHandle, mut turn: Turn, mut outbound: Outbound, 
             telemetry.event(handle.thread_id().as_str(), "turn", summary.to_owned());
         }
 
+        if let Err(error) = publish_step(tracked.as_ref(), handle.thread_id().as_str(), &step).await {
+            tracing::error!(%error, "cannot finish chat turn; queue remains blocked until recovery");
+            outbound.send(handle.thread_id().as_str(), Step::Failed("cannot save the turn status".to_owned())).await;
+            return;
+        }
+
         outbound.send(handle.thread_id().as_str(), step).await;
 
         if last {
             return;
         }
     }
+}
+
+async fn publish_step(tracked: Option<&(Rc<ChatRuntime>, String)>, root: &str, step: &Step) -> Result<(), shade_store::db::DbError> {
+    let Some((chat, id)) = tracked else {
+        return Ok(());
+    };
+
+    chat.step(root, id, step);
+
+    chat.finish(root, id, step).await
 }
 
 /// Why a turn ended without its answer, if it did.

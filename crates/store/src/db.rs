@@ -42,6 +42,7 @@ const MIGRATIONS: &[&str] = &[
     include_str!("../migrations/0014_direct_conversations.sql"),
     include_str!("../migrations/0015_hook_events.sql"),
     include_str!("../migrations/0016_audit.sql"),
+    include_str!("../migrations/0017_chat_turns.sql"),
 ];
 
 type Job = Box<dyn FnOnce(&mut Connection) + Send>;
@@ -198,4 +199,50 @@ fn migrate(connection: &mut Connection) -> Result<(), OpenError> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod migration_tests {
+    use infinity_agent_core::message::InfinityMessage;
+    use infinity_provider_protocol::message::{ToolCall, UserContent};
+    use rusqlite::params;
+
+    use super::*;
+    use crate::BoxError;
+    use crate::roots::{Adapter, Target};
+
+    #[test]
+    fn adopting_legacy_chat_keeps_pending_tools_ahead_of_queued_messages() -> Result<(), BoxError> {
+        let mut connection = Connection::open_in_memory()?;
+        configure(&connection)?;
+
+        for (index, migration) in MIGRATIONS[..MIGRATIONS.len() - 1].iter().enumerate() {
+            connection.execute_batch(migration)?;
+            connection.pragma_update(None, "user_version", (index + 1) as u32)?;
+        }
+
+        let target = Target::Named("default".to_owned());
+        let root = crate::roots::turn(&connection, Adapter::Terminal, &target)?;
+        crate::inbox::insert(&connection, "processed", &root, "run", None)?;
+        crate::inbox::insert(&connection, "queued", &root, "wait", None)?;
+        let user = InfinityMessage::User { content: UserContent::text("run") };
+        let call = InfinityMessage::ToolCall { call: ToolCall::new("call", "shell", serde_json::json!({})), display_as: None };
+        connection.execute(
+            "INSERT INTO messages (thread_id, ord, message_id, body) VALUES (?1, 0, 'processed', ?2)",
+            params![root, serde_json::to_string(&user)?],
+        )?;
+        connection.execute(
+            "INSERT INTO messages (thread_id, ord, message_id, body) VALUES (?1, 1, 'completion', ?2)",
+            params![root, serde_json::to_string(&call)?],
+        )?;
+        connection.execute("INSERT INTO processed_ids (thread_id, id) VALUES (?1, 'processed')", [&root])?;
+
+        migrate(&mut connection)?;
+        let active: String = connection.query_row("SELECT status FROM chat_turns WHERE input_id = 'processed'", [], |row| row.get(0))?;
+        let queued: String = connection.query_row("SELECT status FROM chat_turns WHERE input_id = 'queued'", [], |row| row.get(0))?;
+        assert_eq!(active, "running");
+        assert_eq!(queued, "queued");
+
+        Ok(())
+    }
 }

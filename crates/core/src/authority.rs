@@ -19,7 +19,9 @@ use shade_policy::{Cap, Caps, Charge, Origin, Policy};
 use shade_store::db::DbError;
 use shade_store::grants::{Grants, Refusal};
 use thiserror::Error;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
+use crate::deadline::Deadline;
 use crate::error::BoxError;
 use crate::memory::Memory;
 use crate::prompt;
@@ -82,6 +84,10 @@ impl Authority {
 
     pub fn policy(&self) -> &Policy {
         &self.policy
+    }
+
+    pub async fn deadline(&self, thread: &ThreadId<str>) -> Result<Deadline, Denied> {
+        Deadline::for_thread(self.grants.clone(), thread, self.policy.limits.max_run_seconds).await
     }
 
     /// The authority of the root that owns `thread`. Fails closed.
@@ -151,11 +157,14 @@ pub struct Metered<S> {
     telemetry: Telemetry,
     prices: Option<Prices>,
     memory: Option<Arc<Memory>>,
+    completions: Arc<Semaphore>,
 }
 
 impl<S> Metered<S> {
     pub fn new(inner: S, authority: Authority, telemetry: Telemetry, memory: Option<Arc<Memory>>, prices: Option<Prices>) -> Self {
-        Self { inner, authority, telemetry, memory, prices }
+        let completions = Arc::new(Semaphore::new(usize::from(authority.policy().limits.max_concurrent_completions)));
+
+        Self { inner, authority, telemetry, memory, prices, completions }
     }
 }
 
@@ -163,6 +172,7 @@ impl<S> Metered<S> {
 impl<S: ModelSource> ModelSource for Metered<S> {
     async fn resolve(&self, thread_id: &ThreadId<str>) -> Result<ResolvedModel, BoxError> {
         let mut model = self.inner.resolve(thread_id).await?;
+        let deadline = Arc::new(self.authority.deadline(thread_id).await?);
 
         let provider = MeteredProvider {
             inner: model.provider,
@@ -171,6 +181,8 @@ impl<S: ModelSource> ModelSource for Metered<S> {
             telemetry: self.telemetry.clone(),
             prices: self.prices,
             memory: self.memory.clone(),
+            completions: Arc::clone(&self.completions),
+            deadline,
         };
         model.provider = Arc::new(provider);
 
@@ -185,6 +197,9 @@ struct MeteredProvider {
     telemetry: Telemetry,
     prices: Option<Prices>,
     memory: Option<Arc<Memory>>,
+    completions: Arc<Semaphore>,
+    /// Retries of an old completion must never borrow a newer turn's deadline.
+    deadline: Arc<Deadline>,
 }
 
 #[async_trait]
@@ -195,13 +210,49 @@ impl ModelProvider for MeteredProvider {
 
     /// A refusal is fatal, so Infinity ends the step instead of retrying.
     /// Also replaces Infinity's coding-agent prompt with Shade's (see `prompt`).
-    async fn invoke_model(&self, model_id: &str, mut request: CompletionRequest) -> Result<ModelStream, CompletionError> {
+    async fn invoke_model(&self, model_id: &str, request: CompletionRequest) -> Result<ModelStream, CompletionError> {
+        let deadline = Arc::clone(&self.deadline);
+
+        let (stream, permit) = match deadline.run(self.start(model_id, request)).await {
+            Ok(result) => result?,
+            Err(denied) => return Err(self.refused(denied)),
+        };
+
+        let (telemetry, thread, model, prices) =
+            (self.telemetry.clone(), self.thread.as_str().to_owned(), model_id.to_owned(), self.prices);
+
+        let recorded = bounded_stream(stream, deadline, permit).inspect(move |chunk| match chunk {
+            Ok(StreamChunk::Final(FinalResponse { usage })) => {
+                telemetry.event(&thread, "completion", format!("finished {model}; usage reported={}", usage.is_some()));
+
+                if let Some(usage) = usage {
+                    telemetry.usage(&thread, &model, *usage, prices.map(|price| price.estimate(usage)));
+                }
+            }
+            Err(_) => telemetry.event(&thread, "error", "provider stream failed".to_owned()),
+            _ => {}
+        });
+
+        Ok(Box::pin(recorded))
+    }
+}
+
+impl MeteredProvider {
+    fn refused(&self, denied: Denied) -> CompletionError {
+        self.telemetry.event(self.thread.as_str(), "refused", denied.to_string());
+
+        CompletionError::provider(ErrorClass::Fatal, denied.to_string())
+    }
+
+    async fn start(&self, model_id: &str, mut request: CompletionRequest) -> Result<(ModelStream, OwnedSemaphorePermit), CompletionError> {
+        let permit = match Arc::clone(&self.completions).acquire_owned().await {
+            Ok(permit) => permit,
+            Err(_) => return Err(CompletionError::provider(ErrorClass::Fatal, "the model request queue is closed")),
+        };
+
         let authorized = match self.authority.admit_completion(&self.thread).await {
             Ok(authorized) => authorized,
-            Err(denied) => {
-                self.telemetry.event(self.thread.as_str(), "refused", denied.to_string());
-                return Err(CompletionError::provider(ErrorClass::Fatal, denied.to_string()));
-            }
+            Err(denied) => return Err(self.refused(denied)),
         };
 
         let memory = match &self.memory {
@@ -224,23 +275,32 @@ impl ModelProvider for MeteredProvider {
                 return Err(error);
             }
         };
-        let (telemetry, thread, model, prices) =
-            (self.telemetry.clone(), self.thread.as_str().to_owned(), model_id.to_owned(), self.prices);
 
-        let recorded = stream.inspect(move |chunk| match chunk {
-            Ok(StreamChunk::Final(FinalResponse { usage })) => {
-                telemetry.event(&thread, "completion", format!("finished {model}; usage reported={}", usage.is_some()));
-
-                if let Some(usage) = usage {
-                    telemetry.usage(&thread, &model, *usage, prices.map(|price| price.estimate(usage)));
-                }
-            }
-            Err(_) => telemetry.event(&thread, "error", "provider stream failed".to_owned()),
-            _ => {}
-        });
-
-        Ok(Box::pin(recorded))
+        Ok((stream, permit))
     }
+}
+
+/// The permit covers the entire response. Cancellation, errors and the final
+/// chunk release it, even if the consumer never polls the stream again.
+fn bounded_stream(stream: ModelStream, deadline: Arc<Deadline>, permit: OwnedSemaphorePermit) -> ModelStream {
+    let state = Some((stream, deadline, permit));
+    let stream = futures_util::stream::unfold(state, |state| async move {
+        let (mut stream, deadline, permit) = state?;
+
+        let chunk = match deadline.run(stream.next()).await {
+            Ok(chunk) => chunk?,
+            Err(denied) => Err(CompletionError::provider(ErrorClass::Fatal, denied.to_string())),
+        };
+
+        let state = match &chunk {
+            Err(_) | Ok(StreamChunk::Final(_)) => None,
+            _ => Some((stream, deadline, permit)),
+        };
+
+        Some((chunk, state))
+    });
+
+    Box::pin(stream)
 }
 
 #[cfg(test)]
@@ -261,6 +321,125 @@ mod tests {
     use super::Denied;
     use crate::error::BoxError;
     use crate::testing::{self, attach, reaches_model, reply, until, within};
+
+    /// Stalls either before the HTTP response or while reading its stream.
+    struct Stalled {
+        before_stream: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl infinity_provider_protocol::ModelProvider for Stalled {
+        async fn list_models(&self) -> Result<Vec<infinity_provider_protocol::ModelEntry>, BoxError> {
+            Ok(Vec::new())
+        }
+
+        async fn invoke_model(
+            &self, _model: &str, _request: infinity_provider_protocol::CompletionRequest,
+        ) -> Result<infinity_provider_protocol::ModelStream, infinity_provider_protocol::CompletionError> {
+            if self.before_stream {
+                std::future::pending::<()>().await;
+            }
+
+            Ok(Box::pin(futures_util::stream::pending()))
+        }
+    }
+
+    async fn stalled(
+        db: &Db, thread: ThreadId, before_stream: bool, completions: Arc<tokio::sync::Semaphore>,
+    ) -> Result<super::MeteredProvider, BoxError> {
+        let limits = Limits { max_run_seconds: 2, ..Limits::default() };
+        let authority = super::Authority::new(shade_store::grants::Grants::new(db.clone()), testing::policy(&[Cap::Now], limits));
+        let telemetry = crate::telemetry::Telemetry::new(db.clone(), Arc::default());
+
+        let deadline = Arc::new(authority.deadline(&thread).await?);
+
+        Ok(super::MeteredProvider {
+            inner: Arc::new(Stalled { before_stream }),
+            thread,
+            authority,
+            telemetry,
+            prices: None,
+            memory: None,
+            completions,
+            deadline,
+        })
+    }
+
+    #[tokio::test]
+    async fn stalled_requests_and_streams_expire_and_release_capacity() -> Result<(), BoxError> {
+        use futures_util::StreamExt;
+        use infinity_provider_protocol::{CompletionRequest, ErrorClass, ModelProvider};
+
+        for before_stream in [true, false] {
+            let db = Db::in_memory()?;
+            shade_store::conversation::Conversations::new(db.clone()).register_root(&root()).await?;
+            let permits = Arc::new(tokio::sync::Semaphore::new(1));
+            let provider = stalled(&db, root(), before_stream, Arc::clone(&permits)).await?;
+
+            let result = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+                match provider.invoke_model("mock", CompletionRequest::default()).await {
+                    Ok(mut stream) => stream.next().await.ok_or("missing stream error"),
+                    Err(error) => Ok(Err(error)),
+                }
+            })
+            .await??;
+            let error = result.err().ok_or("a stalled provider succeeded")?;
+
+            assert_eq!(error.class(), ErrorClass::Fatal);
+            assert!(error.to_string().contains("max_run_seconds"));
+            assert_eq!(permits.available_permits(), 1, "the expired call kept its slot");
+            assert!(matches!(provider.authority.admit_tool(&root(), &Cap::Now).await, Err(Denied::Limit(_))));
+        }
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn model_capacity_covers_streams_and_cancellation() -> Result<(), BoxError> {
+        use infinity_provider_protocol::{CompletionRequest, ModelProvider};
+
+        let db = Db::in_memory()?;
+        let conversations = shade_store::conversation::Conversations::new(db.clone());
+        let other = ThreadId::from("other".to_owned());
+        conversations.register_root(&root()).await?;
+        conversations.register_root(&other).await?;
+        let permits = Arc::new(tokio::sync::Semaphore::new(1));
+        let first = stalled(&db, root(), false, Arc::clone(&permits)).await?;
+        let second = stalled(&db, other, false, Arc::clone(&permits)).await?;
+
+        let stream = first.invoke_model("mock", CompletionRequest::default()).await?;
+        let waiting = second.invoke_model("mock", CompletionRequest::default());
+        tokio::pin!(waiting);
+        assert!(tokio::time::timeout(std::time::Duration::from_millis(20), &mut waiting).await.is_err());
+
+        drop(stream);
+        let stream = waiting.await?;
+        assert_eq!(permits.available_permits(), 0);
+        drop(stream);
+        assert_eq!(permits.available_permits(), 1);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn waiting_for_model_capacity_uses_the_run_deadline() -> Result<(), BoxError> {
+        use infinity_provider_protocol::{CompletionRequest, ModelProvider};
+
+        let db = Db::in_memory()?;
+        shade_store::conversation::Conversations::new(db.clone()).register_root(&root()).await?;
+        let permits = Arc::new(tokio::sync::Semaphore::new(1));
+        let held = Arc::clone(&permits).acquire_owned().await?;
+        let provider = stalled(&db, root(), false, Arc::clone(&permits)).await?;
+
+        let result =
+            tokio::time::timeout(std::time::Duration::from_secs(3), provider.invoke_model("mock", CompletionRequest::default())).await?;
+        assert!(result.err().ok_or("a queued call succeeded")?.to_string().contains("max_run_seconds"));
+
+        drop(held);
+        assert_eq!(permits.available_permits(), 1);
+
+        Ok(())
+    }
 
     fn root() -> ThreadId {
         ThreadId::from("root".to_owned())

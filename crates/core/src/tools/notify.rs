@@ -159,9 +159,15 @@ impl Work {
             return answer;
         }
 
-        let text = match notifier.send(destination, message).await {
-            Ok(()) => "Sent to the owner.".to_owned(),
-            Err(error) => format!("Error: {error}"),
+        let deadline = match self.authority.deadline(&call.thread).await {
+            Ok(deadline) => deadline,
+            Err(error) => return format!("Error: {error}"),
+        };
+
+        let text = match deadline.run(notifier.send(destination, message)).await {
+            Ok(Ok(())) => "Sent to the owner.".to_owned(),
+            Ok(Err(error)) => format!("Error: {error}"),
+            Err(error) => format!("Error: {error}. {UNKNOWN_OUTCOME}"),
         };
         let text = self.authority.redact(text);
 
@@ -277,6 +283,39 @@ mod tests {
         }
 
         Ok(())
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_unconfirmed_notification_expires_without_being_resent() -> Result<(), BoxError> {
+        within(async {
+            let db = Db::in_memory()?;
+            Conversations::new(db.clone()).register_root(&root()).await?;
+            let (notifier, mut queue) = Notifier::new(Grants::new(db.clone()));
+            let limits = Limits { max_run_seconds: 2, ..Limits::default() };
+            let services = testing::services(None, Some(notifier));
+            let mut harness = testing::start_with_tools(&db, testing::policy(&[Cap::Notify], limits), services).await?;
+            let mut handle = attach(&mut harness, &root()).await?;
+
+            handle.send(InputMessage::user_text(root(), "tell me"), "input-1").await?;
+            harness.model.next_request().await;
+            harness.model.send_tool_call("call-1", "notify", serde_json::json!({ "message": "done" }));
+            harness.model.finish();
+            let notice = queue.recv().await.ok_or("no notification queued")?;
+
+            testing::until(
+                &mut handle,
+                |event| matches!(event, infinity_agent_core::system::AgentEvent::Info { text } if text.contains("max_run_seconds")),
+            )
+            .await;
+
+            let text = Operations::new(db).captured("root", "call-1").await?.ok_or("missing notification outcome")?;
+            assert!(text.contains("max_run_seconds") && text.contains("may have completed"), "{text}");
+            assert!(notice.ack.is_closed());
+            assert!(queue.try_recv().is_err());
+
+            Ok(())
+        })
+        .await
     }
 
     async fn first_daemon(db: &Db, confirmed: bool) -> Result<(mpsc::Receiver<Notice>, Unanswered), BoxError> {

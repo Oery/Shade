@@ -5,8 +5,10 @@ edition.workspace = true
 rust-version.workspace = true
 publish.workspace = true
 
+[features]
+testing = ["infinity-provider-protocol/mock", "shade-store/testing"]
+
 [dependencies]
-shade-condition.workspace = true
 shade-mcp.workspace = true
 shade-policy.workspace = true
 shade-proto.workspace = true
@@ -14,15 +16,11 @@ shade-sandbox.workspace = true
 shade-schedule.workspace = true
 shade-store.workspace = true
 async-trait.workspace = true
-bytes.workspace = true
 chrono.workspace = true
 chrono-tz.workspace = true
 dotenvy.workspace = true
 futures-util.workspace = true
 http.workspace = true
-http-body-util.workspace = true
-hyper.workspace = true
-hyper-util.workspace = true
 infinity-agent-core.workspace = true
 infinity-provider-protocol.workspace = true
 infinity-provider-rig.workspace = true
@@ -31,14 +29,16 @@ rig-core.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 serenity.workspace = true
-subtle.workspace = true
 thiserror.workspace = true
-toml.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
+bytes.workspace = true
+http-body-util.workspace = true
+hyper.workspace = true
+hyper-util.workspace = true
 infinity-provider-protocol = { workspace = true, features = ["mock"] }
 rmcp = { workspace = true, features = ["server", "macros"] }
 shade-mcp = { workspace = true, features = ["testing"] }

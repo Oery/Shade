@@ -41,7 +41,7 @@ max_output_tokens = 128000
 # context_window = 1048576
 # max_output_tokens = 131072
 
-# Owner chat (terminal and Discord). Without this section chat has no tools.
+# Owner chat (terminal, Discord, and the client API). Without this section chat has no tools.
 # Known caps: now, notify, shell, shell_network, schedules, watches, and the
 # name of each server under [mcp].
 [chat]
@@ -168,7 +168,14 @@ caps = ["now"]
 # max_per_minute = 10                    # more get 429
 # max_queued = 20                        # more get 429
 #
-# Where webhooks are served: loopback or this machine's Tailscale address
+# Optional personal client API: HTTP JSON and SSE for native apps and scripts.
+# The token grants access to all owner conversations and approval decisions.
+# Put its value in .env, like model.api_key_env; generate with openssl rand -hex 32.
+# See docs/api.md for endpoints and examples. Restart shaded after enabling it.
+# [api]
+# token_env = "SHADE_API_TOKEN"
+
+# Where webhooks and the client API are served: loopback or this machine's Tailscale address
 # only; anything else stops startup. To reach them from your other devices
 # over HTTPS, keep the default and run
 #   tailscale serve --bg --https=443 http://127.0.0.1:8787
@@ -182,8 +189,16 @@ caps = ["now"]
 max_completion_rounds = 40
 max_tool_calls = 100
 max_run_seconds = 900
+# Provider requests at once, across chats and background runs. A slot is
+# held until the response stream ends; waiting counts toward the run deadline.
+max_concurrent_completions = 8
 # Messages the model may send with `notify`. A run's failure notice from
 # Shade itself does not count against this.
 max_notifications = 10
 # Scheduled runs at once; the rest wait in the queue, across restarts too.
 max_concurrent_background_runs = 4
+# Waiting owner messages per conversation and across the daemon. Active turns
+# do not count. Owner inputs queue in order across API, terminal, and Discord;
+# waiting starts no execution budget or deadline.
+max_queued_chat_messages = 32
+max_queued_chat_messages_total = 256

@@ -1,4 +1,7 @@
+mod config;
+mod daemon;
 mod error;
+mod http;
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -32,7 +35,7 @@ fn main() -> ExitCode {
 
 fn run(args: Args) -> Result<(), Error> {
     init_tracing()?;
-    shade_core::run(args.config)?;
+    daemon::run(args.config)?;
 
     Ok(())
 }
