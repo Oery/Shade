@@ -38,7 +38,7 @@ pub const WORKSPACE: &str = "/workspace";
 /// Where the vault appears inside the sandbox.
 pub const VAULT: &str = "/vault";
 
-/// `PATH` inside the sandbox. The first entry is NixOS's system profile.
+/// System fallback for `PATH`. Resolved Nix entries from the daemon come first.
 const PATH: &str = "/run/current-system/sw/bin:/usr/local/bin:/usr/bin:/bin";
 
 /// System locations mounted read-only. A symlink is recreated as one, so
@@ -164,6 +164,8 @@ pub struct Sandbox {
     base: Vec<OsString>,
     /// Variables copied from the daemon's environment when the sandbox was built.
     env: Vec<(String, OsString)>,
+    /// Nix executables already visible through `/nix/store`, then system tools.
+    path: OsString,
 }
 
 /// The sandbox for the daemon using `data_dir` and `config_path`, probed.
@@ -201,11 +203,13 @@ impl Sandbox {
         }
 
         let env = copy_env(&config.env);
-        let base = base_args(&env);
+        let host_path = std::env::var_os("PATH").unwrap_or_default();
+        let path = shell_path(&host_path);
+        let base = base_args(&env, &path);
 
         let max_timeout = Duration::from_secs(config.max_timeout_seconds);
 
-        Ok(Self { runner, workspace, vault, max_timeout, base, env })
+        Ok(Self { runner, workspace, vault, max_timeout, base, env, path })
     }
 
     /// The longest timeout a command may ask for.
@@ -305,7 +309,7 @@ impl Sandbox {
             command.env(name, value);
         }
 
-        command.env("PATH", PATH).env("HOME", &self.workspace).current_dir(&self.workspace);
+        command.env("PATH", &self.path).env("HOME", &self.workspace).current_dir(&self.workspace);
         command.args(["-c", script]);
 
         command
@@ -314,7 +318,7 @@ impl Sandbox {
 
 /// Namespaces, lifetime, system mounts, and environment. Mounts reflect the
 /// host layout, which does not change while the daemon runs.
-fn base_args(env: &[(String, OsString)]) -> Vec<OsString> {
+fn base_args(env: &[(String, OsString)], path: &OsStr) -> Vec<OsString> {
     let mut args = Vec::new();
     push(&mut args, ["--unshare-all", "--die-with-parent", "--new-session", "--clearenv"]);
 
@@ -339,9 +343,30 @@ fn base_args(env: &[(String, OsString)]) -> Vec<OsString> {
     }
 
     // Set last so the configured variables cannot replace them.
-    push(&mut args, ["--setenv", "PATH", PATH, "--setenv", "HOME", WORKSPACE, "--setenv", "TMPDIR", "/tmp"]);
+    push(&mut args, [OsStr::new("--setenv"), OsStr::new("PATH"), path]);
+    push(&mut args, ["--setenv", "HOME", WORKSPACE, "--setenv", "TMPDIR", "/tmp"]);
 
     args
+}
+
+/// Nix profiles can live outside the sandbox; their resolved store paths do not.
+fn shell_path(host_path: &OsStr) -> OsString {
+    let mut path = OsString::new();
+
+    for entry in std::env::split_paths(host_path) {
+        let Ok(resolved) = entry.canonicalize() else {
+            continue;
+        };
+
+        if resolved.starts_with("/nix/store") && resolved.is_dir() {
+            path.push(resolved);
+            path.push(":");
+        }
+    }
+
+    path.push(PATH);
+
+    path
 }
 
 fn push<S: AsRef<OsStr>, const N: usize>(args: &mut Vec<OsString>, items: [S; N]) {

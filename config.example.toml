@@ -54,6 +54,8 @@ caps = ["now"]
 # a private /tmp, and nothing else from your home or Shade's directories.
 # Neither path may overlap Shade's config, data, or executable directories,
 # or contain your home directory.
+# Nix profile entries on the daemon's PATH are resolved into /nix/store and
+# kept on the shell's PATH. Profile directories and your home stay hidden.
 # [sandbox]
 # workspace = "/home/me/shade-workspace"
 # Mounted at /vault only for conversations that hold the `vault` capability.

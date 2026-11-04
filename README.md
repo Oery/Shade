@@ -92,6 +92,13 @@ touch ~/.config/shade/.env && chmod 600 ~/.config/shade/.env
 
 The config is read once: restart `shaded` to apply a change.
 
+The shell uses system tools plus entries from the daemon's `PATH` that resolve
+into `/nix/store`. This includes NixOS user profiles such as
+`/etc/profiles/per-user/<user>/bin`, when present on the daemon's `PATH`.
+The resolved store paths are used inside the sandbox; your home and profile
+directories stay hidden. Programs still need `shell_network` for network access
+and explicitly configured environment variables for credentials.
+
 On Discord, `owners` use `[chat]` permissions. Other users can mention the bot
 in server channels with `[discord.guests] caps` (for example, `["now"]`). Guests
 cannot DM the bot, manage schedules or watches, use `/new`, or approve changes.

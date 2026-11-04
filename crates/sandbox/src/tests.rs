@@ -3,7 +3,7 @@
 use std::fs;
 use std::net::TcpListener;
 use std::os::unix::net::UnixListener;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
@@ -63,6 +63,42 @@ impl Drop for Dirs {
 
 fn stdout(finished: &Finished) -> String {
     finished.stdout.text()
+}
+
+#[test]
+fn host_paths_outside_the_nix_store_are_not_inherited() -> Result<(), Box<dyn std::error::Error>> {
+    let dirs = Dirs::new();
+    let paths = std::env::join_paths([dirs.workspace.as_path(), Path::new("/usr/bin"), Path::new("/nonexistent/bin")])?;
+
+    assert_eq!(super::shell_path(&paths), super::PATH);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn nix_profile_paths_resolve_without_exposing_the_profile_directory() -> Result<(), Box<dyn std::error::Error>> {
+    // Only Nix hosts have the store mounted by the sandbox.
+    if !Path::new("/nix/store").is_dir() {
+        return Ok(());
+    }
+
+    let dirs = Dirs::new();
+    let profile = dirs.root.join("profile");
+    std::os::unix::fs::symlink("/nix/store", &profile)?;
+
+    let mut sandbox = dirs.bubblewrap();
+    sandbox.path = super::shell_path(profile.as_os_str());
+    sandbox.base = super::base_args(&sandbox.env, &sandbox.path);
+
+    let finished = sandbox.run("printf '%s' \"$PATH\"", NONE, TIMEOUT).await?;
+    assert_eq!(finished.exit, Exit::Code(0), "{}", finished.stderr.text());
+    assert_eq!(stdout(&finished), format!("/nix/store:{}", super::PATH));
+
+    let script = format!("test ! -e '{}' && test -d /nix/store", profile.display());
+    let finished = sandbox.run(&script, NONE, TIMEOUT).await?;
+    assert_eq!(finished.exit, Exit::Code(0), "{}", finished.stderr.text());
+
+    Ok(())
 }
 
 #[tokio::test]
