@@ -437,7 +437,9 @@ Default watch behavior:
 
 Subscriptions indicate current-state invalidation, not a durable event stream. An MCP update notification identifies a URI; a later read returns the current resource. A short true state followed by false may be missed before the read. Disconnection can hide arbitrarily many intermediate transitions. The supported guarantee is **fire on observed transitions**, not detect every historical crossing.
 
-If a service requires lossless event handling, its MCP integration must expose durable events with IDs and replay/cursors, or deliver identified webhook events through F9. Implement that outside the generic snapshot-watch path. Do not invent historical events from the final snapshot.
+A `new_items` watch replaces the condition with the JSON pointer of a list whose entries have IDs. It remembers those IDs (`watch_items`, kept 30 days past their last listing) and fires for unseen ones, passing only those to the run, in the observation's transaction. It has no cooldown, which would lose items for good, and each firing queues its own run, so a watch may have several waiting, starting one at a time. Rereads and reconnects fire nothing for what stays listed, so a snapshot of current items needs no cursor. A top-level `availability` other than `available` is a failed observation for every watch, which keeps its subscription, as a resource may only recover while listened to.
+
+If a service requires lossless event handling, even of items that come and go between reads, its MCP integration must expose durable events with replay/cursors, or deliver identified webhook events through F9. Implement that outside the generic snapshot-watch path. Do not invent historical events from the final snapshot.
 
 Use one client per server, shared with its tools, and one subscription/read pipeline per `(server, uri)`, with fan-out to all watches. Subscribe (`subscriptions/listen`) before the initial read; serialize/coalesce reads, and a notification arriving during one stays buffered for the next. A server lacking subscriptions is rejected for watch creation.
 

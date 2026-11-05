@@ -158,12 +158,7 @@ impl Watcher {
 
     /// Evaluates one watch, recording the outcome. `true` when it fired.
     async fn judge(&self, watch: &Watch, document: &Value, value: &str, now: DateTime<Utc>) -> bool {
-        let observed = match watch.definition.mode {
-            Mode::NewItems => self.new_items(watch, document, value, now).await,
-            Mode::OnChange | Mode::EveryMatch => condition(watch, document, value, now),
-        };
-
-        let observation = match observed {
+        let observation = match self.evaluate(watch, document, value, now).await {
             Ok(observation) => observation,
             Err(reason) => {
                 self.record_failure(watch, &reason).await;
@@ -179,6 +174,17 @@ impl Watcher {
                 tracing::error!(%error, watch = %watch.id, "cannot record an observation");
                 false
             }
+        }
+    }
+
+    /// What one reading means for a watch. A failure is the watch's alone and
+    /// keeps the subscription: a resource may only recover while listened to.
+    async fn evaluate(&self, watch: &Watch, document: &Value, value: &str, now: DateTime<Utc>) -> Result<Observation, String> {
+        shade_watch::available(document)?;
+
+        match watch.definition.mode {
+            Mode::NewItems => self.new_items(watch, document, value, now).await,
+            Mode::OnChange | Mode::EveryMatch => condition(watch, document, value, now),
         }
     }
 
@@ -323,6 +329,17 @@ mod tests {
             let watcher = Watcher::new(self.db.clone(), servers, policy, redactor, None, self.sender.to_owned(), changed);
 
             Ok(tokio::spawn(Arc::new(watcher).run()))
+        }
+
+        /// Makes `new_items` watch `id` follow `/items`.
+        async fn point_at_items(&self, id: &str) -> Result<(), BoxError> {
+            let watch = self.watches.get(id).await?.ok_or("watch")?;
+            let definition = Definition { condition: "/items".to_owned(), ..watch.definition };
+            let update = Change::Update { id: id.to_owned(), version: watch.version, enabled: true, definition };
+            let receipt = Receipt { thread: "chat".to_owned(), call: "point".to_owned(), tool: "watch_update", text: String::new() };
+            self.watches.apply(update, receipt).await?;
+
+            Ok(())
         }
 
         /// The value section of each run that may start now.
@@ -558,6 +575,39 @@ mod tests {
         rig.until("a", |watch| watch.failures > 0).await?;
 
         assert_eq!(rig.watches.get("a").await?.ok_or("watch")?.last_condition, None, "no baseline from a bad list");
+
+        watcher.abort();
+
+        Ok(())
+    }
+
+    /// A resource saying it is unavailable fails its watch, however healthy
+    /// its value looks, and each report counts towards the alert. It stays
+    /// subscribed, and picks up where it was once the resource recovers.
+    #[tokio::test]
+    async fn an_unavailable_resource_fails_without_losing_its_place() -> Result<(), BoxError> {
+        let rig = Rig::new().await?;
+        let feed = Feed::default();
+        let document = |availability: &str, items: &str| format!(r#"{{"availability":"{availability}","items":{items}}}"#);
+        feed.set(URI, &document("available", r#"[{"id":1}]"#)).await;
+        rig.watches.add_items("a", "chat").await?;
+        rig.point_at_items("a").await?;
+
+        let watcher = rig.start(&feed, &held()).await?;
+        rig.until("a", |watch| watch.last_condition == Some(true)).await?;
+
+        for failures in 1..=3 {
+            feed.set(URI, &document("unavailable", &format!(r#"[{{"id":{failures}}},{{"id":9}}]"#))).await;
+            rig.until("a", |watch| watch.failures == failures).await?;
+        }
+
+        assert!(rig.watches.startable(4).await?.is_empty(), "nothing it said while unavailable counts");
+        assert_eq!(feed.listens(), 1, "the subscription is what lets it recover");
+
+        feed.set(URI, &document("available", r#"[{"id":1},{"id":2}]"#)).await;
+        rig.until("a", |watch| watch.failures == 0).await?;
+
+        assert_eq!(rig.items_fired().await?, ["[{\"id\":2}]"]);
 
         watcher.abort();
 

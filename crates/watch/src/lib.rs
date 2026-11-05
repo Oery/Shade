@@ -82,6 +82,16 @@ pub fn evaluate(document: &Value, condition: &str, max_age: Option<i64>, now: i6
     condition.matches(document)
 }
 
+/// A resource that says it is not available has no value to observe, whatever
+/// else it holds. One that does not say is taken at its word.
+pub fn available(document: &Value) -> Result<(), String> {
+    match document.pointer("/availability") {
+        None => Ok(()),
+        Some(Value::String(availability)) if availability == "available" => Ok(()),
+        Some(availability) => Err(format!("the resource says its availability is {availability}")),
+    }
+}
+
 /// The list at `pointer`. Every entry needs an `id`, a string or a number:
 /// an entry that cannot be told apart from the others would fire forever.
 pub fn items<'a>(document: &'a Value, pointer: &str) -> Result<Vec<Item<'a>>, String> {
@@ -221,7 +231,7 @@ mod tests {
     use serde_json::json;
     use shade_store::watches::{Definition, Destination, Mode, Watch};
 
-    use super::{Decision, Prior, backoff, evaluate, input, items, step};
+    use super::{Decision, Prior, available, backoff, evaluate, input, items, step};
 
     const COOLDOWN: i64 = 300;
     const THRESHOLD: i64 = 100_000;
@@ -298,6 +308,23 @@ mod tests {
 
         for (document, max_age, expected) in cases {
             assert_eq!(evaluate(&document, condition, max_age, now).map_err(drop), expected, "{document}");
+        }
+    }
+
+    /// Only a resource saying otherwise is unavailable.
+    #[test]
+    fn availability_is_what_a_resource_says() {
+        let cases = [
+            (json!({ "value": 1 }), true),
+            (json!({ "availability": "available" }), true),
+            (json!({ "availability": "unavailable" }), false),
+            (json!({ "availability": null }), false),
+            (json!({ "availability": true }), false),
+            (json!(7), true),
+        ];
+
+        for (document, expected) in cases {
+            assert_eq!(available(&document).is_ok(), expected, "{document}");
         }
     }
 
