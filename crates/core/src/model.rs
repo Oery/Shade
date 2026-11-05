@@ -118,7 +118,11 @@ impl Model {
             max_output_tokens: Some(self.config.max_output_tokens),
             supports_image_input: true,
         };
-        let model = MaxTokens { inner: RigCompletionModel::new(model), max_tokens: self.config.max_output_tokens };
+        let model = MaxTokens {
+            inner: RigCompletionModel::new(model),
+            max_tokens: self.config.max_output_tokens,
+            openai: matches!(self.config.provider, Provider::OpenaiCompatible),
+        };
 
         Arc::new(SingleModelProvider::new(entry, model))
     }
@@ -160,10 +164,11 @@ fn compaction_window(context_window: usize, compact_at: Option<usize>) -> Result
 ///
 /// Infinity 0.2.0 always sends `max_tokens: None`, and the rig bridge does not
 /// fill it from the model entry, so Anthropic would reject every request.
-/// rig's OpenAI Chat Completions client ignores the field.
+/// rig's OpenAI Chat Completions client needs it in `additional_params` instead.
 struct MaxTokens<M> {
     inner: M,
     max_tokens: u64,
+    openai: bool,
 }
 
 #[async_trait]
@@ -171,13 +176,114 @@ impl<M: CompletionModel> CompletionModel for MaxTokens<M> {
     async fn stream(&self, mut request: CompletionRequest) -> Result<ModelStream, CompletionError> {
         request.max_tokens = Some(self.max_tokens);
 
+        if self.openai {
+            let params = request.additional_params.get_or_insert_with(|| serde_json::json!({}));
+            let Some(params) = params.as_object_mut() else {
+                return Err(CompletionError::provider(
+                    infinity_provider_protocol::ErrorClass::Fatal,
+                    "model parameters must be an object",
+                ));
+            };
+
+            params.insert("max_tokens".to_owned(), self.max_tokens.into());
+        }
+
         self.inner.stream(request).await
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::compaction_window;
+    use std::sync::Arc;
+
+    use bytes::Bytes;
+    use futures_util::StreamExt;
+    use http::{Request, Response};
+    use http_body_util::{BodyExt, Full};
+    use hyper::body::Incoming;
+    use hyper::server::conn::http1;
+    use hyper::service::service_fn;
+    use hyper_util::rt::TokioIo;
+    use infinity_agent_core::ThreadId;
+    use infinity_agent_core::system::ModelSource;
+    use infinity_provider_protocol::{CompletionRequest, Message};
+    use tokio::net::TcpListener;
+    use tokio::sync::mpsc;
+
+    use super::{Model, compaction_window};
+    use crate::config::{ModelConfig, Provider};
+    use crate::error::BoxError;
+
+    /// Captures the real HTTP body after both Infinity and rig have converted it.
+    /// Authentication is intentionally refused; no real credentials or services are used.
+    #[tokio::test]
+    async fn output_caps_reach_both_providers_on_the_wire() -> Result<(), BoxError> {
+        for provider in [Provider::OpenaiCompatible, Provider::Anthropic] {
+            let (url, mut captured, server) = capture_request().await?;
+            let config = ModelConfig {
+                provider,
+                id: "fake".to_owned(),
+                api_key_env: String::new(),
+                base_url: Some(url),
+                session_header: None,
+                context_window: 10000,
+                max_output_tokens: 7,
+                compact_at_tokens: None,
+                prices: None,
+            };
+            let model = Model {
+                config,
+                api_key: "local-test-only".to_owned(),
+                session_header: None,
+                http: rig::http_client::ReqwestClient::new(),
+                compaction_window: 10000,
+            };
+            let resolved = model.resolve(&ThreadId::from("test".to_owned())).await?;
+            let request = CompletionRequest { chat_history: vec![Message::user("hello")], ..CompletionRequest::default() };
+            if let Ok(mut stream) = resolved.provider.invoke_model("fake", request).await {
+                let _ = stream.next().await;
+            }
+
+            let body = tokio::time::timeout(std::time::Duration::from_secs(5), captured.recv()).await?.ok_or("no HTTP request captured")?;
+            assert_eq!(body["max_tokens"], 7, "{body}");
+            server.abort();
+        }
+
+        Ok(())
+    }
+
+    async fn capture_request()
+    -> Result<(String, mpsc::Receiver<serde_json::Value>, tokio::task::JoinHandle<Result<(), BoxError>>), BoxError> {
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let url = format!("http://{}", listener.local_addr()?);
+        let (captured, receiver) = mpsc::channel(1);
+
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await?;
+            let captured = Arc::new(captured);
+            let service = service_fn(move |request: Request<Incoming>| {
+                let captured = Arc::clone(&captured);
+
+                async move {
+                    let body = match request.into_body().collect().await {
+                        Ok(body) => serde_json::from_slice(&body.to_bytes()).unwrap_or_default(),
+                        Err(_) => serde_json::Value::Null,
+                    };
+                    let _ = captured.send(body).await;
+                    let body = Bytes::from_static(br#"{"error":{"type":"authentication_error","message":"local test"}}"#);
+                    let mut response = Response::new(Full::new(body));
+                    *response.status_mut() = http::StatusCode::UNAUTHORIZED;
+
+                    Ok::<_, std::convert::Infallible>(response)
+                }
+            });
+            http1::Builder::new().serve_connection(TokioIo::new(stream), service).await?;
+
+            Ok(())
+        });
+
+        Ok((url, receiver, server))
+    }
 
     /// Infinity compacts past 75% of the window it is given.
     #[test]

@@ -194,7 +194,9 @@ and test this in M2, where compaction becomes reachable.
   builds the rig client there (sharing one reqwest pool) and sends the thread ID
   in the configured `session_header`. OpenCode Go returns 400
   `MissingSessionID` without `x-opencode-session`.
-- rig's Chat Completions client ignores `max_tokens` and neither streams nor
+- rig's Chat Completions client ignores the typed `max_tokens` field; Shade
+  also sends it through `additional_params`, verified on the HTTP wire for
+  both providers. The client neither streams nor
   returns reasoning content (`reasoning_content`); assistant reasoning in
   history is dropped. Models that require reasoning to be sent back across tool
   calls may degrade or fail there. Verify with a real key.
