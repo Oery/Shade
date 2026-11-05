@@ -7,18 +7,25 @@
 //! holds up the daemon; one that stops is restarted on its next call. A call
 //! that was sent but got no answer has an unknown outcome, and is never sent
 //! again by Shade on its own.
+//!
+//! Servers speak the 2026-07-28 lifecycle: resource subscriptions exist only
+//! there, and every server is home-made, so there is no legacy handshake.
+//! rmcp's response cache is off: it would answer a read with an old value.
 
 mod render;
+mod resources;
+#[cfg(any(test, feature = "testing"))]
+pub mod testing;
 
 use std::collections::BTreeMap;
 use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
 
-use rmcp::model::CallToolRequestParams;
-use rmcp::service::RunningService;
-use rmcp::transport::TokioChildProcess;
-use rmcp::{Peer, RoleClient, ServiceExt};
+use rmcp::model::{CallToolRequestParams, ProtocolVersion};
+use rmcp::service::{ClientCacheConfig, ClientLifecycleMode, RunningService, ServiceError};
+use rmcp::transport::{IntoTransport, TokioChildProcess};
+use rmcp::{ClientServiceExt, Peer, RoleClient};
 use serde::Deserialize;
 use thiserror::Error;
 use tokio::io::AsyncReadExt;
@@ -26,6 +33,7 @@ use tokio::process::{ChildStderr, Command};
 use tokio::sync::Mutex;
 
 pub use render::MAX_RESULT;
+pub use resources::Updates;
 
 /// Taken from the daemon's environment for every server: enough to find its own files.
 const INHERITED: [&str; 6] = ["PATH", "HOME", "XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_STATE_HOME", "XDG_CACHE_HOME"];
@@ -70,6 +78,14 @@ pub struct Tool {
     pub input_schema: serde_json::Value,
 }
 
+/// What a server said it can do when it started.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Features {
+    pub resources: bool,
+    /// Its resources can be listened to for changes.
+    pub subscribe: bool,
+}
+
 /// How a call ended, as the model reads it.
 #[derive(Debug, PartialEq)]
 pub enum Answer {
@@ -89,6 +105,13 @@ pub enum CallError {
 
 type Client = RunningService<RoleClient, ()>;
 
+/// A server past its handshake, with what it offers.
+struct Started {
+    client: Client,
+    tools: Vec<Tool>,
+    features: Features,
+}
+
 /// How a server is started.
 struct Launch {
     program: String,
@@ -104,6 +127,7 @@ pub struct Server {
     call_timeout: Duration,
     client: Mutex<Option<Client>>,
     tools: Mutex<Vec<Tool>>,
+    features: Mutex<Features>,
 }
 
 impl Server {
@@ -127,7 +151,14 @@ impl Server {
     }
 
     fn with(name: String, launch: Option<Launch>, call_timeout: Duration) -> Self {
-        Self { name, launch, call_timeout, client: Mutex::new(None), tools: Mutex::new(Vec::new()) }
+        Self {
+            name,
+            launch,
+            call_timeout,
+            client: Mutex::new(None),
+            tools: Mutex::new(Vec::new()),
+            features: Mutex::new(Features::default()),
+        }
     }
 
     pub fn name(&self) -> &str {
@@ -137,6 +168,11 @@ impl Server {
     /// The tools it listed when it last started; none while it never has.
     pub async fn tools(&self) -> Vec<Tool> {
         self.tools.lock().await.to_vec()
+    }
+
+    /// What it said it can do when it last started; nothing while it never has.
+    pub async fn features(&self) -> Features {
+        *self.features.lock().await
     }
 
     /// Starts the server and lists its tools, unless it is running already.
@@ -157,17 +193,25 @@ impl Server {
 
         let params = CallToolRequestParams::new(tool.to_owned()).with_arguments(arguments);
 
-        match tokio::time::timeout(self.call_timeout, peer.call_tool(params)).await {
-            Ok(Ok(result)) => Ok(render::answer(result)),
+        match self.request(peer.call_tool(params)).await {
+            Ok(result) => Ok(render::answer(result)),
+            Err(reason) => Err(CallError::Unknown(self.name.to_owned(), reason)),
+        }
+    }
+
+    /// Waits for one request, within the call timeout. A broken connection is
+    /// replaced on the next call; a server refusing a request is not broken.
+    async fn request<T>(&self, request: impl Future<Output = Result<T, ServiceError>>) -> Result<T, String> {
+        match tokio::time::timeout(self.call_timeout, request).await {
+            Ok(Ok(answer)) => Ok(answer),
             Ok(Err(error)) => {
-                // A broken connection is replaced on the next call.
-                *self.client.lock().await = None;
-                Err(CallError::Unknown(self.name.to_owned(), error.to_string()))
+                if !matches!(error, ServiceError::McpError(_)) {
+                    *self.client.lock().await = None;
+                }
+
+                Err(error.to_string())
             }
-            Err(_) => Err(CallError::Unknown(
-                self.name.to_owned(),
-                format!("no answer within {} s", self.call_timeout.as_secs()),
-            )),
+            Err(_) => Err(format!("no answer within {} s", self.call_timeout.as_secs())),
         }
     }
 
@@ -183,22 +227,29 @@ impl Server {
             return Err("it stopped and cannot be restarted".to_owned());
         };
 
-        let (running, tools) = match tokio::time::timeout(launch.startup, start(&self.name, launch)).await {
+        let started = match tokio::time::timeout(launch.startup, start(&self.name, launch)).await {
             Ok(started) => started?,
             Err(_) => return Err(format!("it did not start within {} s", launch.startup.as_secs())),
         };
 
-        tracing::info!(server = %self.name, tools = tools.len(), "MCP server started");
-        *self.tools.lock().await = tools;
-        let peer = running.peer().clone();
-        *client = Some(running);
+        tracing::info!(server = %self.name, tools = started.tools.len(), "MCP server started");
+        let peer = started.client.peer().clone();
+        *client = Some(self.keep(started).await);
 
         Ok(peer)
+    }
+
+    /// Records what a started server offers, and hands back its client.
+    async fn keep(&self, started: Started) -> Client {
+        *self.tools.lock().await = started.tools;
+        *self.features.lock().await = started.features;
+
+        started.client
     }
 }
 
 /// Spawns the server, connects, and lists its tools.
-async fn start(name: &str, launch: &Launch) -> Result<(Client, Vec<Tool>), String> {
+async fn start(name: &str, launch: &Launch) -> Result<Started, String> {
     let mut command = Command::new(&launch.program);
     command.args(&launch.args).env_clear().envs(launch.env.iter().map(|(key, value)| (key, value))).kill_on_drop(true);
 
@@ -211,15 +262,32 @@ async fn start(name: &str, launch: &Launch) -> Result<(Client, Vec<Tool>), Strin
         tokio::spawn(log_stderr(name.to_owned(), stderr));
     }
 
-    let client = match ().serve(transport).await {
+    handshake(transport).await
+}
+
+/// Connects over `transport` and asks the server what it offers.
+async fn handshake<T, E, A>(transport: T) -> Result<Started, String>
+where
+    T: IntoTransport<RoleClient, E, A>,
+    E: std::error::Error + Send + Sync + 'static,
+{
+    let lifecycle = ClientLifecycleMode::Discover { preferred_versions: vec![ProtocolVersion::V_2026_07_28] };
+
+    let client = match ().serve_with_lifecycle(transport, lifecycle).await {
         Ok(client) => client,
         Err(error) => return Err(format!("it did not complete the MCP handshake: {error}")),
     };
 
-    match client.list_all_tools().await {
-        Ok(tools) => Ok((client, tools.into_iter().map(render::tool).collect())),
-        Err(error) => Err(format!("it did not list its tools: {error}")),
-    }
+    client.peer().set_response_cache_config(ClientCacheConfig::disabled()).await;
+
+    let tools = match client.list_all_tools().await {
+        Ok(tools) => tools.into_iter().map(render::tool).collect(),
+        Err(error) => return Err(format!("it did not list its tools: {error}")),
+    };
+
+    let features = resources::features(client.peer());
+
+    Ok(Started { client, tools, features })
 }
 
 /// A child can print credentials or arbitrarily long lines. Observe its
@@ -280,24 +348,15 @@ impl Servers {
     }
 }
 
-#[cfg(feature = "testing")]
+#[cfg(any(test, feature = "testing"))]
 impl Server {
     /// A server already connected over `stream`, such as one end of a
     /// `tokio::io::duplex` whose other end an in-process server serves.
     pub async fn connected(name: &str, stream: tokio::io::DuplexStream, call_timeout: Duration) -> Result<Self, String> {
-        let client = match ().serve(stream).await {
-            Ok(client) => client,
-            Err(error) => return Err(error.to_string()),
-        };
-
-        let tools = match client.list_all_tools().await {
-            Ok(tools) => tools.into_iter().map(render::tool).collect(),
-            Err(error) => return Err(error.to_string()),
-        };
-
+        let started = handshake(stream).await?;
         let server = Self::with(name.to_owned(), None, call_timeout);
+        let client = server.keep(started).await;
         *server.client.lock().await = Some(client);
-        *server.tools.lock().await = tools;
 
         Ok(server)
     }

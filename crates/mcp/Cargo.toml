@@ -7,7 +7,7 @@ publish.workspace = true
 
 [features]
 # Connects a server over any transport, so other crates' tests can run one in-process.
-testing = []
+testing = ["rmcp/server"]
 
 [dependencies]
 rmcp.workspace = true
@@ -18,7 +18,7 @@ tokio.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
-rmcp = { workspace = true, features = ["server", "macros"] }
+rmcp = { workspace = true, features = ["server"] }
 
 [lints]
 workspace = true
