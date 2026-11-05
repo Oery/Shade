@@ -1,4 +1,6 @@
-//! MCP tools: each tool of a granted server, offered as `<server>_<tool>`.
+//! MCP tools: each tool of a granted server, offered as `<server>_<tool>`,
+//! and `<server>_resources` and `<server>_read_resource` for a server that
+//! publishes resources.
 //!
 //! A call is admitted against the server's capability, recorded before it
 //! is sent, and its result recorded before the model sees it. A restart
@@ -32,13 +34,20 @@ pub struct McpTool {
     work: Arc<Work>,
 }
 
+/// What a tool asks its server for.
+enum Remote {
+    /// One of its tools, by its own name there.
+    Tool(String),
+    Resources,
+    Read,
+}
+
 /// What a running call needs, shared with its task.
 struct Work {
     authority: Authority,
     operations: Operations,
     server: Arc<Server>,
-    /// The tool's own name on its server.
-    remote: String,
+    remote: Remote,
     /// The name the model calls it by.
     name: String,
 }
@@ -60,10 +69,51 @@ impl McpTool {
         };
 
         let description = format!("[{}] {}", server.name(), tool.description);
-        let work = Work { authority, operations, server: Arc::clone(server), remote: tool.name, name: name.to_owned() };
+        let work = Work { authority, operations, server: Arc::clone(server), remote: Remote::Tool(tool.name), name: name.to_owned() };
 
         Some(Self { name, description, parameters: tool.input_schema, work: Arc::new(work) })
     }
+
+    /// The tools for a server's resources. A tool of its own with the same
+    /// name, listed in `offered`, wins.
+    pub fn resources(authority: &Authority, operations: &Operations, server: &Arc<Server>, offered: &[shade_mcp::Tool]) -> Vec<Self> {
+        let list = (
+            "resources",
+            "List the resources this server publishes.",
+            Remote::Resources,
+            serde_json::json!({ "type": "object", "properties": {} }),
+        );
+        let read = ("read_resource", "Read one of this server's resources by its URI.", Remote::Read, read_parameters());
+        let mut tools = Vec::new();
+
+        for (suffix, about, remote, parameters) in [list, read] {
+            if offered.iter().any(|tool| tool.name == suffix) {
+                continue;
+            }
+
+            let name = format!("{}_{suffix}", server.name());
+            let description = format!("[{}] {about}", server.name());
+            let work = Work {
+                authority: authority.clone(),
+                operations: operations.clone(),
+                server: Arc::clone(server),
+                remote,
+                name: name.to_owned(),
+            };
+
+            tools.push(Self { name, description, parameters, work: Arc::new(work) });
+        }
+
+        tools
+    }
+}
+
+fn read_parameters() -> serde_json::Value {
+    serde_json::json!({
+        "type": "object",
+        "properties": { "uri": { "type": "string", "description": "The resource's URI." } },
+        "required": ["uri"],
+    })
 }
 
 #[async_trait]
@@ -124,7 +174,7 @@ impl Work {
             Err(error) => return format!("Error: {error}"),
         };
 
-        let text = match deadline.run(self.server.call(&self.remote, args)).await {
+        let text = match deadline.run(self.ask(args)).await {
             Ok(Ok(Answer::Done(text))) => text,
             Ok(Ok(Answer::Failed(text))) => format!("Error: {text}"),
             Ok(Err(error @ CallError::Unavailable(..))) => format!("Error: {error}"),
@@ -139,6 +189,19 @@ impl Work {
         }
 
         text
+    }
+}
+
+impl Work {
+    async fn ask(&self, args: serde_json::Value) -> Result<Answer, CallError> {
+        match &self.remote {
+            Remote::Tool(tool) => self.server.call(tool, args).await,
+            Remote::Resources => self.server.resources().await,
+            Remote::Read => match args.get("uri").and_then(serde_json::Value::as_str) {
+                Some(uri) => self.server.read(uri).await,
+                None => Ok(Answer::Failed("`uri` must be a string".to_owned())),
+            },
+        }
     }
 }
 
@@ -168,6 +231,7 @@ mod tests {
     use infinity_agent_core::ThreadId;
     use rmcp::{ServerHandler, ServiceExt, tool, tool_handler, tool_router};
     use shade_mcp::Server;
+    use shade_mcp::testing::Feed;
     use shade_policy::{Cap, Limits};
     use shade_store::conversation::Conversations;
     use shade_store::db::Db;
@@ -263,6 +327,36 @@ mod tests {
 
         assert!(refused.contains("`echo` is not granted"), "{refused}");
         assert_eq!(calls.load(Ordering::SeqCst), 0);
+
+        Ok(())
+    }
+
+    /// Reading a resource needs the server's capability like calling a tool
+    /// does, and what comes back is redacted the same way.
+    #[tokio::test]
+    async fn resource_reads_are_held_to_the_tools_rules() -> Result<(), BoxError> {
+        let feed = Feed::default();
+        feed.set("feed://a", "token=private-test-key-123456").await;
+        let server = Arc::new(feed.connect("feed").await?);
+        let args = serde_json::json!({ "uri": "feed://a" });
+
+        let db = Db::in_memory()?;
+        Conversations::new(db.clone()).register_root(&ThreadId::from("chat".to_owned())).await?;
+        let redactor = Arc::new(Redactor::new(["private-test-key-123456".to_owned()]));
+        let operations = Operations::new(db.clone());
+
+        let cases = [(vec![Cap::Now], "`feed` is not granted"), (vec![Cap::Server("feed".to_owned())], "token=[redacted")];
+
+        for (index, (caps, expected)) in cases.into_iter().enumerate() {
+            let policy = testing::policy(&caps, Limits::default());
+            let authority = Authority::new(Grants::new(db.clone()), policy).with_redactor(Arc::clone(&redactor));
+            let tools = McpTool::resources(&authority, &operations, &server, &[]);
+            let call = Call { sender: (), thread: ThreadId::from("chat".to_owned()), id: format!("call-{index}"), call_id: None };
+
+            let text = named(&tools, "feed_read_resource")?.work.run(args.to_owned(), &call).await;
+
+            assert!(text.contains(expected), "{text}");
+        }
 
         Ok(())
     }

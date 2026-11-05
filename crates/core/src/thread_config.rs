@@ -83,8 +83,8 @@ impl ThreadTools {
 }
 
 impl ThreadTools {
-    /// The tools of every granted MCP server that has started. A server that
-    /// is down offers nothing until it starts.
+    /// The tools and resources of every granted MCP server that has started.
+    /// A server that is down offers nothing until it starts.
     async fn add_mcp_tools(&self, caps: &Caps, config: &mut ThreadConfig<ChannelSender, NoRapHttp>) {
         for cap in caps {
             let Cap::Server(name) = cap else {
@@ -95,7 +95,15 @@ impl ThreadTools {
                 continue;
             };
 
-            for tool in server.tools().await {
+            let tools = server.tools().await;
+
+            if server.features().await.resources {
+                for tool in McpTool::resources(&self.authority, &self.operations, server, &tools) {
+                    config.tools.push(Rc::new(tool));
+                }
+            }
+
+            for tool in tools {
                 if let Some(tool) = McpTool::new(self.authority.clone(), self.operations.clone(), server, tool) {
                     config.tools.push(Rc::new(tool));
                 }
