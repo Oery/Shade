@@ -1,10 +1,11 @@
 # Shade
 
-A personal agent that runs on your own machine. You talk to it in the terminal, on Discord, or through the [client API](docs/api.md); it can also run scheduled jobs and react to webhooks. What it may do is decided by a config file you write, not by the model: each conversation, job and webhook gets only the capabilities you grant it.
+A personal agent that runs on your own machine. You talk to it in the terminal, on Discord, or through the [client API](docs/api.md); it can also run scheduled jobs, react to webhooks, and watch MCP resources. What it may do is decided by a config file you write, not by the model: each conversation, job and webhook gets only the capabilities you grant it.
 
 - One daemon (`shaded`) and a thin client (`shade`), in Rust, on [Infinity](https://infinity.hydro.run/docs/infinity-runtime/overview/).
 - State in one SQLite database: conversations, jobs, runs, and every tool call's outcome. Work accepted before a crash is finished or reported after it, never silently dropped or repeated.
-- Tools: the time, notifications, a sandboxed shell (bubblewrap), scheduled jobs, and any MCP server you configure (each server is a capability).
+- Tools: the time, notifications, a sandboxed shell (bubblewrap), scheduled jobs, and any MCP server you configure (each server is a capability), including its resources.
+- Watches: act when a condition on an MCP resource turns true, with no model call until then, as a background run or one message in the conversation that asked. Servers need to follow [the contract](docs/mcp-servers.md).
 - Memory: a small index of facts the model keeps in your Obsidian vault, shown only where the vault is granted.
 
 [PLAN.md](PLAN.md) holds the design and every milestone's decisions; [AGENTS.md](AGENTS.md) the coding rules.
@@ -80,7 +81,7 @@ touch ~/.config/shade/.env && chmod 600 ~/.config/shade/.env
 
 | Section | Gives |
 | --- | --- |
-| `[chat]` | What owner chat may use: `now`, `notify`, `shell`, `shell_network`, `schedules`, and MCP server names. |
+| `[chat]` | What owner chat may use: `now`, `notify`, `shell`, `shell_network`, `schedules`, `watches`, and MCP server names. |
 | `[discord]` | Owner chat (DMs and mentions), guest mentions, notifications, approval buttons. |
 | `[discord.guests]` | Tools non-owners may use when mentioning the bot in server channels; none by default. |
 | `[sandbox]` | Where `shell` runs. Required when anything holds `shell`. |
@@ -116,6 +117,7 @@ shaded &                  # or the systemd service below
 shade chat                # terminal chat; `shade chat --thread work` for another conversation
 shade ask "what time is it?"
 shade schedule list       # jobs; also pause, resume, rm, approve, reject
+shade watch list          # watches; also pause, resume, rm
 shade usage               # tokens per conversation
 shade audit --since 1d    # grants, tool outcomes, run status and usage
 ```

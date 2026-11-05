@@ -105,6 +105,7 @@ crates/
     src/api.rs              routes, JSON decoding, and HTTP error mapping
     src/api/events.rs       SSE encoding and subscriber disconnects
     src/webhook.rs          shared HTTP listener and webhook requests
+  watch/                    shade-watch: pure watch rules (firing, freshness, input text)
   policy/                   shade-policy: capabilities, origins, ceilings, limit checks
     src/
       lib.rs
@@ -438,7 +439,9 @@ Subscriptions indicate current-state invalidation, not a durable event stream. A
 
 If a service requires lossless event handling, its MCP integration must expose durable events with IDs and replay/cursors, or deliver identified webhook events through F9. Implement that outside the generic snapshot-watch path. Do not invent historical events from the final snapshot.
 
-Use one client per watched server and one subscription/read pipeline per `(server, uri)`, with fan-out to all watches. Subscribe before the initial read; serialize/coalesce reads and retain a dirty flag when another notification arrives during one. A transport lacking subscriptions is rejected for watch creation.
+Use one client per server, shared with its tools, and one subscription/read pipeline per `(server, uri)`, with fan-out to all watches. Subscribe (`subscriptions/listen`) before the initial read; serialize/coalesce reads, and a notification arriving during one stays buffered for the next. A server lacking subscriptions is rejected for watch creation.
+
+A watch has a destination. `run`, the default shape above, starts a fresh granted run on each firing. `conversation` sends one turn to the conversation that created it, under that conversation's authority, and then ends: repeating work belongs in a `run` watch. Both share everything up to the firing.
 
 Reconnect with exponential backoff capped at five minutes. Resubscribe and read on reconnect. Persisted `last_condition` prevents firing again merely because the snapshot still matches; a changed current snapshot may produce a newly observed transition. Notify once after five consecutive failures, reset the failure episode after successful recovery, and avoid one notification per failed attempt. Watcher health alerts are runtime operations with their own bounded rate limit.
 
@@ -450,7 +453,7 @@ The job input includes the captured triggering value, URI, observation time, and
 
 Document this in `docs/mcp-servers.md`, aligned with the independent MCP-server workspace:
 
-1. Declare resource-subscription support and accept subscriptions to the documented resource URIs.
+1. Declare resource-subscription support and accept `subscriptions/listen` for the documented resource URIs. `resources/subscribe` is deprecated and unused.
 2. Return documented JSON snapshots. Shade selects exactly one matching JSON text content entry for the requested URI; missing/ambiguous content is an error.
 3. Notify when the meaningful value or availability state changes. Do not notify solely because a fetch timestamp advanced.
 4. Publish freshness/availability metadata, including when the upstream value was actually observed. A cache read must not reset `observed_at`.
@@ -470,7 +473,7 @@ Here the condition pointer is `/value/price`. Exact service schemas may differ, 
 
 The server owns upstream rate limits, fetching/pushes, cache invalidation, and fetch coalescing. Reads normally use its cache. Read tools may expose `max_age_seconds` under the separate MCP plan: omitted/null uses the server default, zero asks for refresh, and a positive value bounds age. The host must not assume a requested refresh overrides upstream rate limits or guarantees success.
 
-Two stdio clients may mean two server processes: Infinity's bridge plus the watcher. Independent in-memory caches can therefore mean duplicate upstream polling. That is an accepted initial tradeoff, not a promise of one fetch across all clients. Integrations needing one upstream poller should use a resident multi-client HTTP server or deliberately shared service state. Shade does not add a generic shared-cache service.
+Tools and watches share one client, so one server process, per configured server. rmcp's client-side response cache is off, because it would answer a read from `ttl_ms` and serve stale entries on error. Shade does not add a generic shared-cache service.
 
 Read-only server modes must enforce account/resource boundaries. All configured MCP executables, configuration, and protected credentials are trusted host components and must remain outside agent-writable roots. A server failing to connect/start is degraded rather than a whole-daemon failure; apply timeouts/backoff and expose its state. Bridges must not block boot forever while discovering an unavailable server.
 
@@ -745,6 +748,9 @@ Each milestone is one reviewable PR. `Check` is a manual demonstration; `Tests` 
 - **Scope:** one client per server and shared URI pipelines, baseline state, watch tools/CLI, transactional transition+run, cooldown, failure episodes, freshness checks, backoff, caching/watch contract, and example server.
 - **Check:** baseline 90k; 110k fires; 120k holds; 95k re-arms; 105k inside cooldown is suppressed; no delayed fire at cooldown expiry; a later 95k then 105k outside cooldown fires. Reconnect while still true does not repeat a fire.
 - **Tests:** first true read establishes baseline; cooldown updates state without queuing a delayed run; errors preserve valid state; stale reconnect rejected; transition/run crash atomicity; multiple watches share reads/subscriptions; notification during a read schedules a reread. Document missed intermediate transitions explicitly.
+- **Changed from the design:** reading `rmcp` 3.8.0 showed `resources/subscribe` is deprecated in favour of `subscriptions/listen`, which only exists on the 2026-07-28 lifecycle, while `.serve()` is always the legacy handshake. Every server now connects with `ClientLifecycleMode::Discover`, with no legacy fallback, and the read cache is off. Listening returns a handle, so `()` stays the client handler. The owner added in-conversation watches (a `destination` on the same definition), which use the durable chat queue rather than Infinity's subscription events: `cancel_subscription` is a built-in tool and those are off. So nothing here is an unresolved Infinity subscription, and M18's recovery needs no change. Scope was this repo only: no example server, and `my-mcp-servers` is untouched.
+- **Done:** `shade-mcp` gained `resources.rs` (`resources`, `read`, `snapshot`, `listen`, and `Updates`, whose `changed()` takes everything already waiting) and records `Features` at the handshake. A server refusing a request no longer drops the connection its tools share. `tools/mcp.rs` offers `<server>_resources` and `<server>_read_resource` under the server's cap through the same admit, record and redact path; a real tool of that name wins. `shade-watch` is pure: `step` (the F7 table), `evaluate` (freshness then condition), `input`, `backoff`, `list`. Freshness is a fixed envelope (`/observed_at`, `/availability`) used when a watch sets `max_age_seconds`. Migration 0018 adds `watches` and `watch_runs`, and running watch runs count toward the shared capacity. `Watches::observe` records state and queues the firing in one transaction for both destinations, ends a conversation watch that fired, and writes nothing under an old version; an update that changes server, URI or condition clears the baseline. `watcher.rs` keeps one pipeline per resource, listening before reading and backing off to 5 minutes; it skips servers no longer in `policy.chat`, redacts before storing, and alerts once after five failures in a row (`Notifier::alert`). `router/watches.rs` starts runs, delivers firings under source key `watch-run:<id>` (a full queue leaves the row for the next tick, and delivering twice is a repeat), reports outcomes, and interrupts runs a restart cannot resume. `tools/watches.rs` holds `watch_create|list|update|delete`, for owner chat with `watches` only: creating needs the server's cap and reads once, so a bad URI or pointer is refused at once, and the model is told when the first reading already matches. A conversation watch is refused from the terminal, which has no live reader, and `/new` ends the old conversation's watches. `shade watch list|pause|resume|rm`. The contract is `docs/mcp-servers.md`.
+- **Check (done, partly):** against OpenCode Go with the real servers on a scratch daemon: `mcp-nightbot` and `mcp-obsidian` connected under the new lifecycle with 4 and 10 tools, and real calls worked (20 commands, the scratch vault's one note). With `watches` in chat caps, `watch_create` on `obsidian` was refused with "does not offer resource subscriptions", nothing was stored, and `shade watch list`, `rm` of an unknown ID and the missing `approve` behaved. The PLAN sequence is the `step` table test, and firing, sharing, rereads, reconnects and delivery ran only against the in-process `shade_mcp::testing::Feed`. **No real server process has fired a watch yet**: that waits for a home-made server to adopt the contract.
 
 ### M17 — Audit and usage views
 
@@ -834,7 +840,7 @@ Known gaps left open on purpose. Each points to the milestone notes with the det
 - **Shell access to the vault.** `[sandbox] vault` is mounted for no grant yet: callers pass `Access::vault` as false, so the vault is reachable only through its MCP server. Tie the mount to the vault server's capability if the shell should see notes (M6, M13).
 - **Anthropic prompt caching.** Off, and `cached` reads 0: rig 0.31 drops cached-token counts on streaming responses, and with Anthropic caching on, compaction might never trigger. Waits for an Infinity upgrade that brings a fixed rig (M9b, Known gaps).
 - **Long conversations.** Proposed, not planned: end a conversation after inactivity with a pointer to the previous one, and a chat-only `history` tool to read earlier conversations, with thresholds chosen from `shade usage` data (M9b, Next).
-- **Watches.** M16 stays unscheduled until there is a concrete resource to watch; scheduled checks cover most "tell me when" needs.
+- **First real watchable server.** No home-made server offers resources yet, so a watch has only fired against the in-process test server. The first one to adopt `docs/mcp-servers.md` is the end-to-end check (M16). Non-JSON resources such as notes would also need a watch that fires on any change, which is not built.
 
 ## 7. Primary references
 

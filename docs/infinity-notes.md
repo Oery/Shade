@@ -215,7 +215,7 @@ and test this in M2, where compaction becomes reachable.
 - Each server becomes two tools: `{server}_list_tools` and `{server}_invoke_tool`.
   One lazily connected, serialized session per `McpClient`.
 - Only `tools/list` and `tools/call`. No resources, subscriptions, or
-  notifications: watches need `rmcp` (F7/F8), as planned.
+  notifications. Shade uses `rmcp` directly instead (M13), which watches need.
 - `McpTool::execute` spawns the call and sends the result itself
   ([lib.rs:650][mcp]), so Shade cannot persist it first. Shade wraps the public
   `McpClient::dispatch` in its own tool: check authority, record the operation,
