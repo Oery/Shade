@@ -43,6 +43,7 @@ const MIGRATIONS: &[&str] = &[
     include_str!("../migrations/0015_hook_events.sql"),
     include_str!("../migrations/0016_audit.sql"),
     include_str!("../migrations/0017_chat_turns.sql"),
+    include_str!("../migrations/0018_watches.sql"),
 ];
 
 type Job = Box<dyn FnOnce(&mut Connection) + Send>;
@@ -216,7 +217,8 @@ mod migration_tests {
         let mut connection = Connection::open_in_memory()?;
         configure(&connection)?;
 
-        for (index, migration) in MIGRATIONS[..MIGRATIONS.len() - 1].iter().enumerate() {
+        // Everything before 0017, the migration that adopts legacy chat.
+        for (index, migration) in MIGRATIONS[..16].iter().enumerate() {
             connection.execute_batch(migration)?;
             connection.pragma_update(None, "user_version", (index + 1) as u32)?;
         }

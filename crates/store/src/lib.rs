@@ -16,6 +16,7 @@ pub mod roots;
 pub mod schedules;
 pub mod state;
 pub mod usage;
+pub mod watches;
 
 #[cfg(test)]
 mod tests;

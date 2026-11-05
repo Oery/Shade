@@ -164,7 +164,9 @@ impl HookEvents {
 /// Running scheduled runs and hook events together: the background work
 /// the shared capacity counts.
 pub(crate) fn running_background(connection: &Connection) -> Result<u32, DbError> {
-    let sql = "SELECT (SELECT COUNT(*) FROM runs WHERE status = 'running') + (SELECT COUNT(*) FROM hook_events WHERE status = 'running')";
+    let sql = "SELECT (SELECT COUNT(*) FROM runs WHERE status = 'running')
+                    + (SELECT COUNT(*) FROM hook_events WHERE status = 'running')
+                    + (SELECT COUNT(*) FROM watch_runs WHERE status = 'running')";
 
     Ok(connection.query_row(sql, [], |row| row.get(0))?)
 }

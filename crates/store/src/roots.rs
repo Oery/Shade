@@ -10,6 +10,7 @@ use shade_policy::{Grant, Origin};
 
 use crate::db::{Db, DbError};
 use crate::grants::{insert_grant, start_budget};
+use crate::watches;
 
 /// Which conversation an input belongs to.
 pub enum Target {
@@ -93,11 +94,13 @@ impl Roots {
         Ok(Adapter::parse(&adapter).map(|adapter| Conversation { adapter, key, direct }))
     }
 
-    /// Points `key` at a new root. The previous root keeps its history.
+    /// Points `key` at a new root. The previous root keeps its history, and
+    /// its conversation watches end: nobody reads that conversation any more.
     pub async fn replace(&self, adapter: Adapter, key: String) -> Result<ThreadId, DbError> {
         self.db
             .call(move |connection| {
                 let transaction = connection.transaction()?;
+                watches::end_with_conversation(&transaction, adapter, &key)?;
                 let id = point(&transaction, adapter, &key)?;
                 transaction.commit()?;
 

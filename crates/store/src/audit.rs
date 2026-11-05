@@ -68,13 +68,15 @@ impl Audit {
                          UNION ALL SELECT root_id, received_at FROM inbox
                          UNION ALL SELECT root_id, COALESCE(finished_at, started_at) FROM runs
                          UNION ALL SELECT root_id, COALESCE(finished_at, started_at) FROM hook_events
+                         UNION ALL SELECT root_id, COALESCE(finished_at, started_at) FROM watch_runs
                        ), recent AS (SELECT root_id, MAX(at) AS at FROM activity GROUP BY root_id HAVING MAX(at) >= ?1)
                        SELECT g.root_id, g.origin, g.source, g.caps,
-                              COALESCE(r.id, h.id),
-                              COALESCE(r.status, h.status, CASE WHEN g.origin IN ('chat', 'guest') THEN 'chat' ELSE 'unavailable' END)
+                              COALESCE(r.id, h.id, w.id),
+                              COALESCE(r.status, h.status, w.status, CASE WHEN g.origin IN ('chat', 'guest') THEN 'chat' ELSE 'unavailable' END)
                        FROM grants g JOIN recent a ON a.root_id = g.root_id
                        LEFT JOIN runs r ON r.root_id = g.root_id
                        LEFT JOIN hook_events h ON h.root_id = g.root_id
+                       LEFT JOIN watch_runs w ON w.root_id = g.root_id
                        WHERE (?2 IS NULL OR g.root_id = ?2)
                        ORDER BY a.at DESC, g.root_id LIMIT 20";
                 let mut statement = connection.prepare(sql)?;

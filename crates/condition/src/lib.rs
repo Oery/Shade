@@ -9,13 +9,13 @@
 
 use std::cmp::Ordering;
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Number, Value};
 
 /// 2^53: past this, not every integer has its own floating-point value.
 const EXACT: u128 = 1 << 53;
 
-#[derive(Clone, Copy, Debug, PartialEq, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Deserialize, Serialize)]
 pub enum Op {
     #[serde(rename = "==")]
     Eq,
@@ -55,7 +55,7 @@ impl Op {
     }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Condition {
     #[serde(default)]

@@ -16,6 +16,7 @@ shade-mcp = { path = "crates/mcp" }
 shade-policy = { path = "crates/policy" }
 shade-proto = { path = "crates/proto" }
 shade-schedule = { path = "crates/schedule" }
+shade-watch = { path = "crates/watch" }
 shade-sandbox = { path = "crates/sandbox" }
 shade-store = { path = "crates/store" }
 async-trait = "0.1"
