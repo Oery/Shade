@@ -4,8 +4,8 @@
 //! listens before it reads, so no change slips between the two, and reads
 //! one at a time; a change arriving during a read is waiting when it is done.
 //! A failed read or a lost subscription means listen and read again, after a
-//! backoff. The persisted condition state is what stops a reconnect firing
-//! again on a value that merely still matches.
+//! backoff. The persisted state is what stops a reconnect firing again: a
+//! condition's last result, or the items a `new_items` watch has seen.
 
 use std::collections::btree_map::Entry;
 use std::collections::{BTreeMap, BTreeSet};
@@ -16,7 +16,7 @@ use serde_json::Value;
 use shade_mcp::{Server, Servers};
 use shade_policy::{Cap, Policy};
 use shade_store::db::Db;
-use shade_store::watches::{Observation, Watch, Watches};
+use shade_store::watches::{Mode, Observation, Watch, Watches};
 use shade_watch::Prior;
 use tokio::sync::{Notify, mpsc};
 use tokio::task::AbortHandle;
@@ -158,36 +158,60 @@ impl Watcher {
 
     /// Evaluates one watch, recording the outcome. `true` when it fired.
     async fn judge(&self, watch: &Watch, document: &Value, value: &str, now: DateTime<Utc>) -> bool {
-        let definition = &watch.definition;
+        let observed = match watch.definition.mode {
+            Mode::NewItems => self.new_items(watch, document, value, now).await,
+            Mode::OnChange | Mode::EveryMatch => condition(watch, document, value, now),
+        };
 
-        let matched = match shade_watch::evaluate(document, &definition.condition, definition.max_age_seconds, now.timestamp()) {
-            Ok(matched) => matched,
+        let observation = match observed {
+            Ok(observation) => observation,
             Err(reason) => {
                 self.record_failure(watch, &reason).await;
                 return false;
             }
         };
 
-        let prior = Prior { condition: watch.last_condition, last_fired: watch.last_fired_at, cooldown: definition.cooldown_seconds };
-        let decision = shade_watch::step(&prior, matched, definition.mode, now.timestamp());
-        let fired = decision.fire.then(|| shade_watch::input(watch, value, now));
-
-        let observation = Observation {
-            watch: watch.id.to_owned(),
-            version: watch.version,
-            condition: decision.condition,
-            value: value.to_owned(),
-            fired,
-            at: now.timestamp(),
-        };
+        let fired = observation.fired.is_some();
 
         match self.watches.observe(observation).await {
-            Ok(recorded) => recorded && decision.fire,
+            Ok(recorded) => recorded && fired,
             Err(error) => {
                 tracing::error!(%error, watch = %watch.id, "cannot record an observation");
                 false
             }
         }
+    }
+
+    /// Compares what is listed with what the watch remembers. The first
+    /// observation only remembers, as a baseline never fires.
+    async fn new_items(&self, watch: &Watch, document: &Value, value: &str, now: DateTime<Utc>) -> Result<Observation, String> {
+        let mut items = shade_watch::items(document, &watch.definition.condition)?;
+
+        for item in &mut items {
+            item.id = self.redactor.redact(std::mem::take(&mut item.id));
+        }
+
+        let seen = match self.watches.seen(&watch.id).await {
+            Ok(seen) => seen,
+            Err(error) => return Err(format!("cannot read what it has seen: {error}")),
+        };
+
+        let new: Vec<&Value> = items.iter().filter(|item| !seen.contains(&item.id)).map(|item| item.value).collect();
+
+        let fired = match (watch.last_condition, new.is_empty()) {
+            (Some(_), false) => Some(shade_watch::input(watch, &self.redactor.redact(serde_json::json!(new).to_string()), now)),
+            _ => None,
+        };
+
+        Ok(Observation {
+            watch: watch.id.to_owned(),
+            version: watch.version,
+            condition: !items.is_empty(),
+            value: value.to_owned(),
+            items: items.into_iter().map(|item| item.id).collect(),
+            fired,
+            at: now.timestamp(),
+        })
     }
 
     /// The resource itself failed: every watch on it failed.
@@ -221,6 +245,25 @@ impl Watcher {
             notifier.alert(text).await;
         }
     }
+}
+
+/// Decides a watch with a condition. An error leaves its state as it was.
+fn condition(watch: &Watch, document: &Value, value: &str, now: DateTime<Utc>) -> Result<Observation, String> {
+    let definition = &watch.definition;
+    let matched = shade_watch::evaluate(document, &definition.condition, definition.max_age_seconds, now.timestamp())?;
+
+    let prior = Prior { condition: watch.last_condition, last_fired: watch.last_fired_at, cooldown: definition.cooldown_seconds };
+    let decision = shade_watch::step(&prior, matched, definition.mode, now.timestamp());
+
+    Ok(Observation {
+        watch: watch.id.to_owned(),
+        version: watch.version,
+        condition: decision.condition,
+        value: value.to_owned(),
+        items: Vec::new(),
+        fired: decision.fire.then(|| shade_watch::input(watch, value, now)),
+        at: now.timestamp(),
+    })
 }
 
 #[cfg(test)]
@@ -280,6 +323,25 @@ mod tests {
             let watcher = Watcher::new(self.db.clone(), servers, policy, redactor, None, self.sender.to_owned(), changed);
 
             Ok(tokio::spawn(Arc::new(watcher).run()))
+        }
+
+        /// The value section of each run that may start now.
+        async fn items_fired(&self) -> Result<Vec<String>, BoxError> {
+            let queued = self.watches.startable(4).await?;
+            let sections =
+                queued.iter().filter_map(|run| run.input.split_once("<value>\n")).map(|(_, rest)| rest.trim_end_matches("\n</value>"));
+
+            Ok(sections.map(str::to_owned).collect())
+        }
+
+        /// Starts and ends every run that may start now.
+        async fn finish_runs(&self) -> Result<(), BoxError> {
+            for queued in self.watches.startable(4).await? {
+                self.watches.start(queued.run.to_owned()).await?;
+                self.watches.finish(&queued.run, None).await?;
+            }
+
+            Ok(())
         }
 
         /// Waits until watch `id` satisfies `ready`.
@@ -413,6 +475,89 @@ mod tests {
         rig.until("a", |watch| watch.failures == 0 && watch.last_value.as_deref() == Some("120")).await?;
 
         assert!(rig.watches.startable(4).await?.is_empty(), "true to true across a failure is no crossing");
+
+        watcher.abort();
+
+        Ok(())
+    }
+
+    /// What fired a live check: a restart finds the old list, and the first
+    /// poll adds to it seconds later. Only the new item fires, at once.
+    #[tokio::test]
+    async fn only_unseen_items_fire_however_soon() -> Result<(), BoxError> {
+        let rig = Rig::new().await?;
+        let feed = Feed::default();
+        feed.set(URI, r#"[{"id":1}]"#).await;
+        rig.watches.add_items("a", "chat").await?;
+
+        let first = rig.start(&feed, &held()).await?;
+        rig.until("a", valued(r#"[{"id":1}]"#)).await?;
+        assert!(rig.watches.startable(4).await?.is_empty(), "the baseline never fires");
+
+        feed.set(URI, r#"[{"id":1},{"id":2}]"#).await;
+        rig.until("a", valued(r#"[{"id":1},{"id":2}]"#)).await?;
+        first.abort();
+
+        assert_eq!(rig.items_fired().await?, ["[{\"id\":2}]"]);
+        rig.finish_runs().await?;
+
+        let again = Feed::default();
+        again.set(URI, r#"[{"id":1},{"id":2}]"#).await;
+
+        let second = rig.start(&again, &held()).await?;
+        rig.until("a", |_| again.reads() > 0).await?;
+        assert!(rig.watches.startable(4).await?.is_empty(), "a reconnect finding the same list fires nothing");
+
+        again.set(URI, r#"[{"id":2},{"id":3}]"#).await;
+        rig.until("a", valued(r#"[{"id":2},{"id":3}]"#)).await?;
+
+        assert_eq!(rig.items_fired().await?, ["[{\"id\":3}]"]);
+
+        second.abort();
+
+        Ok(())
+    }
+
+    /// Firings waiting for capacity each keep their items, and a watch still
+    /// runs one at a time.
+    #[tokio::test]
+    async fn new_items_are_not_lost_while_a_run_waits() -> Result<(), BoxError> {
+        let rig = Rig::new().await?;
+        let feed = Feed::default();
+        feed.set(URI, "[]").await;
+        rig.watches.add_items("a", "chat").await?;
+
+        let watcher = rig.start(&feed, &held()).await?;
+        rig.until("a", valued("[]")).await?;
+
+        feed.set(URI, r#"[{"id":1}]"#).await;
+        rig.until("a", valued(r#"[{"id":1}]"#)).await?;
+        feed.set(URI, r#"[{"id":1},{"id":2}]"#).await;
+        rig.until("a", valued(r#"[{"id":1},{"id":2}]"#)).await?;
+
+        assert_eq!(rig.watches.statuses().await?, ["queued", "queued"]);
+        assert_eq!(rig.items_fired().await?, ["[{\"id\":1}]"], "one at a time");
+
+        rig.finish_runs().await?;
+        assert_eq!(rig.items_fired().await?, ["[{\"id\":2}]"]);
+
+        watcher.abort();
+
+        Ok(())
+    }
+
+    /// An entry without an ID stops the watch from following, loudly.
+    #[tokio::test]
+    async fn a_list_that_cannot_be_followed_fails() -> Result<(), BoxError> {
+        let rig = Rig::new().await?;
+        let feed = Feed::default();
+        feed.set(URI, r#"[{"name":"no id"}]"#).await;
+        rig.watches.add_items("a", "chat").await?;
+
+        let watcher = rig.start(&feed, &held()).await?;
+        rig.until("a", |watch| watch.failures > 0).await?;
+
+        assert_eq!(rig.watches.get("a").await?.ok_or("watch")?.last_condition, None, "no baseline from a bad list");
 
         watcher.abort();
 

@@ -41,6 +41,8 @@ const MAX_URI: usize = 1000;
 /// Seconds a watch stays quiet after firing, unless told otherwise.
 const DEFAULT_COOLDOWN: i64 = 300;
 
+const ITEMS_ONLY: &str = "a watch on `items` takes no condition, `mode`, `cooldown_seconds` or `max_age_seconds`";
+
 #[derive(Clone, Copy, PartialEq)]
 pub enum Action {
     Create,
@@ -101,7 +103,9 @@ struct CreateArgs {
     title: String,
     server: String,
     uri: String,
-    condition: Condition,
+    condition: Option<Condition>,
+    /// The JSON pointer of a list to follow, instead of a condition.
+    items: Option<String>,
     prompt: String,
     /// `run` or `conversation`.
     destination: String,
@@ -281,14 +285,16 @@ impl Work {
             self.reachable(thread).await?;
         }
 
+        let trigger = Trigger::new(args.condition, args.items, args.mode, args.cooldown_seconds, args.max_age_seconds)?;
+
         let definition = Definition {
             title: bounded("title", args.title, MAX_TITLE)?,
             server: args.server,
             uri: bounded("uri", args.uri, MAX_URI)?,
-            condition: condition_text(&args.condition)?,
-            mode: mode(args.mode.as_deref())?,
-            cooldown_seconds: cooldown(args.cooldown_seconds)?,
-            max_age_seconds: max_age(args.max_age_seconds)?,
+            condition: trigger.condition,
+            mode: trigger.mode,
+            cooldown_seconds: trigger.cooldown_seconds,
+            max_age_seconds: trigger.max_age_seconds,
             prompt: bounded("prompt", args.prompt, MAX_PROMPT)?,
             caps,
             destination,
@@ -315,6 +321,13 @@ impl Work {
 
         if args.caps.is_some() && definition.destination == Destination::Conversation {
             return Err("a `conversation` watch has no caps of its own".to_owned());
+        }
+
+        let conditional =
+            args.condition.is_some() || args.mode.is_some() || args.cooldown_seconds.is_some() || args.max_age_seconds.is_some();
+
+        if conditional && definition.mode == Mode::NewItems {
+            return Err(ITEMS_ONLY.to_owned());
         }
 
         let merged = Definition {
@@ -353,8 +366,10 @@ impl Work {
         Ok(Prepared { change: Change::Update { id: args.id, version, enabled, definition: merged }, said })
     }
 
-    /// Whether the condition holds now, once the source is known to be
-    /// watchable: held by this conversation, subscribable, and readable.
+    /// Whether the condition holds now, or anything is listed, once the
+    /// source is known to be watchable: held by this conversation,
+    /// subscribable, and readable. A resource may not be available until it
+    /// is listened to, so its shape is what counts here.
     async fn probe(&self, definition: &Definition, held: &Caps) -> Result<bool, String> {
         let name = &definition.server;
 
@@ -373,6 +388,10 @@ impl Work {
         }
 
         let document = server.snapshot(&definition.uri).await?;
+
+        if definition.mode == Mode::NewItems {
+            return Ok(!shade_watch::items(&document, &definition.condition)?.is_empty());
+        }
 
         shade_watch::evaluate(&document, &definition.condition, definition.max_age_seconds, Utc::now().timestamp())
     }
@@ -411,9 +430,10 @@ fn delete(args: DeleteArgs) -> Prepared {
 /// What the model is told: the first reading never fires, so it must know
 /// whether the condition already holds.
 fn said(id: &str, definition: &Definition, matches: bool) -> String {
-    let now = match matches {
-        true => "The condition holds right now. That does not fire: it fires the next time it turns true after being false.",
-        false => "The condition does not hold right now, and fires when it turns true.",
+    let now = match (definition.mode, matches) {
+        (Mode::NewItems, _) => "What is listed now never fires: each item added later fires once.",
+        (_, true) => "The condition holds right now. That does not fire: it fires the next time it turns true after being false.",
+        (_, false) => "The condition does not hold right now, and fires when it turns true.",
     };
     let then = match definition.destination {
         Destination::Run => "A background run starts when it fires.",
@@ -424,6 +444,36 @@ fn said(id: &str, definition: &Definition, matches: bool) -> String {
         "Watching {} (watch {id}). {now} {then} Confirm it to the owner in one short sentence.",
         definition.uri
     )
+}
+
+/// What makes a watch fire. A `new_items` watch has no use for a cooldown,
+/// which would drop items for good, or for an age limit on old items.
+struct Trigger {
+    condition: String,
+    mode: Mode,
+    cooldown_seconds: i64,
+    max_age_seconds: Option<i64>,
+}
+
+impl Trigger {
+    fn new(
+        condition: Option<Condition>, items: Option<String>, mode_name: Option<String>, cooldown_seconds: Option<i64>,
+        max_age_seconds: Option<i64>,
+    ) -> Result<Self, String> {
+        match (condition, items) {
+            (Some(condition), None) => Ok(Self {
+                condition: condition_text(&condition)?,
+                mode: mode(mode_name.as_deref())?,
+                cooldown_seconds: cooldown(cooldown_seconds)?,
+                max_age_seconds: max_age(max_age_seconds)?,
+            }),
+            (None, Some(pointer)) if mode_name.is_none() && cooldown_seconds.is_none() && max_age_seconds.is_none() => {
+                Ok(Self { condition: pointer, mode: Mode::NewItems, cooldown_seconds: 0, max_age_seconds: None })
+            }
+            (None, Some(_)) => Err(ITEMS_ONLY.to_owned()),
+            _ => Err("give either `condition` or `items`".to_owned()),
+        }
+    }
 }
 
 fn condition_text(condition: &Condition) -> Result<String, String> {
@@ -439,8 +489,8 @@ fn mode(name: Option<&str>) -> Result<Mode, String> {
     let name = name.unwrap_or(Mode::OnChange.name());
 
     match Mode::parse(name) {
+        Some(Mode::NewItems) | None => Err(format!("unknown mode `{name}`")),
         Some(mode) => Ok(mode),
-        None => Err(format!("unknown mode `{name}`")),
     }
 }
 
@@ -476,7 +526,9 @@ fn new_id() -> String {
 fn describe(action: Action) -> &'static str {
     match action {
         Action::Create => {
-            "Watch an MCP resource and act when a condition on its JSON turns true. No model runs until then. \
+            "Watch an MCP resource and act when something in its JSON happens. No model runs until then. \
+             Give `items` to hear about each new entry of a list, such as new events: every entry fires exactly once. \
+             Give `condition` to act when a value crosses a line, such as a price. \
              Use destination `conversation` for 'tell me here when X': one message in this conversation, then the watch ends. \
              Use destination `run` for standing work: each firing starts a background run holding `caps`, which reaches the \
              owner only through `notify`. The first reading never fires, even if it already matches. Values that come and \
@@ -485,7 +537,7 @@ fn describe(action: Action) -> &'static str {
         Action::List => "List watches: what each observes, whether it matches, and whether it is failing.",
         Action::Update => {
             "Change a watch, or pause it. Changing the URI or condition starts a new baseline, so that change never fires by \
-             itself. To change its server or destination, delete it and create another."
+             itself. To change its server, destination or `items`, delete it and create another."
         }
         Action::Delete => "Delete a watch. A run it already fired still finishes.",
     }
@@ -525,6 +577,11 @@ fn create_parameters(caps: serde_json::Value) -> serde_json::Value {
             "server": { "type": "string", "description": "The MCP server's name." },
             "uri": { "type": "string", "description": "The resource's URI." },
             "condition": condition_schema(),
+            "items": {
+                "type": "string",
+                "description": "Instead of `condition`: the RFC 6901 JSON pointer of a list whose entries each have an `id`. \
+                                It fires for entries not seen before, and the run gets only those. Takes no `mode` or cooldown.",
+            },
             "prompt": { "type": "string", "description": "What to do when it fires." },
             "destination": { "type": "string", "enum": ["run", "conversation"] },
             "caps": caps,
@@ -540,7 +597,7 @@ fn create_parameters(caps: serde_json::Value) -> serde_json::Value {
                 "description": "For a resource with `observed_at` and `availability` fields: the oldest value to trust.",
             },
         },
-        "required": ["title", "server", "uri", "condition", "prompt", "destination"],
+        "required": ["title", "server", "uri", "prompt", "destination"],
     })
 }
 
@@ -665,12 +722,46 @@ mod tests {
         args
     }
 
+    /// A watch on the list at `pointer`, with `key` set.
+    fn items(pointer: &str, key: &str, value: Value) -> Value {
+        let mut args = with("items", json!(pointer));
+        args[key] = value;
+
+        if let Some(fields) = args.as_object_mut() {
+            fields.remove("condition");
+        }
+
+        args
+    }
+
     fn without_caps(mut args: Value) -> Value {
         if let Some(fields) = args.as_object_mut() {
             fields.remove("caps");
         }
 
         args
+    }
+
+    /// A resource reports `unavailable` until it is listened to, which only
+    /// creating the watch makes happen, so that must not refuse it. An
+    /// update cannot turn such a watch into something a cooldown could drop.
+    #[tokio::test]
+    async fn a_list_can_be_watched_before_it_is_available() -> Result<(), BoxError> {
+        let setup = setup(&held()).await?;
+        setup.feed.set(URI, r#"{"availability":"unavailable","new":[]}"#).await;
+
+        let said = call(&setup.work, &setup.api, Action::Create, "create", items("/new", "uri", json!(URI))).await?;
+        assert!(said.contains("each item added later fires once"), "{said}");
+
+        let watches = setup.watches.list().await?;
+        let id = watches.first().ok_or("watch")?.id.to_owned();
+        assert_eq!(watches.first().map(|watch| watch.definition.cooldown_seconds), Some(0));
+
+        let update = json!({ "id": id, "cooldown_seconds": 600 });
+        let refused = call(&setup.work, &setup.api, Action::Update, "update", update).await;
+        assert!(refused.is_err_and(|error| error.contains("takes no condition")));
+
+        Ok(())
     }
 
     /// Each of these would otherwise store a watch that can never work, or
@@ -690,6 +781,14 @@ mod tests {
             (with("destination", json!("conversation")), "drop `caps`"),
             (with("destination", json!("elsewhere")), "unknown destination"),
             (with("cooldown_seconds", json!(-1)), "negative"),
+            (with("mode", json!("new_items")), "unknown mode"),
+            (with("items", json!("/list")), "either `condition` or `items`"),
+            (with("condition", Value::Null), "either `condition` or `items`"),
+            (items("/price", "cooldown_seconds", json!(60)), "takes no condition"),
+            (items("/price", "max_age_seconds", json!(60)), "takes no condition"),
+            (items("/price", "mode", json!("every_match")), "takes no condition"),
+            (items("/price", "uri", json!(URI)), "is not a list"),
+            (items("/missing", "uri", json!(URI)), "nothing at"),
         ];
 
         for (index, (args, expected)) in cases.into_iter().enumerate() {
@@ -776,8 +875,15 @@ mod tests {
         call(&setup.work, &setup.api, Action::Create, "create", run_args()).await?;
 
         let watch = setup.watches.list().await?.pop().ok_or("no watch")?;
-        let observation =
-            Observation { watch: watch.id.to_owned(), version: 1, condition: false, value: "90".to_owned(), fired: None, at: 1000 };
+        let observation = Observation {
+            watch: watch.id.to_owned(),
+            version: 1,
+            condition: false,
+            value: "90".to_owned(),
+            items: Vec::new(),
+            fired: None,
+            at: 1000,
+        };
         setup.watches.observe(observation).await?;
 
         call(&setup.work, &setup.api, Action::Update, "prompt", json!({ "id": watch.id, "prompt": "New." })).await?;
@@ -809,6 +915,7 @@ mod tests {
             version: 1,
             condition: true,
             value: "1".to_owned(),
+            items: Vec::new(),
             fired: Some("go".to_owned()),
             at: 1000,
         };

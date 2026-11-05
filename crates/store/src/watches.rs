@@ -7,6 +7,8 @@
 //! carries the version it evaluated, so a read that raced a change to the
 //! watch writes nothing.
 
+use std::collections::BTreeSet;
+
 use infinity_agent_core::ThreadId;
 use rusqlite::{Connection, OptionalExtension, Row, params};
 use shade_policy::{Grant, Origin};
@@ -25,6 +27,9 @@ pub const MAX_WATCHES: i64 = 50;
 /// Consecutive failures before the owner hears about them.
 pub const ALERT_AFTER: i64 = 5;
 
+/// Seconds an item stays remembered after it was last listed.
+const SEEN_RETENTION: i64 = 30 * 24 * 60 * 60;
+
 /// When a matching observation fires.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Mode {
@@ -32,6 +37,8 @@ pub enum Mode {
     OnChange,
     /// Whenever it is true.
     EveryMatch,
+    /// For each item of a list not seen before. There is no condition.
+    NewItems,
 }
 
 impl Mode {
@@ -39,11 +46,12 @@ impl Mode {
         match self {
             Self::OnChange => "on_change",
             Self::EveryMatch => "every_match",
+            Self::NewItems => "new_items",
         }
     }
 
     pub fn parse(name: &str) -> Option<Self> {
-        [Self::OnChange, Self::EveryMatch].into_iter().find(|mode| mode.name() == name)
+        [Self::OnChange, Self::EveryMatch, Self::NewItems].into_iter().find(|mode| mode.name() == name)
     }
 }
 
@@ -75,7 +83,7 @@ pub struct Definition {
     pub title: String,
     pub server: String,
     pub uri: String,
-    /// A typed condition, as JSON.
+    /// A typed condition, as JSON; for `new_items`, the JSON pointer of its list.
     pub condition: String,
     pub mode: Mode,
     pub cooldown_seconds: i64,
@@ -129,6 +137,8 @@ pub struct Observation {
     pub version: i64,
     pub condition: bool,
     pub value: String,
+    /// The IDs a `new_items` watch found listed, which it now remembers.
+    pub items: Vec<String>,
     /// The input of what it fired, if it did.
     pub fired: Option<String>,
     pub at: i64,
@@ -242,6 +252,20 @@ impl Watches {
             .await
     }
 
+    /// The item IDs a `new_items` watch remembers.
+    pub async fn seen(&self, id: &str) -> Result<BTreeSet<String>, DbError> {
+        let id = id.to_owned();
+
+        self.db
+            .call(move |connection| {
+                let mut statement = connection.prepare("SELECT item_id FROM watch_items WHERE watch_id = ?1")?;
+                let rows = statement.query_map([&id], |row| row.get(0))?;
+
+                Ok(rows.collect::<Result<_, _>>()?)
+            })
+            .await
+    }
+
     /// Records an observation and what it fired. `false` when the watch
     /// changed since it was read, in which case nothing was written.
     pub async fn observe(&self, observation: Observation) -> Result<bool, DbError> {
@@ -274,7 +298,8 @@ impl Watches {
     }
 
     /// Queued runs that fit in what `capacity` leaves after every running
-    /// background run, oldest first. A watch has at most one running.
+    /// background run, oldest first. A watch has at most one running, so
+    /// only its oldest queued run is offered.
     pub async fn startable(&self, capacity: u32) -> Result<Vec<Queued>, DbError> {
         self.db
             .call(move |connection| {
@@ -283,6 +308,7 @@ impl Watches {
                            FROM watch_runs r JOIN watches w ON w.id = r.watch_id
                            WHERE r.status = 'queued' AND w.destination = 'run'
                            AND NOT EXISTS (SELECT 1 FROM watch_runs a WHERE a.watch_id = r.watch_id AND a.status = 'running')
+                           AND r.rowid = (SELECT MIN(q.rowid) FROM watch_runs q WHERE q.watch_id = r.watch_id AND q.status = 'queued')
                            ORDER BY r.fired_at, r.rowid LIMIT ?1";
                 let mut statement = connection.prepare(sql)?;
                 let rows = statement.query_map([room], queued_row)?;
@@ -397,14 +423,23 @@ impl Watches {
 impl Watches {
     /// A watch on `feed://price` of the `feed` server, firing above 100.
     pub async fn add(&self, id: &str, creator_root: &str, destination: Destination) -> Result<(), DbError> {
+        self.add_as(id, creator_root, destination, r#"{"op":">","value":100}"#, Mode::OnChange).await
+    }
+
+    /// A `new_items` watch on `feed://price`, whose whole document is its list.
+    pub async fn add_items(&self, id: &str, creator_root: &str) -> Result<(), DbError> {
+        self.add_as(id, creator_root, Destination::Run, "", Mode::NewItems).await
+    }
+
+    async fn add_as(&self, id: &str, creator_root: &str, destination: Destination, condition: &str, mode: Mode) -> Result<(), DbError> {
         let (id, creator_root) = (id.to_owned(), creator_root.to_owned());
 
         let definition = Definition {
             title: id.to_owned(),
             server: "feed".to_owned(),
             uri: "feed://price".to_owned(),
-            condition: r#"{"op":">","value":100}"#.to_owned(),
-            mode: Mode::OnChange,
+            condition: condition.to_owned(),
+            mode,
             cooldown_seconds: 0,
             max_age_seconds: None,
             prompt: "Tell me.".to_owned(),
@@ -510,6 +545,10 @@ fn create(connection: &Connection, id: &str, creator_root: &str, definition: &De
 /// A change to what is observed or how starts a new baseline; a new prompt or
 /// title keeps it. The new version drops any read still in flight.
 fn update(connection: &Connection, id: &str, version: i64, enabled: bool, definition: &Definition) -> Result<Option<String>, DbError> {
+    let sql = "DELETE FROM watch_items WHERE watch_id = ?1 AND EXISTS (
+                   SELECT 1 FROM watches WHERE id = ?1 AND version = ?2 AND (server <> ?3 OR uri <> ?4 OR condition <> ?5))";
+    connection.execute(sql, params![id, version, definition.server, definition.uri, definition.condition])?;
+
     let sql = "UPDATE watches SET
                    last_condition = CASE WHEN server = ?3 AND uri = ?4 AND condition = ?5 THEN last_condition END,
                    last_value = CASE WHEN server = ?3 AND uri = ?4 AND condition = ?5 THEN last_value END,
@@ -544,7 +583,7 @@ fn update(connection: &Connection, id: &str, version: i64, enabled: bool, defini
 
 /// A conversation watch that fired is done, in the same transaction.
 fn record(connection: &Connection, observation: &Observation) -> Result<bool, DbError> {
-    let Observation { watch, version, condition, value, fired, at } = observation;
+    let Observation { watch, version, condition, value, items, fired, at } = observation;
 
     let sql = "UPDATE watches SET last_condition = ?3, last_value = ?4, last_error = NULL, failures = 0, alerted = 0,
                    last_fired_at = CASE WHEN ?5 THEN ?6 ELSE last_fired_at END
@@ -554,6 +593,8 @@ fn record(connection: &Connection, observation: &Observation) -> Result<bool, Db
         return Ok(false);
     }
 
+    remember(connection, watch, items, *at)?;
+
     let Some(input) = fired else {
         return Ok(true);
     };
@@ -561,15 +602,36 @@ fn record(connection: &Connection, observation: &Observation) -> Result<bool, Db
     let sql = "UPDATE watches SET enabled = 0, deleted_at = ?2 WHERE id = ?1 AND destination = 'conversation'";
     connection.execute(sql, params![watch, at])?;
 
-    let waiting =
-        connection.query_row("SELECT 1 FROM watch_runs WHERE watch_id = ?1 AND status = 'queued'", [watch], |_| Ok(())).optional()?;
-
-    if waiting.is_none() {
-        let sql = "INSERT INTO watch_runs (id, watch_id, version, input, fired_at) VALUES (?1, ?2, ?3, ?4, ?5)";
-        connection.execute(sql, params![new_id(), watch, version, input, at])?;
+    // A condition firing adds nothing to one already waiting. New items do:
+    // they are remembered now, so they are never offered again.
+    if items.is_empty() && has_queued_run(connection, watch)? {
+        return Ok(true);
     }
 
+    let sql = "INSERT INTO watch_runs (id, watch_id, version, input, fired_at) VALUES (?1, ?2, ?3, ?4, ?5)";
+    connection.execute(sql, params![new_id(), watch, version, input, at])?;
+
     Ok(true)
+}
+
+/// Remembers what is listed, and forgets what has been gone for long enough.
+fn remember(connection: &Connection, watch: &str, items: &[String], at: i64) -> Result<(), DbError> {
+    let sql = "INSERT INTO watch_items (watch_id, item_id, last_seen_at) VALUES (?1, ?2, ?3)
+               ON CONFLICT (watch_id, item_id) DO UPDATE SET last_seen_at = ?3";
+
+    for item in items {
+        connection.execute(sql, params![watch, item, at])?;
+    }
+
+    connection.execute("DELETE FROM watch_items WHERE last_seen_at < ?1", [at - SEEN_RETENTION])?;
+
+    Ok(())
+}
+
+fn has_queued_run(connection: &Connection, watch: &str) -> Result<bool, DbError> {
+    let sql = "SELECT 1 FROM watch_runs WHERE watch_id = ?1 AND status = 'queued'";
+
+    Ok(connection.query_row(sql, [watch], |_| Ok(())).optional()?.is_some())
 }
 
 fn start_run(connection: &Connection, run: &str) -> Result<Option<Input>, DbError> {
@@ -699,7 +761,15 @@ mod tests {
     }
 
     fn observation(version: i64, fired: Option<&str>) -> Observation {
-        Observation { watch: "w".to_owned(), version, condition: true, value: "110".to_owned(), fired: fired.map(str::to_owned), at: 1000 }
+        Observation {
+            watch: "w".to_owned(),
+            version,
+            condition: true,
+            value: "110".to_owned(),
+            items: Vec::new(),
+            fired: fired.map(str::to_owned),
+            at: 1000,
+        }
     }
 
     async fn setup(destination: Destination) -> Result<(Db, Watches), BoxError> {
@@ -737,6 +807,38 @@ mod tests {
 
         let reset = watches.get("w").await?.ok_or("watch")?;
         assert_eq!(reset.last_condition, None);
+
+        Ok(())
+    }
+
+    /// What a watch remembers moves with its observations: a raced read
+    /// remembers nothing, a new source forgets, and old items are forgotten.
+    #[tokio::test]
+    async fn seen_items_follow_the_watch() -> Result<(), BoxError> {
+        let (_db, watches) = setup(Destination::Run).await?;
+        let listing = |version, items: &[&str], at| Observation {
+            items: items.iter().map(|item| (*item).to_owned()).collect(),
+            at,
+            ..observation(version, None)
+        };
+        let seen = async |watches: &Watches| watches.seen("w").await.map(|seen| seen.into_iter().collect::<Vec<_>>());
+
+        assert!(!watches.observe(listing(9, &["raced"], 1000)).await?);
+        assert!(seen(&watches).await?.is_empty());
+
+        watches.observe(listing(1, &["old", "kept"], 1000)).await?;
+        watches.observe(listing(1, &["kept"], 1000 + super::SEEN_RETENTION + 1)).await?;
+        assert_eq!(seen(&watches).await?, ["kept"]);
+
+        let prompt = Definition { prompt: "New.".to_owned(), ..definition(Destination::Run) };
+        let update = Change::Update { id: "w".to_owned(), version: 1, enabled: true, definition: prompt };
+        watches.apply(update, receipt("prompt")).await?;
+        assert_eq!(seen(&watches).await?, ["kept"]);
+
+        let source = Definition { uri: "feed://other".to_owned(), ..definition(Destination::Run) };
+        let update = Change::Update { id: "w".to_owned(), version: 2, enabled: true, definition: source };
+        watches.apply(update, receipt("source")).await?;
+        assert!(seen(&watches).await?.is_empty());
 
         Ok(())
     }

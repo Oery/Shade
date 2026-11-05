@@ -17,7 +17,15 @@ use crate::error::BoxError;
 use crate::testing::{self, within};
 
 fn fired(input: &str) -> Observation {
-    Observation { watch: "w".to_owned(), version: 1, condition: true, value: "110".to_owned(), fired: Some(input.to_owned()), at: 1000 }
+    Observation {
+        watch: "w".to_owned(),
+        version: 1,
+        condition: true,
+        value: "110".to_owned(),
+        items: Vec::new(),
+        fired: Some(input.to_owned()),
+        at: 1000,
+    }
 }
 
 async fn send(router: &Router, root: &str, text: &str) -> Result<Turn, BoxError> {
