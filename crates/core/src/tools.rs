@@ -6,6 +6,7 @@ pub mod notify;
 pub mod now;
 pub mod schedules;
 pub mod shell;
+pub mod watches;
 
 use infinity_agent_core::ThreadId;
 use infinity_agent_core::message::{InputMessage, InputMessageContent};

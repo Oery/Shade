@@ -19,7 +19,7 @@ pub struct Config {
     /// Without a `[chat]` section, chat has no tools.
     #[serde(default)]
     pub chat: ChatConfig,
-    /// Background runs: scheduled jobs and, later, watches.
+    /// Background runs: scheduled jobs, webhooks and watches.
     #[serde(default)]
     pub jobs: JobsConfig,
     #[serde(default)]

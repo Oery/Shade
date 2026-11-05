@@ -127,6 +127,10 @@ caps = ["now"]
 # in `env`, read from the environment or the `.env` next to this config. A
 # call that gets no answer in time is reported as possibly done, and never
 # sent again.
+# A server that publishes resources also offers `<name>_resources` and
+# `<name>_read_resource`. If it supports subscriptions, owner chat holding
+# `watches` and the server's name can watch them (see docs/mcp-servers.md).
+#
 # [mcp.nightbot]
 # command = ["/path/to/mcp-nightbot"]
 # env = ["NIGHTBOT_CLIENT_ID", "NIGHTBOT_CLIENT_SECRET"]

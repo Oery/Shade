@@ -2416,6 +2416,7 @@ dependencies = [
  "serde",
  "serde_json",
  "serenity",
+ "shade-condition",
  "shade-mcp",
  "shade-policy",
  "shade-proto",

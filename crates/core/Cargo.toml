@@ -9,6 +9,7 @@ publish.workspace = true
 testing = ["infinity-provider-protocol/mock", "shade-store/testing"]
 
 [dependencies]
+shade-condition.workspace = true
 shade-mcp.workspace = true
 shade-policy.workspace = true
 shade-proto.workspace = true

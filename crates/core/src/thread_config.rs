@@ -36,6 +36,7 @@ use crate::tools::notify::Notify;
 use crate::tools::now::Now;
 use crate::tools::schedules::{self, Action, ScheduleTool};
 use crate::tools::shell::Shell;
+use crate::tools::watches::{self, WatchTool};
 
 /// Owner chat, always; the owner's `[chat] prompt` follows and can change the style.
 const CHAT_PROMPT: &str = "You are chatting with your owner, on Discord or in a terminal. Keep replies short: answer in a \
@@ -49,7 +50,7 @@ const GUEST_PROMPT: &str = "You are answering a guest in a Discord server channe
                           You cannot manage schedules or approve changes for the owner.";
 
 /// Background runs have no reader: only `notify` reaches the owner.
-const JOBS_PROMPT: &str = "You are running a background job for your owner, started by a schedule or a webhook. Nobody reads your \
+const JOBS_PROMPT: &str = "You are running a background job for your owner, started by a schedule, a webhook or a watch. Nobody reads your \
                            replies. If the result needs the owner's attention, send it with the notify tool; otherwise \
                            finish without notifying.";
 
@@ -165,6 +166,15 @@ impl ThreadConfigSource<ChannelSender, NoRapHttp> for ThreadTools {
 
             for action in Action::ALL {
                 config.tools.push(Rc::new(ScheduleTool::new(action, &work, &authorized.caps)));
+            }
+        }
+
+        if authorized.caps.contains(&Cap::Watches) && authorized.origin == Origin::Chat {
+            let (servers, changed) = (Arc::clone(&self.services.mcp), Arc::clone(&self.services.watches_changed));
+            let work = watches::Work::new(self.authority.clone(), self.db.clone(), servers, changed);
+
+            for action in watches::Action::ALL {
+                config.tools.push(Rc::new(WatchTool::new(action, &work, &authorized.caps)));
             }
         }
 

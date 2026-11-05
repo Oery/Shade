@@ -503,14 +503,14 @@ fn said(card: &Card, id: &str) -> String {
     format!("Done (job {id}):\n{}\nConfirm it to the owner in one short sentence.", card.text())
 }
 
-fn parse<T: DeserializeOwned>(args: serde_json::Value) -> Result<T, String> {
+pub(super) fn parse<T: DeserializeOwned>(args: serde_json::Value) -> Result<T, String> {
     match serde_json::from_value(args) {
         Ok(args) => Ok(args),
         Err(error) => Err(format!("invalid arguments: {error}")),
     }
 }
 
-fn bounded(field: &str, text: String, max: usize) -> Result<String, String> {
+pub(super) fn bounded(field: &str, text: String, max: usize) -> Result<String, String> {
     let text = text.trim();
 
     if text.is_empty() {
@@ -526,7 +526,7 @@ fn bounded(field: &str, text: String, max: usize) -> Result<String, String> {
 
 /// The caps a job may get from a conversation holding `held`: its own,
 /// minus management. Anything else is refused by name.
-fn delegate(requested: Vec<String>, held: &Caps) -> Result<Vec<String>, String> {
+pub(super) fn delegate(requested: Vec<String>, held: &Caps) -> Result<Vec<String>, String> {
     let delegable = shade_policy::delegable(held);
     let mut caps = Caps::new();
     let mut refused = Vec::new();
@@ -584,7 +584,7 @@ fn parameters(action: Action, delegable: &Caps, policy: &Policy, timezone: &str)
                 "title": { "type": "string", "maxLength": MAX_TITLE },
                 "prompt": { "type": "string", "maxLength": MAX_PROMPT, "description": "What each run should do, self-contained." },
                 "trigger": trigger(timezone),
-                "caps": caps(delegable, policy),
+                "caps": caps_schema(delegable, policy),
                 "channels": channels(),
                 "file": {
                     "type": "string",
@@ -603,7 +603,7 @@ fn parameters(action: Action, delegable: &Caps, policy: &Policy, timezone: &str)
                 "title": { "type": "string", "maxLength": MAX_TITLE },
                 "prompt": { "type": "string", "maxLength": MAX_PROMPT },
                 "trigger": trigger(timezone),
-                "caps": caps(delegable, policy),
+                "caps": caps_schema(delegable, policy),
                 "channels": channels(),
                 "paused": { "type": "boolean" },
             },
@@ -663,7 +663,7 @@ fn channels() -> serde_json::Value {
     })
 }
 
-fn caps(delegable: &Caps, policy: &Policy) -> serde_json::Value {
+pub(super) fn caps_schema(delegable: &Caps, policy: &Policy) -> serde_json::Value {
     let names: Vec<&str> = delegable.iter().map(|cap| cap.name()).collect();
     let described: Vec<String> = delegable.iter().map(|cap| format!("{}: {}", cap.name(), policy.describe(cap))).collect();
 

@@ -33,7 +33,7 @@ enum Command {
     Schedule(Manage),
     /// Manage resource watches.
     #[command(subcommand)]
-    Watch(Manage),
+    Watch(ManageWatch),
     /// Inspect conversations.
     #[command(subcommand)]
     Threads(Threads),
@@ -72,6 +72,29 @@ enum Manage {
 enum Threads {
     /// List conversations.
     List,
+}
+
+#[derive(Subcommand)]
+enum ManageWatch {
+    /// List watches and how they are doing.
+    List,
+    /// Stop observing a watch, keeping its baseline.
+    Pause { id: String },
+    /// Observe a watch again.
+    Resume { id: String },
+    /// Delete a watch.
+    Rm { id: String },
+}
+
+impl From<ManageWatch> for shade_proto::Manage {
+    fn from(manage: ManageWatch) -> Self {
+        match manage {
+            ManageWatch::List => Self::List,
+            ManageWatch::Pause { id } => Self::Pause { id },
+            ManageWatch::Resume { id } => Self::Resume { id },
+            ManageWatch::Rm { id } => Self::Rm { id },
+        }
+    }
 }
 
 impl From<Manage> for shade_proto::Manage {
