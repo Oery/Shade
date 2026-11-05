@@ -15,6 +15,7 @@ shade-proto.workspace = true
 shade-sandbox.workspace = true
 shade-schedule.workspace = true
 shade-store.workspace = true
+shade-watch.workspace = true
 async-trait.workspace = true
 chrono.workspace = true
 chrono-tz.workspace = true

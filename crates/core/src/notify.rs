@@ -91,6 +91,16 @@ impl Notifier {
         }
     }
 
+    /// Tells the owner of trouble with no run to charge it to. The caller
+    /// bounds how often. `text` is cut to a bounded length.
+    pub async fn alert(&self, mut text: String) {
+        text.truncate(text.floor_char_boundary(MAX_FAILURE_NOTICE));
+
+        if let Err(error) = self.send(Destination::Owner, text).await {
+            tracing::warn!(%error, "cannot send an alert");
+        }
+    }
+
     async fn claim_failure_notice(&self, thread: &ThreadId<str>) -> bool {
         match self.grants.claim_failure_notice(thread).await {
             Ok(claimed) => {

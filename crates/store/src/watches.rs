@@ -393,6 +393,58 @@ impl Watches {
     }
 }
 
+#[cfg(any(test, feature = "testing"))]
+impl Watches {
+    /// A watch on `feed://price` of the `feed` server, firing above 100.
+    pub async fn add(&self, id: &str, creator_root: &str, destination: Destination) -> Result<(), DbError> {
+        let (id, creator_root) = (id.to_owned(), creator_root.to_owned());
+
+        let definition = Definition {
+            title: id.to_owned(),
+            server: "feed".to_owned(),
+            uri: "feed://price".to_owned(),
+            condition: r#"{"op":">","value":100}"#.to_owned(),
+            mode: Mode::OnChange,
+            cooldown_seconds: 0,
+            max_age_seconds: None,
+            prompt: "Tell me.".to_owned(),
+            caps: vec!["notify".to_owned()],
+            destination,
+        };
+
+        self.db
+            .call(move |connection| {
+                create(connection, &id, &creator_root, &definition)?;
+
+                Ok(())
+            })
+            .await
+    }
+
+    /// Every run's status, oldest first.
+    pub async fn statuses(&self) -> Result<Vec<String>, DbError> {
+        self.db
+            .call(|connection| {
+                let mut statement = connection.prepare("SELECT status FROM watch_runs ORDER BY fired_at, rowid")?;
+                let rows = statement.query_map([], |row| row.get(0))?;
+
+                Ok(rows.collect::<Result<_, _>>()?)
+            })
+            .await
+    }
+
+    /// The root of the oldest run that started.
+    pub async fn run_root(&self) -> Result<Option<String>, DbError> {
+        self.db
+            .call(|connection| {
+                let sql = "SELECT root_id FROM watch_runs WHERE root_id IS NOT NULL ORDER BY fired_at, rowid";
+
+                Ok(connection.query_row(sql, [], |row| row.get(0)).optional()?)
+            })
+            .await
+    }
+}
+
 /// Ends the conversation watches of the root `key` points at, which is about
 /// to be replaced. Runs inside the caller's transaction.
 pub(crate) fn end_with_conversation(connection: &Connection, adapter: Adapter, key: &str) -> Result<(), DbError> {

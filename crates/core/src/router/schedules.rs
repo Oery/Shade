@@ -38,14 +38,20 @@ impl Router {
         self.prune_hook_events().await;
     }
 
-    /// Starts queued scheduled runs, then accepted webhook events, while the shared capacity allows.
+    /// Starts queued scheduled runs, then accepted webhook events, then what
+    /// watches fired, while the shared capacity allows.
     pub(super) async fn start_background(&self, now: DateTime<Utc>) {
-        if let Err(error) = self.start_queued(now).await {
-            tracing::error!(%error, "cannot start queued runs");
-        }
+        let started = [
+            ("queued runs", self.start_queued(now).await),
+            ("webhook runs", self.start_hook_events().await),
+            ("watch runs", self.start_watch_runs().await),
+            ("watch deliveries", self.deliver_watch_firings().await),
+        ];
 
-        if let Err(error) = self.start_hook_events().await {
-            tracing::error!(%error, "cannot start webhook runs");
+        for (work, result) in started {
+            if let Err(error) = result {
+                tracing::error!(%error, work, "cannot start background work");
+            }
         }
     }
 
@@ -200,7 +206,7 @@ impl Router {
         Ok(format!("Dropped change {code}; nothing was changed."))
     }
 
-    async fn followup_capacity(&self, thread: Option<&str>) -> Result<(), String> {
+    pub(super) async fn followup_capacity(&self, thread: Option<&str>) -> Result<(), String> {
         let Some(thread) = thread else {
             return Ok(());
         };

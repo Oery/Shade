@@ -11,12 +11,16 @@ mod hooks;
 mod resume;
 mod schedules;
 pub mod turn;
+mod watches;
 
 #[cfg(test)]
 mod tests;
 
 #[cfg(test)]
 mod chat_tests;
+
+#[cfg(test)]
+mod watch_tests;
 
 use std::cell::RefCell;
 use std::path::PathBuf;
@@ -44,7 +48,8 @@ use shade_store::roots::{Adapter, Conversation, Roots, Target};
 use shade_store::schedules::{Run, Schedules};
 use shade_store::state::States;
 use shade_store::usage::Usages;
-use tokio::sync::mpsc;
+use shade_store::watches::Watches;
+use tokio::sync::{Notify, mpsc};
 use tokio::time::MissedTickBehavior;
 
 use crate::adapters::discord::Reply;
@@ -105,7 +110,12 @@ pub enum Inbound {
         action: Manage,
         reply: mpsc::Sender<Response>,
     },
-    /// A background run may start now: a webhook event was just accepted.
+    /// Owner management of watches.
+    Watch {
+        action: Manage,
+        reply: mpsc::Sender<Response>,
+    },
+    /// A background run may start now: a webhook event was accepted, or a watch fired.
     StartBackground,
     /// A copy of the database to a new file.
     Backup {
@@ -127,6 +137,8 @@ pub enum Outbound {
     Run { run: Run, schedules: Schedules, notifier: Option<Notifier> },
     /// A run started by a webhook event. Its outcome is recorded, and a failure is sent to the owner.
     Hook { event: String, hook: String, events: HookEvents, notifier: Option<Notifier> },
+    /// A run a watch fired. Its outcome is recorded, and a failure is sent to the owner.
+    Watch { run: shade_store::watches::Run, watches: Watches, notifier: Option<Notifier> },
 }
 
 impl Outbound {
@@ -161,6 +173,7 @@ impl Outbound {
             }
             Self::Run { run, schedules, notifier } => schedules::report(run, schedules, notifier.as_ref(), thread, step).await,
             Self::Hook { event, hook, events, notifier } => hooks::report(event, hook, events, notifier.as_ref(), thread, step).await,
+            Self::Watch { run, watches, notifier } => watches::report(run, watches, notifier.as_ref(), thread, step).await,
         }
     }
 }
@@ -175,6 +188,9 @@ pub struct Router {
     telemetry: Telemetry,
     schedules: Schedules,
     hooks: HookEvents,
+    watches: Watches,
+    /// Wakes the watcher when the owner changes what is watched.
+    watches_changed: Arc<Notify>,
     system: System,
     /// For replies to resumed work in Discord conversations.
     discord: Option<Arc<Http>>,
@@ -201,13 +217,14 @@ impl Router {
     }
 
     pub fn new(db: Db, system: System, policy: Arc<Policy>, discord: Option<Arc<Http>>, services: Services, telemetry: Telemetry) -> Self {
-        let Services { notifier, job_files, .. } = services;
+        let Services { notifier, job_files, watches_changed, .. } = services;
         let inbox = Inbox::new(db.clone());
         let roots = Roots::new(db.clone());
         let operations = Operations::new(db.clone());
         let usages = Usages::new(db.clone());
         let schedules = Schedules::new(db.clone());
         let hooks = HookEvents::new(db.clone());
+        let watches = Watches::new(db.clone());
 
         let (wakeup, completed) = mpsc::channel(1);
         let chat = Rc::new(ChatRuntime::new(Chats::new(db.clone()), wakeup));
@@ -222,6 +239,8 @@ impl Router {
             telemetry,
             schedules,
             hooks,
+            watches,
+            watches_changed,
             system,
             discord,
             notifier,
@@ -270,6 +289,7 @@ impl Router {
             Inbound::Usage { reply } => self.usage(reply).await,
             Inbound::Audit { since, root, reply } => self.audit(since, root, reply).await,
             Inbound::Schedule { action, reply } => self.manage(action, reply).await,
+            Inbound::Watch { action, reply } => self.manage_watches(action, reply).await,
             Inbound::StartBackground => self.start_background(Utc::now()).await,
             Inbound::Backup { path, reply } => self.backup(path, reply).await,
         }
@@ -288,6 +308,7 @@ impl Router {
         self.resume_inputs(&mut resumed).await?;
 
         self.interrupt_hook_events(resumed.to_owned()).await?;
+        self.interrupt_watch_runs(resumed.to_owned()).await?;
         self.interrupt_runs(resumed).await?;
         self.start_chats().await;
 
@@ -413,6 +434,10 @@ impl Router {
             Ok(Some(run)) => return Some(self.run_outbound(run)),
             Ok(None) => {}
             Err(error) => tracing::warn!(%error, %thread, "cannot tell whether resumed work is a scheduled run"),
+        }
+
+        if let Some(outbound) = self.resumed_watch(thread).await {
+            return Some(outbound);
         }
 
         match self.hooks.event_of(thread).await {

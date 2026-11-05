@@ -59,8 +59,15 @@ pub async fn client(db: &Db, policy: Arc<Policy>) -> Result<(Client, MockModelCo
     };
     let model_source = StaticModel::new(Arc::new(SingleModelProvider::new(entry, mock)), "mock").await?;
     let job_files = Arc::new(JobFiles::new(std::env::temp_dir().join(format!("shade-test-jobs-{}", uuid::Uuid::new_v4()))));
-    let services =
-        Services { sandbox: None, notifier: None, job_files, mcp: Default::default(), memory: None, redactor: Default::default() };
+    let services = Services {
+        sandbox: None,
+        notifier: None,
+        job_files,
+        mcp: Default::default(),
+        memory: None,
+        redactor: Default::default(),
+        watches_changed: Default::default(),
+    };
     let authority = Authority::new(Grants::new(db.clone()), Arc::clone(&policy));
     let telemetry = Telemetry::new(db.clone(), Arc::clone(&services.redactor));
     let conversations = Conversations::new(db.clone());

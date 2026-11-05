@@ -66,6 +66,8 @@ pub struct Services {
     /// Shown to roots holding the vault server's capability.
     pub memory: Option<Arc<Memory>>,
     pub redactor: Arc<Redactor>,
+    /// Wakes the watcher when what is watched may have changed.
+    pub watches_changed: Arc<tokio::sync::Notify>,
 }
 
 pub struct ThreadTools {

@@ -25,13 +25,14 @@ mod testing;
 mod thread_config;
 mod tools;
 mod usage;
+mod watcher;
 
 use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::Arc;
 
 use shade_sandbox::Sandbox;
-use tokio::sync::mpsc;
+use tokio::sync::{Notify, mpsc};
 
 pub use client::{Client, ClientError, HookAccepted, HookAdmission, Subscription};
 pub use config::{ChatConfig, Config, DiscordConfig, JobsConfig, ModelConfig};
@@ -55,6 +56,7 @@ use crate::notify::Notifier;
 use crate::router::{Inbound, Router};
 use crate::thread_config::Services;
 use shade_mcp::{Server, Servers};
+use watcher::Watcher;
 
 /// Pending input between the control socket and the router.
 const INBOUND_QUEUE: usize = 16;
@@ -69,6 +71,7 @@ pub struct Runtime {
     client: Client,
     discord: Option<Discord>,
     shards: Option<Arc<serenity::all::ShardManager>>,
+    watcher: Arc<Watcher>,
     // Struct fields drop in order: the socket must disappear before the lock.
     _lock: lock::ExecutionLock,
 }
@@ -105,6 +108,7 @@ impl Runtime {
             None => None,
         };
 
+        let wake = inbound.clone();
         let client = Client::new(inbound.clone(), shade_store::chat::Chats::new(db.clone()));
         let socket = ControlSocket::bind(shade_proto::socket_path(&data_dir), inbound)?;
         tracing::info!(path = %socket.path().display(), model = %model.id(), "listening");
@@ -113,10 +117,21 @@ impl Runtime {
         let notifier = discord.as_ref().map(|discord| notifications(discord, &db));
         let job_files = Arc::new(JobFiles::new(jobfiles::dir_for(config_path)));
         let redactor = Arc::new(secrets.into_redactor());
-        let services = Services { sandbox: sandbox.map(Arc::new), notifier, job_files, mcp, memory, redactor };
-        let router = Router::start(model, db, Arc::new(policy), services, http);
+        let policy = Arc::new(policy);
+        let watches_changed = Arc::new(Notify::new());
+        let watcher = Watcher::new(
+            db.clone(),
+            Arc::clone(&mcp),
+            Arc::clone(&policy),
+            Arc::clone(&redactor),
+            notifier.clone(),
+            wake,
+            Arc::clone(&watches_changed),
+        );
+        let services = Services { sandbox: sandbox.map(Arc::new), notifier, job_files, mcp, memory, redactor, watches_changed };
+        let router = Router::start(model, db, policy, services, http);
 
-        Ok(Self { socket, router, inbound: Some(inbound_queue), client, discord, shards, _lock })
+        Ok(Self { socket, router, inbound: Some(inbound_queue), client, discord, shards, watcher: Arc::new(watcher), _lock })
     }
 
     pub fn client(&self) -> Client {
@@ -142,6 +157,8 @@ impl Runtime {
         if let Some(discord) = self.discord.take() {
             tokio::spawn(discord.run());
         }
+
+        tokio::spawn(Arc::clone(&self.watcher).run());
 
         tokio::select! {
             () = self.socket.serve() => {},

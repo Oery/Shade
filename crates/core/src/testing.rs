@@ -82,7 +82,15 @@ pub async fn start_with(db: &Db, policy: Arc<Policy>) -> Result<Harness, BoxErro
 pub fn services(sandbox: Option<Arc<Sandbox>>, notifier: Option<Notifier>) -> Services {
     let job_files = Arc::new(JobFiles::new(std::env::temp_dir().join(format!("shade-test-jobs-{}", uuid::Uuid::new_v4()))));
 
-    Services { sandbox, notifier, job_files, mcp: Default::default(), memory: None, redactor: Default::default() }
+    Services {
+        sandbox,
+        notifier,
+        job_files,
+        mcp: Default::default(),
+        memory: None,
+        redactor: Default::default(),
+        watches_changed: Default::default(),
+    }
 }
 
 /// A system whose tools reach `services`.
